@@ -29,6 +29,7 @@ mod value;
 use crate::constraint::Problem;
 use crate::core::{AtomTerm, ResolvedCall};
 use crate::typechecking::TypeError;
+use rayon::prelude::*;
 use actions::Program;
 use ast::remove_globals::remove_globals;
 use ast::*;
@@ -53,6 +54,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::str::FromStr;
 use std::{fmt::Debug, sync::Arc};
+use std::sync::RwLock;
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::TypeInfo;
@@ -60,11 +62,13 @@ use unionfind::*;
 use util::*;
 pub use value::*;
 
+
+
 pub type ArcSort = Arc<dyn Sort>;
 
 pub type Subst = IndexMap<Symbol, Value>;
 
-pub trait PrimitiveLike {
+pub trait PrimitiveLike : Send + Sync {
     fn name(&self) -> Symbol;
     /// Constructs a type constraint for the primitive that uses the span information
     /// for error localization.
@@ -904,10 +908,11 @@ impl EGraph {
             .unwrap_or_else(|| panic!("ruleset does not exist: {}", &ruleset));
         match rules {
             Ruleset::Rules(_ruleset_name, rule_names) => {
+                let run_report_arc = Arc::new(RwLock::new(run_report));
+                let search_results_arc = Arc::new(RwLock::new(search_results));
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
-
-                for (rule_name, rule) in copy_rules.iter() {
+                let _ = copy_rules.par_iter().map(|(rule_name, rule)| {
                     let mut all_matches = vec![];
                     let rule_search_start = Instant::now();
                     let mut did_match = false;
@@ -924,18 +929,18 @@ impl EGraph {
                         rule_search_time.as_secs_f64(),
                         all_matches.len()
                     );
-                    run_report.add_rule_search_time(*rule_name, rule_search_time);
-                    search_results.insert(
+                    (*run_report_arc.write().unwrap()).add_rule_search_time(*rule_name, rule_search_time);
+                    (*search_results_arc.write().unwrap()).insert(
                         *rule_name,
                         SearchResult {
                             all_matches,
                             did_match,
                         },
                     );
-                }
+                });
 
                 let search_time = search_start.elapsed();
-                run_report.add_ruleset_search_time(ruleset, search_time);
+                (*run_report_arc.write().unwrap()).add_ruleset_search_time(ruleset, search_time);
             }
             Ruleset::Combined(_name, sub_rulesets) => {
                 let start_time = Instant::now();
@@ -1514,6 +1519,9 @@ impl EGraph {
         std::mem::take(&mut self.msgs)
     }
 }
+
+unsafe impl Send for EGraph {}
+unsafe impl Sync for EGraph {}
 
 // Currently, only the following errors can thrown without location information:
 // * PrimitiveError
