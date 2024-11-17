@@ -4,6 +4,7 @@ use egglog_bridge::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, 
 use num_rational::Rational64;
 use web_time::Instant;
 
+#[allow(clippy::disallowed_macros)]
 fn main() {
     const N: usize = 12;
     env_logger::init();

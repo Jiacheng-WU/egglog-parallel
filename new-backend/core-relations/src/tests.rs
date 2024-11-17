@@ -1,7 +1,6 @@
 use std::ops::Range;
 
 use numeric_id::NumericId;
-use web_time::Instant;
 
 use crate::{
     action::WriteVal,
@@ -427,7 +426,6 @@ fn ac_test(strat: PlanStrategy) {
     db.merge_all();
 
     let run_ac_rule = move |db: &mut Database, recent_range: Range<Value>| {
-        let start = Instant::now();
         let old_range = Value::new(0)..recent_range.start;
         let all_range = Value::new(0)..recent_range.end;
         let next_ts = recent_range.end;
@@ -531,13 +529,10 @@ fn ac_test(strat: PlanStrategy) {
             .unwrap();
         rules.build();
         let rule_set = rsb.build();
-        let res = db.run_rule_set(&rule_set);
-        eprintln!("ac rules took {:?}", start.elapsed());
-        res
+        db.run_rule_set(&rule_set)
     };
 
     let rebuild = |db: &mut Database, cur_ts: Value| -> (Value, bool) {
-        let start = Instant::now();
         let next_ts = Value::new(cur_ts.rep() + 1);
         let mut rsb = db.new_rule_set();
         let num_rebuild = |rsb: &mut RuleSetBuilder, cur_ts: Value, next_ts: Value| {
@@ -780,7 +775,6 @@ fn ac_test(strat: PlanStrategy) {
             let rs = rsb.build();
             changed |= db.run_rule_set(&rs);
         }
-        eprintln!("rebuild took {:?}", start.elapsed());
         (next_ts, changed)
     };
     let mut cur_ts = Value::new(0);

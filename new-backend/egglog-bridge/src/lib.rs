@@ -20,6 +20,7 @@ use core_relations::{
     SortedWritesTable, TableId, TaggedRowBuffer, Value, WrappedTable,
 };
 use indexmap::{map::Entry, IndexMap};
+use log::info;
 use numeric_id::{define_id, DenseIdMap, NumericId};
 use proof_spec::{ProofReason, ProofReconstructionState, ReasonSpecId};
 use smallvec::SmallVec;
@@ -410,15 +411,15 @@ impl EGraph {
             .for_each(|(_, row)| f(&row[0..row.len() - truncate]));
     }
 
-    /// A basic method for dumping the state of the database to standard error.
+    /// A basic method for dumping the state of the database to `log::info!`.
     ///
     /// For large tables, this is unlikely to give particularly useful output.
     pub fn dump_debug_info(&self) {
-        eprintln!("=== View Tables ===");
+        info!("=== View Tables ===");
         for (id, info) in self.funcs.iter() {
             let table = self.db.get_table(info.table);
             self.scan_table(table, |row| {
-                eprintln!(
+                info!(
                     "View Table {name} / {id:?} / {table:?}: {row:?}",
                     name = info.name,
                     table = info.table
@@ -426,23 +427,23 @@ impl EGraph {
             });
         }
 
-        eprintln!("=== Term Tables ===");
+        info!("=== Term Tables ===");
         for (_, table_id) in &self.term_tables {
             let table = self.db.get_table(*table_id);
             self.scan_table(table, |row| {
                 let name = &self.funcs[FunctionId::new(row[0].rep())].name;
                 let row = &row[1..];
-                eprintln!("Term Table {table_id:?}: {name}, {row:?}")
+                info!("Term Table {table_id:?}: {name}, {row:?}")
             });
         }
 
-        eprintln!("=== Reason Tables ===");
+        info!("=== Reason Tables ===");
         for (_, table_id) in &self.reason_tables {
             let table = self.db.get_table(*table_id);
             self.scan_table(table, |row| {
                 let spec = self.proof_specs[ReasonSpecId::new(row[0].rep())].as_ref();
                 let row = &row[1..];
-                eprintln!("Reason Table {table_id:?}: {spec:?}, {row:?}")
+                info!("Reason Table {table_id:?}: {spec:?}, {row:?}")
             });
         }
     }
