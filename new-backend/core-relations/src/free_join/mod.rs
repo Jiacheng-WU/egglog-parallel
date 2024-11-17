@@ -366,11 +366,11 @@ impl Database {
     }
 
     pub(crate) fn process_constraints(
-        &mut self,
+        &self,
         table: TableId,
         cs: &[Constraint],
     ) -> ProcessedConstraints {
-        let table_info = &mut self.tables[table];
+        let table_info = &self.tables[table];
         let (mut subset, mut fast, mut slow) = table_info.table.split_fast_slow(cs);
         slow.retain(|c| {
             let (col, val) = match c {

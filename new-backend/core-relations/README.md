@@ -172,37 +172,6 @@ thinks is a good idea. The last time I looked at the egglog test suite, most
 programs do not use this feature, and if they did we can rewrite queries
 automatically to get these semantics back.
 
-### Containers
-Containers are not currently supported, and I think we need to implement a new
-feature to add support. In eggcc, a lot of vectors are "reflected" into the
-database. In addition to a `(Vec Operand)` you might have:
-
-```
-(function (Vec-get (Vec Operand) int) Operand)
-```
-
-And similar for `Vec-length`, etc. We do not really use the vector contents
-themselves except to dump them into a table.
-
-In other words, we can represent containers _as relations_, and relations are
-something that we already support! There's a problem though: we don't know how
-to write congruence for vectors this way. We need a way to union the ids
-associated with two vectors when all of their operands are equal. I suggest a
-new type of rule: "forall rules". We ought to be able to write:
-
-```scheme
-(rule ((Vec v1) (Vec v2)
-       (!= v1 v2)
-       (forall i (= (Vec-get v1 i) (Vec-get v2 i))))
-    (union v1 v2))
-```
-
-Maps are similar.
-
-I believe that the API for these is subtle, but that the implementation wouldn't
-actually be that bad: Free Join and GJ already do a lot of "iterate over all
-`i`s such that `<long list of constraints>` match."
-
 ### Proofs?
 My hope for proofs is that we can define an additional non-primary key that
 points to the root of the _proof tree_ associated with that term. Then, as
@@ -213,3 +182,124 @@ congruence will be "just another rule", we can also add proofs there.
 This doesn't make proof production trivial, but it gives us more freedom in
 using native union-finds, and allowing for more information to be stored inline
 rather than "a join or two away".
+
+## Parallelism
+
+This branch has some work towards supporting parallel egglog execution.
+Essentially all the work for parallelism happens in `core-relations`: We don't
+want to change the execution model to start with, we just want it so that when
+you run a bunch of rules, those rules run in parallel as much as possible.
+
+
+At a high level, the main architectural changes to support parallelism are as
+follows:
+
+1. All of the `stage_insert` and `stage_remove` calls are moved to a
+`MutationBuffer` structure which batches mutations in a thread-local buffer
+before flushing them at destruction time. `MutationBuffer` uses a thread-safe
+queue under the hood to allow for batches to be accumulated and flushed in
+parallel.
+
+2. Core data-structures are now thread-safe. This is a mix of replacing hashmaps
+with concurrent variants (as in the "Predicted Values" structure), and writing
+our own (Union Find, Indexes [to an extent], Intern tables). Custom concurrent
+data-structures are in the `concurrency` crate.
+
+3. All main types are now marked as `Send` and `Sync`. This required refactoring
+the Primitives module.
+
+With all that, I'd say we're ready to really start experimenting with
+parallelism. A few places to start:
+
+### Parallel Rules
+When running a set of rules, we currently have the following loop in the
+`Database::run_rule_set` in `core-relations/src/free_join/execute.rs`:
+
+```rust
+        let mut join_state = JoinState {
+            db: self,
+            preds: &preds,
+            subsets: Default::default(),
+            bindings: Default::default(),
+            var_batches: Default::default(),
+            index_cache: Default::default(),
+        };
+        for (plan, desc) in &rule_set.plans {
+            with_pool_set(|ps| {
+                let start = Instant::now();
+                for (id, info) in plan.atoms.iter() {
+                    let table = join_state.db.get_table(info.table);
+                    join_state.subsets.insert(id, table.all());
+                }
+                join_state.run_plan(plan, rule_set, 0, ps);
+                join_state.subsets.clear();
+                join_state.bindings.clear();
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    log::debug!("Rule {desc} took {elapsed:?}");
+                    log::debug!("Plan for {desc}: {plan:#?}");
+                } else {
+                    log::trace!("Rule {desc} took {elapsed:?}");
+                }
+            });
+        }
+        let mut batches = join_state.var_batches;
+        let mut exec_state = ExecutionState {
+            db: self.read_only_view(),
+            predicted: &preds,
+            buffers: Default::default(),
+        };
+        // Run any remaining batches.
+        for (action, ActionState { bindings, .. }) in batches.iter_mut() {
+            exec_state.run_instrs(&rule_set.actions[action], bindings);
+        }
+```
+
+I think we could probably move the `JoinState` construction and cleanup _inside_
+the for loop and then change the loop to a rayon parallel for-each? We may have
+to clean more stuff up by doing that, but it is a reasonable place to start I
+think.
+
+
+Once that's done, we can parallelize _within_ the recusrive GJ loop.
+
+#### Parallelizing FJ/GJ
+The core join logic happens in `JoinState::run_plan` in
+`src/free_join/execute.rs`. Unlike egglog, we attempt to batch execution at a
+single level before making a recursive call. Batches are flushed to a recursive
+call in the `drain_updates` macro:
+
+```rust
+macro_rules! drain_updates {
+    ($updates:expr) => {
+        for mut update in $updates.drain(..) {
+            for (var, val) in update.bindings.drain(..) {
+                self.bindings.insert(var, val);
+            }
+            for (atom, subset) in update.refinements.drain(..) {
+                self.subsets.insert(atom, subset);
+            }
+            self.run_plan(plan, rule_set, cur + 1, ps);
+        }
+    };
+}
+```
+
+The outer method accumulates a number of variable bindings or refined subsets,
+then we do a recursive call in a batch. I think this is a good place to kick off
+a recurive call (using `rayon::scope` and `spawn`). We'll want to move
+`bindings` and `refinements` out of `JoinState` and instead pass them as
+parameters to `run_plan`. Then, a new scope 
+could take ownership of `$updates` and copy `subsets` and `bindings` , then run
+the rest of the loop as before.
+
+We can then vary the "morsel size" here by changing the `CHUNK_SIZE` constant.
+
+### Inter-table Write Parallelism
+TODO
+
+### Intra-table Write Parallelism
+TODO
+
+### Increasing Rebuild Parallelism
+TODO
