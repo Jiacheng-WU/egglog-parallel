@@ -4,14 +4,14 @@ use std::{
     mem,
 };
 
-use hashbrown::raw::RawTable;
+use hashbrown::HashTable;
 use numeric_id::{define_id, NumericId};
 use rustc_hash::FxHasher;
 
 use crate::{
     common::{IndexMap, Value},
     offsets::{RowId, SortedOffsetSlice, SubsetRef},
-    pool::{Clear, PoolSet, Pooled},
+    pool::{with_pool_set, Clear, PoolSet, Pooled},
     row_buffer::{RowBuffer, TaggedRowBuffer},
     table_spec::{ColumnId, Generation, Offset, TableVersion, WrappedTable},
     OffsetRange,
@@ -50,22 +50,26 @@ impl<TI: IndexBase> Index<TI> {
         self.table.get_subset(key)
     }
 
+    pub(crate) fn needs_refresh(&self, table: &WrappedTable) -> bool {
+        table.version() != self.updated_to
+    }
+
     /// Update the contents of the index to the current version of the table.
     ///
     /// The index is guaranteed to be up to date until `merge` is called on the
     /// table again.
-    pub(crate) fn refresh(&mut self, table: &WrappedTable, pool_set: &PoolSet) {
+    pub(crate) fn refresh(&mut self, table: &WrappedTable) {
         let cur_version = table.version();
         if cur_version == self.updated_to {
             return;
         }
         let subset = if cur_version.major != self.updated_to.major {
             self.table.clear();
-            table.all(pool_set)
+            table.all()
         } else {
-            table.updates_since(self.updated_to.minor, pool_set)
+            table.updates_since(self.updated_to.minor)
         };
-        let mut buf = TaggedRowBuffer::new(self.key.len(), pool_set);
+        let mut buf = TaggedRowBuffer::new(self.key.len());
         let mut cur = Offset::new(0);
         loop {
             buf.clear();
@@ -73,9 +77,9 @@ impl<TI: IndexBase> Index<TI> {
                 table.scan_project(subset.as_ref(), &self.key, cur, 1024, &[], &mut buf)
             {
                 cur = next;
-                self.table.merge_rows(&buf, pool_set);
+                self.table.merge_rows(&buf);
             } else {
-                self.table.merge_rows(&buf, pool_set);
+                self.table.merge_rows(&buf);
                 break;
             }
         }
@@ -93,7 +97,7 @@ impl<TI: IndexBase> Index<TI> {
 
 // Define a newtype to hook things into the PoolSet machinery.
 #[derive(Default)]
-pub(crate) struct SubsetTable(RawTable<TableEntry<BufferedSubset>>);
+pub(crate) struct SubsetTable(HashTable<TableEntry<BufferedSubset>>);
 
 impl Clear for SubsetTable {
     fn clear(&mut self) {
@@ -106,7 +110,7 @@ impl Clear for SubsetTable {
 
 // Define a newtype to hook things into the PoolSet machinery.
 #[derive(Default)]
-pub(crate) struct KeyPresenceTable(RawTable<TableEntry<()>>);
+pub(crate) struct KeyPresenceTable(HashTable<TableEntry<()>>);
 
 impl Clear for KeyPresenceTable {
     fn clear(&mut self) {
@@ -127,9 +131,9 @@ pub(crate) trait IndexBase {
     /// Get the subset corresponding to this key, if there is one.
     fn get_subset<'a>(&'a self, key: &Self::Key) -> Option<SubsetRef<'a>>;
     /// Add the given key and row id to the table.
-    fn add_row(&mut self, key: &Self::Key, row: RowId, ps: &PoolSet);
+    fn add_row(&mut self, key: &Self::Key, row: RowId);
     /// Merge the contents of the [`TaggedRowBuffer`] into the table.
-    fn merge_rows(&mut self, buf: &TaggedRowBuffer, pool_set: &PoolSet);
+    fn merge_rows(&mut self, buf: &TaggedRowBuffer);
     /// Call `f` over the elements of the index.
     fn for_each(&self, f: impl FnMut(&Self::Key, SubsetRef));
     /// The number of keys in the index.
@@ -150,16 +154,16 @@ impl IndexBase for ColumnIndex {
     fn get_subset(&self, key: &Value) -> Option<SubsetRef> {
         self.table.get(key).map(|x| x.as_ref(&self.subsets))
     }
-    fn add_row(&mut self, key: &Value, row: RowId, _: &PoolSet) {
+    fn add_row(&mut self, key: &Value, row: RowId) {
         self.table
             .entry(*key)
             .or_insert_with(BufferedSubset::empty)
             .add_row_sorted(row, &mut self.subsets);
     }
-    fn merge_rows(&mut self, buf: &TaggedRowBuffer, pool_set: &PoolSet) {
+    fn merge_rows(&mut self, buf: &TaggedRowBuffer) {
         for (src_id, key) in buf.iter() {
             debug_assert_eq!(key.len(), 1);
-            self.add_row(&key[0], src_id, pool_set);
+            self.add_row(&key[0], src_id);
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
@@ -173,11 +177,11 @@ impl IndexBase for ColumnIndex {
 }
 
 impl ColumnIndex {
-    pub(crate) fn new(pool_set: &PoolSet) -> ColumnIndex {
-        ColumnIndex {
-            table: pool_set.get(),
-            subsets: SubsetBuffer::new(pool_set),
-        }
+    pub(crate) fn new() -> ColumnIndex {
+        with_pool_set(|ps| ColumnIndex {
+            table: ps.get(),
+            subsets: SubsetBuffer::new(ps),
+        })
     }
 }
 
@@ -191,14 +195,16 @@ pub struct TupleIndex {
 }
 
 impl TupleIndex {
-    pub(crate) fn new(key_arity: usize, pool_set: &PoolSet) -> TupleIndex {
-        let keys = RowBuffer::new(key_arity, pool_set);
-        let table = pool_set.get();
-        TupleIndex {
-            keys,
-            table,
-            subsets: SubsetBuffer::new(pool_set),
-        }
+    pub(crate) fn new(key_arity: usize) -> TupleIndex {
+        let keys = RowBuffer::new(key_arity);
+        with_pool_set(|ps| {
+            let table = ps.get();
+            TupleIndex {
+                keys,
+                table,
+                subsets: SubsetBuffer::new(ps),
+            }
+        })
     }
 }
 
@@ -212,45 +218,46 @@ impl IndexBase for TupleIndex {
 
     fn get_subset(&self, key: &[Value]) -> Option<SubsetRef> {
         let hash = hash_key(key);
-        let entry = self.table.0.get(hash, |entry| {
+        let entry = self.table.0.find(hash, |entry| {
             entry.hash == hash && self.keys.get_row(entry.key) == key
         })?;
         Some(entry.vals.as_ref(&self.subsets))
     }
 
-    fn add_row(&mut self, key: &[Value], row: RowId, _: &PoolSet) {
+    fn add_row(&mut self, key: &[Value], row: RowId) {
         let hash = hash_key(key);
-        if let Some(entry) = self.table.0.get_mut(hash, |entry| {
-            entry.hash == hash && self.keys.get_row(entry.key) == key
-        }) {
-            entry.vals.add_row_sorted(row, &mut self.subsets);
-        } else {
-            let key_id = self.keys.add_row(key);
-            let subset = BufferedSubset::singleton(row);
-            self.table.0.insert(
-                hash,
-                TableEntry {
+        let table_entry = self.table.0.entry(
+            hash,
+            |entry| entry.hash == hash && self.keys.get_row(entry.key) == key,
+            |ent| ent.hash,
+        );
+        match table_entry {
+            hashbrown::hash_table::Entry::Occupied(mut occ) => {
+                occ.get_mut().vals.add_row_sorted(row, &mut self.subsets);
+            }
+            hashbrown::hash_table::Entry::Vacant(v) => {
+                let key_id = self.keys.add_row(key);
+                let subset = BufferedSubset::singleton(row);
+                v.insert(TableEntry {
                     hash,
                     key: key_id,
                     vals: subset,
-                },
-                |entry| entry.hash,
-            );
+                });
+            }
         }
     }
 
-    fn merge_rows(&mut self, buf: &TaggedRowBuffer, pool_set: &PoolSet) {
+    fn merge_rows(&mut self, buf: &TaggedRowBuffer) {
         for (src_id, key) in buf.iter() {
-            self.add_row(key, src_id, pool_set);
+            self.add_row(key, src_id);
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
         // SAFETY: `f` cannot leak references from the callback due to its type.
-        for entry in unsafe { self.table.0.iter() } {
-            let entry = unsafe { entry.as_ref() };
+        self.table.0.iter().for_each(|entry| {
             let key = self.keys.get_row(entry.key);
             f(key, entry.vals.as_ref(&self.subsets));
-        }
+        });
     }
 
     fn len(&self) -> usize {

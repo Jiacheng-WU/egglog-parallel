@@ -13,10 +13,10 @@ use crate::{
         ActionId, AtomId, Database, ProcessedConstraints, SubAtom, TableId, TableInfo, VarInfo,
         Variable,
     },
-    pool::Pooled,
+    pool::{with_pool_set, Pooled},
     primitives::{PrimitiveFunctionId, PrimitiveId},
     table_spec::{ColumnId, Constraint},
-    ExternalFunctionId, PrimitiveFunctionSignature,
+    ExternalFunctionId, PoolSet, PrimitiveFunctionSignature,
 };
 
 /// A set of queries to run against a [`Database`]
@@ -52,7 +52,7 @@ impl<'outer> RuleSetBuilder<'outer> {
 
     /// Start a new query against this rule set.
     pub fn new_query<'a>(&'a mut self) -> QueryBuilder<'outer, 'a> {
-        let instrs = self.db.pool_set().get();
+        let instrs = with_pool_set(PoolSet::get);
         QueryBuilder {
             rsb: self,
             instrs,

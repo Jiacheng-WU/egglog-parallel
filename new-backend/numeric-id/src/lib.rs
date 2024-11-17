@@ -11,16 +11,29 @@ mod tests;
 
 /// A trait describing "newtypes" that wrap an integer.
 pub trait NumericId: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Hash {
+    type Rep;
+    type Atomic;
+    fn new(val: Self::Rep) -> Self;
     fn from_usize(index: usize) -> Self;
     fn index(self) -> usize;
+    fn rep(self) -> Self::Rep;
     fn inc(self) -> Self {
         Self::from_usize(self.index() + 1)
     }
 }
 
 impl NumericId for usize {
+    type Rep = usize;
+    type Atomic = std::sync::atomic::AtomicUsize;
+    fn new(val: usize) -> Self {
+        val
+    }
     fn from_usize(index: usize) -> Self {
         index
+    }
+
+    fn rep(self) -> usize {
+        self
     }
 
     fn index(self) -> usize {
@@ -257,9 +270,29 @@ mod context {
 pub use context::ContextHandle;
 
 #[macro_export]
+#[doc(hidden)]
+macro_rules! atomic_of {
+    (usize) => {
+        std::sync::atomic::AtomicUsize
+    };
+    (u8) => {
+        std::sync::atomic::AtomicU8
+    };
+    (u16) => {
+        std::sync::atomic::AtomicU16
+    };
+    (u32) => {
+        std::sync::atomic::AtomicU32
+    };
+    (u64) => {
+        std::sync::atomic::AtomicU64
+    };
+}
+
+#[macro_export]
 macro_rules! define_id {
-    ($v:vis $name:ident, $repr:ty) => { define_id!($v, $name, $repr, ""); };
-    ($v:vis $name:ident, $repr:ty, $doc:tt) => {
+    ($v:vis $name:ident, $repr:tt) => { define_id!($v, $name, $repr, ""); };
+    ($v:vis $name:ident, $repr:tt, $doc:tt) => {
         #[derive(Copy, Clone)]
         #[doc = $doc]
         $v struct $name {
@@ -302,9 +335,7 @@ macro_rules! define_id {
                 }
             }
 
-            $v fn new(id: $repr) -> Self {
-                Self::with_context(id, "")
-            }
+
 
             #[allow(unused)]
             $v const fn new_const(id: $repr) -> Self {
@@ -316,16 +347,18 @@ macro_rules! define_id {
 
             #[allow(unused)]
             $v fn range(low: Self, high: Self) -> impl Iterator<Item = Self> {
+                use $crate::NumericId;
                 (low.rep..high.rep).map(|i| $name::new(i))
             }
 
-            #[allow(unused)]
-            $v fn rep(self) -> $repr {
-                self.rep
-            }
         }
 
         impl $crate::NumericId for $name {
+            type Rep = $repr;
+            type Atomic = $crate::atomic_of!($repr);
+            fn new(id: $repr) -> Self {
+                Self::with_context(id, "")
+            }
             fn from_usize(index: usize) -> Self {
                 assert!(<$repr>::MAX as usize >= index,
                     "overflowing id type {} (represented as {}) with index {}", stringify!($name), stringify!($repr), index);
@@ -333,6 +366,9 @@ macro_rules! define_id {
             }
             fn index(self) -> usize {
                 self.rep as usize
+            }
+            fn rep(self) -> $repr {
+                self.rep
             }
         }
 

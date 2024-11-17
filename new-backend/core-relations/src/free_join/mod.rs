@@ -1,18 +1,25 @@
 //! Execute queries against a database using a variant of Free Join.
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    mem,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 
-use numeric_id::{define_id, DenseIdMap};
+use concurrency::ReadOptimizedLock;
+use numeric_id::{define_id, DenseIdMap, NumericId};
 use smallvec::SmallVec;
 
 use crate::{
     action::{
         mask::{Mask, MaskIter, ValueSource},
-        Bindings,
+        Bindings, DbView,
     },
-    common::HashMap,
+    common::DashMap,
     hash_index::{ColumnIndex, Index},
     offsets::Subset,
-    pool::{Pool, PoolSet, Pooled},
+    pool::{with_pool_set, Pool, Pooled},
     primitives::Primitives,
     query::{Query, RuleSetBuilder},
     table_spec::{ColumnId, Constraint, Table, TableSpec, WrappedTable},
@@ -92,14 +99,14 @@ pub(crate) struct VarInfo {
     pub(crate) used_in_rhs: bool,
 }
 
-pub(crate) type HashIndex = Rc<RefCell<Index<TupleIndex>>>;
-pub(crate) type HashColumnIndex = Rc<RefCell<Index<ColumnIndex>>>;
+pub(crate) type HashIndex = Arc<ReadOptimizedLock<Index<TupleIndex>>>;
+pub(crate) type HashColumnIndex = Arc<ReadOptimizedLock<Index<ColumnIndex>>>;
 
-pub(crate) struct TableInfo {
+pub struct TableInfo {
     pub(crate) spec: TableSpec,
     pub(crate) table: WrappedTable,
-    pub(crate) indexes: HashMap<SmallVec<[ColumnId; 4]>, HashIndex>,
-    pub(crate) column_indexes: HashMap<ColumnId, HashColumnIndex>,
+    pub(crate) indexes: DashMap<SmallVec<[ColumnId; 4]>, HashIndex>,
+    pub(crate) column_indexes: DashMap<ColumnId, HashColumnIndex>,
 }
 
 impl Clone for TableInfo {
@@ -113,12 +120,6 @@ impl Clone for TableInfo {
     }
 }
 
-impl TableInfo {
-    pub(crate) fn table_mut(&mut self) -> &mut dyn Table {
-        &mut *self.table
-    }
-}
-
 define_id!(pub CounterId, u32, "A counter accessible to actions, useful for generating unique Ids.");
 define_id!(pub ExternalFunctionId, u32, "A user-defined operation that can be invoked from a query");
 
@@ -127,10 +128,10 @@ define_id!(pub ExternalFunctionId, u32, "A user-defined operation that can be in
 ///
 /// This is a useful, if low-level, interface for extending this database with
 /// functionality and state not built into the core model.
-pub trait ExternalFunction {
+pub trait ExternalFunction: Send + Sync {
     /// Invoke the function with mutable access to the database. If a value is
     /// not returned, halt the execution of the current rule.
-    fn invoke(&self, state: &mut ExecutionState, args: &[Value]) -> Option<Value>;
+    fn invoke(&self, state: &ExecutionState, args: &[Value]) -> Option<Value>;
 }
 
 pub(crate) trait ExternalFunctionExt: ExternalFunction {
@@ -142,13 +143,13 @@ pub(crate) trait ExternalFunctionExt: ExternalFunction {
     #[doc(hidden)]
     fn invoke_batch(
         &self,
-        state: &mut ExecutionState,
+        state: &ExecutionState,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
         out_var: Variable,
     ) {
-        let pool: Pool<Vec<Value>> = state.db.pool_set().get_pool().clone();
+        let pool: Pool<Vec<Value>> = with_pool_set(|ps| ps.get_pool().clone());
         let mut out = pool.get();
         mask.iter_dynamic(
             pool,
@@ -172,26 +173,26 @@ pub struct Database {
     // NB: some fields are pub(crate) to allow some internal modules to avoid
     // borrowing the whole table.
     pub(crate) tables: DenseIdMap<TableId, TableInfo>,
-    pub(crate) counters: DenseIdMap<CounterId, usize>,
+    // TODO: having a single AtomicUsize per counter can lead to contention. We
+    // should look into prefetching counters when creating a new ExecutionState
+    // and incrementing locally. Note that the batch size shouldn't be too big
+    // because we keep an array per id in the UF.
+    pub(crate) counters: DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_functions: DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
     primitives: Primitives,
-    pub(crate) pool_set: PoolSet,
     stack: Vec<DbState>,
 }
 
 struct DbState {
     tables: DenseIdMap<TableId, TableInfo>,
-    counters: DenseIdMap<CounterId, usize>,
+    counters: DenseIdMap<CounterId, AtomicUsize>,
 }
 
 pub(crate) fn inc_counter(
-    counters: &mut DenseIdMap<CounterId, usize>,
+    counters: &DenseIdMap<CounterId, AtomicUsize>,
     counter_id: CounterId,
 ) -> usize {
-    let c = counters.get_mut(counter_id).expect("counter must exist");
-    let res = *c;
-    *c += 1;
-    res
+    counters[counter_id].fetch_add(1, Ordering::Relaxed)
 }
 
 impl Database {
@@ -205,9 +206,13 @@ impl Database {
     /// Depending on the implementation of the tables in the database, this
     /// could deep-copy all database state.
     pub fn push(&mut self) {
+        let mut counters = DenseIdMap::with_capacity(self.counters.n_ids());
+        for (k, v) in self.counters.iter() {
+            counters.insert(k, AtomicUsize::new(v.load(Ordering::Acquire)));
+        }
         self.stack.push(DbState {
             tables: self.tables.clone(),
-            counters: self.counters.clone(),
+            counters,
         });
     }
 
@@ -234,27 +239,21 @@ impl Database {
         self.external_functions.push(Box::new(f))
     }
 
-    pub(crate) fn extract_external_func(
-        &mut self,
-        id: ExternalFunctionId,
-    ) -> Box<dyn ExternalFunctionExt> {
-        self.external_functions.take(id)
-    }
-
-    pub(crate) fn replace_external_func(
-        &mut self,
-        id: ExternalFunctionId,
-        f: Box<dyn ExternalFunctionExt>,
-    ) {
-        self.external_functions.insert(id, f);
-    }
-
     pub fn primitives(&self) -> &Primitives {
         &self.primitives
     }
 
     pub fn primitives_mut(&mut self) -> &mut Primitives {
         &mut self.primitives
+    }
+
+    pub(crate) fn read_only_view(&self) -> DbView<DenseIdMap<TableId, TableInfo>> {
+        DbView {
+            table_info: &self.tables,
+            counters: &self.counters,
+            external_funcs: &self.external_functions,
+            prims: &self.primitives,
+        }
     }
 
     /// Estimate the size of the table. If a constraint is provided, return an
@@ -264,12 +263,12 @@ impl Database {
             .tables
             .get(table)
             .expect("table must be declared in the current database");
-        let mut sub = table_info.table.all(self.pool_set());
+        let mut sub = table_info.table.all();
         if let Some(c) = c {
-            if let Some(sub) = table_info.table.fast_subset(&c, self.pool_set()) {
+            if let Some(sub) = table_info.table.fast_subset(&c) {
                 return sub.size();
             }
-            sub = table_info.table.refine(sub, &[c], self.pool_set());
+            sub = table_info.table.refine(sub, &[c]);
         }
         sub.size()
     }
@@ -278,23 +277,36 @@ impl Database {
     ///
     /// These counters can be used to generate unique ids as part of an action.
     pub fn add_counter(&mut self) -> CounterId {
-        self.counters.push(0)
-    }
-
-    pub fn pool_set(&self) -> &PoolSet {
-        &self.pool_set
+        self.counters.push(AtomicUsize::new(0))
     }
 
     /// A helper for merging all pending updates. Currently only used in tests.
     ///
     /// Useful for out-of-band insertions into the database.
-    pub fn merge_all(&mut self) {
-        let mut predicted = PredictedVals::default();
-        let mut exec_state = ExecutionState {
-            db: self,
-            predicted: &mut predicted,
-        };
-        exec_state.merge_all();
+    pub fn merge_all(&mut self) -> bool {
+        let mut ever_changed = false;
+        loop {
+            let mut changed = false;
+            let predicted = PredictedVals::default();
+            for id in 0..self.tables.n_ids() {
+                // Move the table out of the tables map. Run the merge (which can
+                // access the rest of the db). Then put it back.
+                let table = TableId::from_usize(id);
+                let mut info = self.tables.take(table);
+                let table_changed = info.table.merge(&mut ExecutionState {
+                    predicted: &predicted,
+                    db: self.read_only_view(),
+                    buffers: Default::default(),
+                });
+                changed |= table_changed;
+                self.tables.insert(table, info);
+            }
+            ever_changed |= changed;
+            if !changed {
+                break;
+            }
+        }
+        ever_changed
     }
 
     /// A low-level helper for merging pending updates to a particular function.
@@ -304,17 +316,19 @@ impl Database {
     /// elesewhere. The `merge_all` method runs merges to a fixed point to avoid
     /// surprises here.
     pub fn merge_table(&mut self, table: TableId) {
-        let mut predicted = PredictedVals::default();
-        let mut exec_state = ExecutionState {
-            db: self,
-            predicted: &mut predicted,
-        };
-        exec_state.merge_table(table);
+        let mut info = self.tables.take(table);
+        let predicted = PredictedVals::default();
+        let _table_changed = info.table.merge(&mut ExecutionState {
+            db: self.read_only_view(),
+            predicted: &predicted,
+            buffers: Default::default(),
+        });
+        self.tables.insert(table, info);
     }
 
     /// Increment the given counter and return its previous value.
-    pub fn inc_counter(&mut self, counter: CounterId) -> usize {
-        inc_counter(&mut self.counters, counter)
+    pub fn inc_counter(&self, counter: CounterId) -> usize {
+        inc_counter(&self.counters, counter)
     }
 
     /// Get id of the next table to be added to the database.
@@ -357,7 +371,7 @@ impl Database {
         cs: &[Constraint],
     ) -> ProcessedConstraints {
         let table_info = &mut self.tables[table];
-        let (mut subset, mut fast, mut slow) = table_info.table.split_fast_slow(cs, &self.pool_set);
+        let (mut subset, mut fast, mut slow) = table_info.table.split_fast_slow(cs);
         slow.retain(|c| {
             let (col, val) = match c {
                 Constraint::EqConst { col, val } => (*col, *val),
@@ -380,10 +394,10 @@ impl Database {
             // We have or will build an index: upgrade this constraint to
             // 'fast'.
             fast.push(c.clone());
-            let index = get_column_index_from_tableinfo(table_info, col, &self.pool_set);
-            match index.borrow().get_subset(&val) {
+            let index = get_column_index_from_tableinfo(table_info, col);
+            match index.read().get_subset(&val) {
                 Some(s) => {
-                    subset.intersect(s, self.pool_set.get_pool());
+                    with_pool_set(|ps| subset.intersect(s, &ps.get_pool()));
                 }
                 None => {
                     // There are no rows matching this key! We can constrain this to nothing.
@@ -416,52 +430,37 @@ impl Database {
 ///
 /// This is in a separate function to allow us to reuse it while already
 /// borrowing a `TableInfo`.
-fn get_index_from_tableinfo<'a>(
-    table_info: &'a mut TableInfo,
-    cols: &[ColumnId],
-    pool_set: &PoolSet,
-) -> &'a HashIndex {
-    let (_, index) = table_info
-        .indexes
-        .raw_entry_mut()
-        .from_key(cols)
-        .or_insert_with(|| {
-            (
-                cols.iter().copied().collect(),
-                Rc::new(RefCell::new(Index::new(
-                    cols.to_vec(),
-                    TupleIndex::new(cols.len(), pool_set),
-                ))),
-            )
-        });
-    if let Ok(mut ix) = index.try_borrow_mut() {
-        // NB: why is try_borrow safe?
-        // * We update indexes from within the execution of free join.
-        // * We may use the same index more than once during a query, so
-        // try_borrow_mut() can fail.
-        // * But we only need to refresh the table _once_ at the beginning of
-        // the query, so a single success is all we need.
-        ix.refresh(&table_info.table, pool_set);
+fn get_index_from_tableinfo(table_info: &TableInfo, cols: &[ColumnId]) -> HashIndex {
+    let guard = table_info.indexes.entry(cols.into()).or_insert_with(|| {
+        Arc::new(ReadOptimizedLock::new(Index::new(
+            cols.to_vec(),
+            TupleIndex::new(cols.len()),
+        )))
+    });
+    let ix = guard.value().read();
+    if ix.needs_refresh(&table_info.table) {
+        mem::drop(ix);
+        let mut ix = guard.value().lock();
+        ix.refresh(&table_info.table);
     }
-    index
+    guard.value().clone()
 }
 
 /// The core logic behind getting and updating a column index.
 ///
 /// This is the single-column analog to [`get_index_from_tableinfo`].
-fn get_column_index_from_tableinfo<'a>(
-    table_info: &'a mut TableInfo,
-    col: ColumnId,
-    pool_set: &PoolSet,
-) -> &'a HashColumnIndex {
+fn get_column_index_from_tableinfo(table_info: &TableInfo, col: ColumnId) -> HashColumnIndex {
     let index = table_info.column_indexes.entry(col).or_insert_with(|| {
-        Rc::new(RefCell::new(Index::new(
+        Arc::new(ReadOptimizedLock::new(Index::new(
             vec![col],
-            ColumnIndex::new(pool_set),
+            ColumnIndex::new(),
         )))
     });
-    if let Ok(mut ix) = index.try_borrow_mut() {
-        ix.refresh(&table_info.table, pool_set);
+    let ix = index.read();
+    if ix.needs_refresh(&table_info.table) {
+        mem::drop(ix);
+        let mut ix = index.lock();
+        ix.refresh(&table_info.table);
     }
-    index
+    index.clone()
 }

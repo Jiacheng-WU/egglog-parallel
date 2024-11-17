@@ -22,7 +22,7 @@ use crate::{
     common::Value,
     hash_index::{ColumnIndex, IndexBase, TupleIndex},
     offsets::{RowId, Subset, SubsetRef},
-    pool::{PoolSet, Pooled},
+    pool::{with_pool_set, PoolSet, Pooled},
     row_buffer::TaggedRowBuffer,
     QueryEntry, Variable,
 };
@@ -31,7 +31,7 @@ define_id!(pub ColumnId, u32, "a particular column in a table");
 define_id!(
     pub Generation,
     u64,
-    "the current version of a table -- uesd to invalidate any existing RowIds"
+    "the current version of a table -- used to invalidate any existing RowIds"
 );
 define_id!(
     pub Offset,
@@ -101,7 +101,7 @@ pub struct Row {
 }
 
 /// An interface for a table.
-pub trait Table: Any {
+pub trait Table: Any + Send + Sync {
     /// A variant of clone that returns a boxed trait object; this trait object
     /// must contain all of the data associated with the current table.
     fn dyn_clone(&self) -> Box<dyn Table>;
@@ -125,21 +125,26 @@ pub trait Table: Any {
     // Used in queries:
 
     /// Get a subset corresponding to all rows in the table.
-    fn all(&self, pool_set: &PoolSet) -> Subset;
+    fn all(&self) -> Subset;
 
     /// Get the length of the table.
     ///
     /// This is not in general equal to the length of the `all` subset: the size
     /// of a subset is allowed to be larger than the number of table entries in
     /// range of the subset.
-    fn len(&self, pool_set: &PoolSet) -> usize;
+    fn len(&self) -> usize;
+
+    /// Check if the table is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 
     /// Get the current version for the table. [`RowId`]s and [`Subset`]s are
     /// only valid for a given major generation.
     fn version(&self) -> TableVersion;
 
     /// Get the subset of the table that has appeared since the last offset.
-    fn updates_since(&self, gen: Offset, pool_set: &PoolSet) -> Subset;
+    fn updates_since(&self, gen: Offset) -> Subset;
 
     /// Iterate over the given subset of the table, starting at an opaque
     /// `start` token, ending after up to `n` rows, returning the next start
@@ -179,16 +184,16 @@ pub trait Table: Any {
     /// Filter a given subset of the table for the rows matching the single constraint.
     ///
     /// Implementors must provide at least one of `refine_one` or `refine`.`
-    fn refine_one(&self, subset: Subset, c: &Constraint, pool_set: &PoolSet) -> Subset {
-        self.refine(subset, std::slice::from_ref(c), pool_set)
+    fn refine_one(&self, subset: Subset, c: &Constraint) -> Subset {
+        self.refine(subset, std::slice::from_ref(c))
     }
 
     /// Filter a given subset of the table for the rows matching the given constraints.
     ///
     /// Implementors must provide at least one of `refine_one` or `refine`.`
-    fn refine(&self, subset: Subset, cs: &[Constraint], pool_set: &PoolSet) -> Subset {
+    fn refine(&self, subset: Subset, cs: &[Constraint]) -> Subset {
         cs.iter()
-            .fold(subset, |subset, c| self.refine_one(subset, c, pool_set))
+            .fold(subset, |subset, c| self.refine_one(subset, c))
     }
 
     /// An optional method for quickly generating a subset from a constraint.
@@ -197,7 +202,7 @@ pub trait Table: Any {
     ///
     /// These constraints are very helpful for query planning; it is a good idea
     /// to implement them.
-    fn fast_subset(&self, _: &Constraint, _: &PoolSet) -> Option<Subset> {
+    fn fast_subset(&self, _: &Constraint) -> Option<Subset> {
         None
     }
 
@@ -207,24 +212,25 @@ pub trait Table: Any {
     fn split_fast_slow(
         &self,
         cs: &[Constraint],
-        pool_set: &PoolSet,
     ) -> (
         Subset,                  /* the subset of the table matching all fast constraints */
         Pooled<Vec<Constraint>>, /* the fast constraints */
         Pooled<Vec<Constraint>>, /* the slow constraints */
     ) {
-        let mut fast = pool_set.get::<Vec<_>>();
-        let mut slow = pool_set.get::<Vec<_>>();
-        let mut subset = self.all(pool_set);
-        for c in cs {
-            if let Some(sub) = self.fast_subset(c, pool_set) {
-                subset.intersect(sub.as_ref(), pool_set.get_pool());
-                fast.push(c.clone());
-            } else {
-                slow.push(c.clone());
+        with_pool_set(|ps| {
+            let mut fast = ps.get::<Vec<Constraint>>();
+            let mut slow = ps.get::<Vec<Constraint>>();
+            let mut subset = self.all();
+            for c in cs {
+                if let Some(sub) = self.fast_subset(c) {
+                    subset.intersect(sub.as_ref(), &ps.get_pool());
+                    fast.push(c.clone());
+                } else {
+                    slow.push(c.clone());
+                }
             }
-        }
-        (subset, fast, slow)
+            (subset, fast, slow)
+        })
     }
 
     // Used in actions:
@@ -233,28 +239,40 @@ pub trait Table: Any {
     ///
     /// The number of values specified by `keys` should match the number of
     /// primary keys for the table.
-    fn get_row(&self, key: &[Value], pool_set: &PoolSet) -> Option<Row>;
+    fn get_row(&self, key: &[Value]) -> Option<Row>;
 
     /// Look up the given column of single row by the given key values, if it is
     /// in the table.
     ///
     /// The number of values specified by `keys` should match the number of
     /// primary keys for the table.
-    fn get_row_column(&self, key: &[Value], col: ColumnId, pool_set: &PoolSet) -> Option<Value> {
-        self.get_row(key, pool_set).map(|row| row.vals[col.index()])
+    fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
+        self.get_row(key).map(|row| row.vals[col.index()])
     }
-
-    /// Stage the row for insertion. Changes may not be visible until after
-    /// `merge` is called.
-    fn stage_insert(&mut self, row: &[Value]);
-
-    /// Stage the keyed entries for removal. Changes may not be visible until after
-    /// `merge` is called.
-    fn stage_remove(&mut self, key: &[Value]);
 
     /// Merge any updates to the table, and potentially update the generation for
     /// the table.
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool;
+
+    /// Create a new buffer for staging mutations on this table.
+    fn new_buffer(&self) -> Box<dyn MutationBuffer>;
+}
+
+/// A trait specifying a buffer of pending mutations for a [`Table`].
+///
+/// Dropping an object implementing this trait should "flush" the pending
+/// mutations to the table. Calling  [`Table::merge`] on that table would then
+/// apply those mutations, making them visible for future readers.
+pub trait MutationBuffer: Any {
+    /// Stage the keyed entries for insertion. Changes may not be visible until
+    /// this buffer is dropped, and after `merge` is called on the underlying
+    /// table.
+    fn stage_insert(&mut self, row: &[Value]);
+
+    /// Stage the keyed entries for removal. Changes may not be visible until
+    /// this buffer is dropped, and after `merge` is called on the underlying
+    /// table.
+    fn stage_remove(&mut self, key: &[Value]);
 }
 
 struct WrapperImpl<T>(PhantomData<*const T>);
@@ -280,43 +298,27 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
             out.add_row(row_id, row);
         })
     }
-    fn pivot_col(
-        &self,
-        table: &dyn Table,
-        subset: SubsetRef,
-        col: ColumnId,
-        pool_set: &PoolSet,
-    ) -> ColumnIndex {
+    fn group_by_col(&self, table: &dyn Table, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
         let table = table.as_any().downcast_ref::<T>().unwrap();
-        let mut res = ColumnIndex::new(pool_set);
+        let mut res = ColumnIndex::new();
         table.scan_generic(subset, |row_id, row| {
-            res.add_row(&row[col.index()], row_id, pool_set);
+            res.add_row(&row[col.index()], row_id);
         });
         res
     }
-    fn pivot(
-        &self,
-        table: &dyn Table,
-        subset: SubsetRef,
-        cols: &[ColumnId],
-        pool_set: &PoolSet,
-    ) -> TupleIndex {
+    fn group_by_key(&self, table: &dyn Table, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
         let table = table.as_any().downcast_ref::<T>().unwrap();
-        let mut res = TupleIndex::new(cols.len(), pool_set);
+        let mut res = TupleIndex::new(cols.len());
         match cols {
             [] => {}
             [col] => table.scan_generic(subset, |row_id, row| {
-                res.add_row(&[row[col.index()]], row_id, pool_set);
+                res.add_row(&[row[col.index()]], row_id);
             }),
             [x, y] => table.scan_generic(subset, |row_id, row| {
-                res.add_row(&[row[x.index()], row[y.index()]], row_id, pool_set);
+                res.add_row(&[row[x.index()], row[y.index()]], row_id);
             }),
             [x, y, z] => table.scan_generic(subset, |row_id, row| {
-                res.add_row(
-                    &[row[x.index()], row[y.index()], row[z.index()]],
-                    row_id,
-                    pool_set,
-                );
+                res.add_row(&[row[x.index()], row[y.index()], row[z.index()]], row_id);
             }),
             _ => {
                 let mut scratch = SmallVec::<[Value; 8]>::new();
@@ -324,7 +326,7 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
                     for col in cols {
                         scratch.push(row[col.index()]);
                     }
-                    res.add_row(&scratch, row_id, pool_set);
+                    res.add_row(&scratch, row_id);
                     scratch.clear();
                 });
             }
@@ -369,7 +371,6 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
     fn lookup_row_vectorized(
         &self,
         table: &dyn Table,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -377,19 +378,19 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
         out_var: Variable,
     ) {
         let table = table.as_any().downcast_ref::<T>().unwrap();
-        let mut out = ps.get::<Vec<Value>>();
+        let mut out = with_pool_set(PoolSet::get::<Vec<Value>>);
         match args {
             [QueryEntry::Var(v)] => {
                 mask.iter(&bindings[*v])
                     .fill_vec(&mut out, Value::stale, |_, arg| {
-                        table.get_row_column(&[*arg], col, ps)
+                        table.get_row_column(&[*arg], col)
                     });
             }
             [QueryEntry::Var(v1), QueryEntry::Var(v2)] => {
                 mask.iter(&bindings[*v1]).zip(&bindings[*v2]).fill_vec(
                     &mut out,
                     Value::stale,
-                    |_, (a1, a2)| table.get_row_column(&[*a1, *a2], col, ps),
+                    |_, (a1, a2)| table.get_row_column(&[*a1, *a2], col),
                 );
             }
             [QueryEntry::Var(v1), QueryEntry::Var(v2), QueryEntry::Var(v3)] => {
@@ -397,11 +398,11 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
                     .zip(&bindings[*v2])
                     .zip(&bindings[*v3])
                     .fill_vec(&mut out, Value::stale, |_, ((a1, a2), a3)| {
-                        table.get_row_column(&[*a1, *a2, *a3], col, ps)
+                        table.get_row_column(&[*a1, *a2, *a3], col)
                     });
             }
             args => {
-                let pool = ps.get_pool().clone();
+                let pool = with_pool_set(|ps| ps.get_pool().clone());
                 mask.iter_dynamic(
                     pool,
                     args.iter().map(|v| match v {
@@ -410,7 +411,7 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
                     }),
                 )
                 .fill_vec(&mut out, Value::stale, |_, args| {
-                    table.get_row_column(&args, col, ps)
+                    table.get_row_column(&args, col)
                 });
             }
         };
@@ -420,7 +421,6 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
     fn lookup_with_default_vectorized(
         &self,
         table: &dyn Table,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -429,24 +429,20 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
         out_var: Variable,
     ) {
         let table = table.as_any().downcast_ref::<T>().unwrap();
-        let mut out = ps.get::<Vec<Value>>();
+        let mut out = with_pool_set(|ps| ps.get::<Vec<Value>>());
         match (args, default) {
             ([QueryEntry::Var(v)], QueryEntry::Var(default)) => mask
                 .iter(&bindings[*v])
                 .zip(&bindings[default])
                 .fill_vec(&mut out, Value::stale, |_, (v, default)| {
-                    Some(table.get_row_column(&[*v], col, ps).unwrap_or(*default))
+                    Some(table.get_row_column(&[*v], col).unwrap_or(*default))
                 }),
             ([QueryEntry::Var(v1), QueryEntry::Var(v2)], QueryEntry::Var(default)) => mask
                 .iter(&bindings[*v1])
                 .zip(&bindings[*v2])
                 .zip(&bindings[default])
                 .fill_vec(&mut out, Value::stale, |_, ((a1, a2), default)| {
-                    Some(
-                        table
-                            .get_row_column(&[*a1, *a2], col, ps)
-                            .unwrap_or(*default),
-                    )
+                    Some(table.get_row_column(&[*a1, *a2], col).unwrap_or(*default))
                 }),
             (
                 [QueryEntry::Var(v1), QueryEntry::Var(v2), QueryEntry::Var(v3)],
@@ -459,12 +455,12 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
                 .fill_vec(&mut out, Value::stale, |_, (((a1, a2), a3), default)| {
                     Some(
                         table
-                            .get_row_column(&[*a1, *a2, *a3], col, ps)
+                            .get_row_column(&[*a1, *a2, *a3], col)
                             .unwrap_or(*default),
                     )
                 }),
             (args, default) => {
-                let pool = ps.get_pool().clone();
+                let pool = with_pool_set(|ps| ps.get_pool().clone());
                 mask.iter_dynamic(
                     pool,
                     iter::once(&default).chain(args.iter()).map(|v| match v {
@@ -475,7 +471,7 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
                 .fill_vec(&mut out, Value::stale, |_, vals| {
                     let default = vals[0];
                     let key = &vals[1..];
-                    Some(table.get_row_column(key, col, ps).unwrap_or(default))
+                    Some(table.get_row_column(key, col).unwrap_or(default))
                 })
             }
         };
@@ -525,23 +521,13 @@ impl WrappedTable {
     }
 
     /// Group the contents of the given subset by the given column.
-    pub(crate) fn pivot_col(
-        &self,
-        subset: SubsetRef,
-        col: ColumnId,
-        pool_set: &PoolSet,
-    ) -> ColumnIndex {
-        self.wrapper.pivot_col(&*self.inner, subset, col, pool_set)
+    pub(crate) fn pivot_col(&self, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
+        self.wrapper.group_by_col(&*self.inner, subset, col)
     }
 
     /// A multi-column vairant of [`WrappedTable::pivot_col`].
-    pub(crate) fn pivot(
-        &self,
-        subset: SubsetRef,
-        cols: &[ColumnId],
-        pool_set: &PoolSet,
-    ) -> TupleIndex {
-        self.wrapper.pivot(&*self.inner, subset, cols, pool_set)
+    pub(crate) fn pivot(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
+        self.wrapper.group_by_key(&*self.inner, subset, cols)
     }
 
     /// A variant fo [`WrappedTable::scan_bounded`] that projects a subset of
@@ -560,13 +546,12 @@ impl WrappedTable {
     }
 
     /// Return the contents of the subset as a [`TaggedRowBuffer`].
-    pub fn scan(&self, subset: SubsetRef, pool: &PoolSet) -> TaggedRowBuffer {
-        self.wrapper.scan(&*self.inner, subset, pool)
+    pub fn scan(&self, subset: SubsetRef) -> TaggedRowBuffer {
+        self.wrapper.scan(&*self.inner, subset)
     }
 
     pub(crate) fn lookup_row_vectorized(
         &self,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -574,13 +559,12 @@ impl WrappedTable {
         out_var: Variable,
     ) {
         self.wrapper
-            .lookup_row_vectorized(&*self.inner, ps, mask, bindings, args, col, out_var);
+            .lookup_row_vectorized(&*self.inner, mask, bindings, args, col, out_var);
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn lookup_with_default_vectorized(
         &self,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -590,7 +574,6 @@ impl WrappedTable {
     ) {
         self.wrapper.lookup_with_default_vectorized(
             &*self.inner,
-            ps,
             mask,
             bindings,
             args,
@@ -625,20 +608,8 @@ pub(crate) trait TableWrapper {
         n: usize,
         out: &mut TaggedRowBuffer,
     ) -> Option<Offset>;
-    fn pivot_col(
-        &self,
-        table: &dyn Table,
-        subset: SubsetRef,
-        col: ColumnId,
-        pool_set: &PoolSet,
-    ) -> ColumnIndex;
-    fn pivot(
-        &self,
-        table: &dyn Table,
-        subset: SubsetRef,
-        cols: &[ColumnId],
-        pool_set: &PoolSet,
-    ) -> TupleIndex;
+    fn group_by_col(&self, table: &dyn Table, subset: SubsetRef, col: ColumnId) -> ColumnIndex;
+    fn group_by_key(&self, table: &dyn Table, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex;
 
     #[allow(clippy::too_many_arguments)]
     fn scan_project(
@@ -651,9 +622,10 @@ pub(crate) trait TableWrapper {
         cs: &[Constraint],
         out: &mut TaggedRowBuffer,
     ) -> Option<Offset>;
-    fn scan(&self, table: &dyn Table, subset: SubsetRef, pool: &PoolSet) -> TaggedRowBuffer {
+
+    fn scan(&self, table: &dyn Table, subset: SubsetRef) -> TaggedRowBuffer {
         let arity = table.spec().arity();
-        let mut buf = TaggedRowBuffer::new(arity, pool);
+        let mut buf = TaggedRowBuffer::new(arity);
         assert!(self
             .scan_bounded(table, subset, Offset::new(0), usize::MAX, &mut buf)
             .is_none());
@@ -664,7 +636,6 @@ pub(crate) trait TableWrapper {
     fn lookup_row_vectorized(
         &self,
         table: &dyn Table,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -676,7 +647,6 @@ pub(crate) trait TableWrapper {
     fn lookup_with_default_vectorized(
         &self,
         table: &dyn Table,
-        ps: &PoolSet,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],

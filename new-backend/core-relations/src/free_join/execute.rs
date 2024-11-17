@@ -2,7 +2,7 @@
 
 use std::{
     hash::{Hash, Hasher},
-    iter,
+    iter, mem,
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -21,13 +21,13 @@ use crate::{
     query::RuleSet,
     row_buffer::TaggedRowBuffer,
     table_spec::{ColumnId, Offset},
-    OffsetRange, Pool, SubsetRef,
+    OffsetRange, Pool, PoolSet, SubsetRef,
 };
 
 use super::{
     get_column_index_from_tableinfo,
     plan::{JoinStage, Plan},
-    ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
+    with_pool_set, ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
 };
 
 enum DynamicIndex {
@@ -56,7 +56,7 @@ impl Prober {
                 intersect_outer,
                 table,
             } => {
-                let mut sub = table.borrow().get_subset(key)?.to_owned(&self.pool);
+                let mut sub = table.read().get_subset(key)?.to_owned(&self.pool);
                 if *intersect_outer {
                     sub.intersect(self.subset.as_ref(), &self.pool);
                     if sub.is_empty() {
@@ -70,7 +70,7 @@ impl Prober {
                 table,
             } => {
                 debug_assert_eq!(key.len(), 1);
-                let mut sub = table.borrow().get_subset(&key[0])?.to_owned(&self.pool);
+                let mut sub = table.read().get_subset(&key[0])?.to_owned(&self.pool);
                 if *intersect_outer {
                     sub.intersect(self.subset.as_ref(), &self.pool);
                     if sub.is_empty() {
@@ -90,7 +90,7 @@ impl Prober {
             DynamicIndex::Cached {
                 intersect_outer: true,
                 table,
-            } => table.borrow().for_each(|k, v| {
+            } => table.read().for_each(|k, v| {
                 let mut res = v.to_owned(&self.pool);
                 res.intersect(self.subset.as_ref(), &self.pool);
                 if !res.is_empty() {
@@ -100,12 +100,12 @@ impl Prober {
             DynamicIndex::Cached {
                 intersect_outer: false,
                 table,
-            } => table.borrow().for_each(|k, v| f(k, v)),
+            } => table.read().for_each(|k, v| f(k, v)),
             DynamicIndex::CachedColumn {
                 intersect_outer: true,
                 table,
             } => {
-                table.borrow().for_each(|k, v| {
+                table.read().for_each(|k, v| {
                     let mut res = v.to_owned(&self.pool);
                     res.intersect(self.subset.as_ref(), &self.pool);
                     if !res.is_empty() {
@@ -117,7 +117,7 @@ impl Prober {
                 intersect_outer: false,
                 table,
             } => {
-                table.borrow().for_each(|k, v| f(&[*k], v));
+                table.read().for_each(|k, v| f(&[*k], v));
             }
             DynamicIndex::Dynamic(tab) => {
                 tab.for_each(f);
@@ -130,8 +130,8 @@ impl Prober {
 
     fn len(&self) -> usize {
         match &self.ix {
-            DynamicIndex::Cached { table, .. } => table.borrow().len(),
-            DynamicIndex::CachedColumn { table, .. } => table.borrow().len(),
+            DynamicIndex::Cached { table, .. } => table.read().len(),
+            DynamicIndex::CachedColumn { table, .. } => table.read().len(),
             DynamicIndex::Dynamic(tab) => tab.len(),
             DynamicIndex::DynamicColumn(tab) => tab.len(),
         }
@@ -140,44 +140,47 @@ impl Prober {
 
 impl Database {
     pub fn run_rule_set(&mut self, rule_set: &RuleSet) -> bool {
-        let mut preds = PredictedVals::default();
+        let preds = PredictedVals::default();
         let mut join_state = JoinState {
             db: self,
-            preds: &mut preds,
+            preds: &preds,
             subsets: Default::default(),
             bindings: Default::default(),
             var_batches: Default::default(),
             index_cache: Default::default(),
         };
         for (plan, desc) in &rule_set.plans {
-            let start = Instant::now();
-            for (id, info) in plan.atoms.iter() {
-                let table = join_state.db.get_table(info.table);
-                join_state
-                    .subsets
-                    .insert(id, table.all(&join_state.db.pool_set));
-            }
-            join_state.run_plan(plan, rule_set, 0);
-            join_state.subsets.clear();
-            join_state.bindings.clear();
-            let elapsed = start.elapsed();
-            if elapsed > Duration::from_secs(1) {
-                log::debug!("Rule {desc} took {elapsed:?}");
-                log::debug!("Plan for {desc}: {plan:#?}");
-            } else {
-                log::trace!("Rule {desc} took {elapsed:?}");
-            }
+            with_pool_set(|ps| {
+                let start = Instant::now();
+                for (id, info) in plan.atoms.iter() {
+                    let table = join_state.db.get_table(info.table);
+                    join_state.subsets.insert(id, table.all());
+                }
+                join_state.run_plan(plan, rule_set, 0, ps);
+                join_state.subsets.clear();
+                join_state.bindings.clear();
+                let elapsed = start.elapsed();
+                if elapsed > Duration::from_secs(1) {
+                    log::debug!("Rule {desc} took {elapsed:?}");
+                    log::debug!("Plan for {desc}: {plan:#?}");
+                } else {
+                    log::trace!("Rule {desc} took {elapsed:?}");
+                }
+            });
         }
         let mut batches = join_state.var_batches;
         let mut exec_state = ExecutionState {
-            db: self,
-            predicted: &mut preds,
+            db: self.read_only_view(),
+            predicted: &preds,
+            buffers: Default::default(),
         };
         // Run any remaining batches.
         for (action, ActionState { bindings, .. }) in batches.iter_mut() {
             exec_state.run_instrs(&rule_set.actions[action], bindings);
         }
-        exec_state.merge_all()
+        // flush any pending mutations in 'exec_state', then merge.
+        mem::drop(exec_state);
+        self.merge_all()
     }
 }
 
@@ -188,8 +191,8 @@ struct ActionState {
 }
 
 struct JoinState<'a> {
-    db: &'a mut Database,
-    preds: &'a mut PredictedVals,
+    db: &'a Database,
+    preds: &'a PredictedVals,
     subsets: DenseIdMap<AtomId, Subset>,
     bindings: DenseIdMap<Variable, Value>,
     var_batches: DenseIdMap<ActionId, ActionState>,
@@ -206,7 +209,7 @@ impl JoinState<'_> {
         let cols = SmallVec::<[ColumnId; 4]>::from_iter(cols);
         let subset = self.subsets.take(atom);
 
-        let info = &mut self.db.tables[plan.atoms[atom].table];
+        let info = &self.db.tables[plan.atoms[atom].table];
         let all_cacheable = cols.iter().all(|col| {
             !info
                 .spec
@@ -215,7 +218,7 @@ impl JoinState<'_> {
                 .copied()
                 .unwrap_or(false)
         });
-        let whole_table = info.table.all(&self.db.pool_set);
+        let whole_table = info.table.all();
         let dyn_index =
             if all_cacheable && subset.is_dense() && whole_table.size() / 2 < subset.size() {
                 // Skip intersecting with the subset if we are just looking at the
@@ -228,24 +231,22 @@ impl JoinState<'_> {
                 if cols.len() != 1 {
                     DynamicIndex::Cached {
                         intersect_outer,
-                        table: get_index_from_tableinfo(info, &cols, &self.db.pool_set).clone(),
+                        table: get_index_from_tableinfo(info, &cols).clone(),
                     }
                 } else {
                     DynamicIndex::CachedColumn {
                         intersect_outer,
-                        table: get_column_index_from_tableinfo(info, cols[0], &self.db.pool_set)
-                            .clone(),
+                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
                     }
                 }
             } else if cols.len() != 1 {
-                DynamicIndex::Dynamic(info.table.pivot(subset.as_ref(), &cols, &self.db.pool_set))
+                DynamicIndex::Dynamic(info.table.pivot(subset.as_ref(), &cols))
             } else {
                 DynamicIndex::DynamicColumn(if subset.size() > 16 {
                     let mut hasher = FxHasher::default();
                     (&cols[0], &subset).hash(&mut hasher);
                     let hc = hasher.finish();
 
-                    let pool_set = &self.db.pool_set;
                     let subset = &subset;
                     let (_, res) = self
                         .index_cache
@@ -254,27 +255,24 @@ impl JoinState<'_> {
                         .or_insert_with(|| {
                             (
                                 (cols[0], subset.clone()),
-                                Rc::new(info.table.pivot_col(subset.as_ref(), cols[0], pool_set)),
+                                Rc::new(info.table.pivot_col(subset.as_ref(), cols[0])),
                             )
                         });
                     res.clone()
                 } else {
-                    Rc::new(
-                        info.table
-                            .pivot_col(subset.as_ref(), cols[0], &self.db.pool_set),
-                    )
+                    Rc::new(info.table.pivot_col(subset.as_ref(), cols[0]))
                 })
             };
         Prober {
             subset,
-            pool: self.db.pool_set.get_pool().clone(),
+            pool: with_pool_set(|ps| ps.get_pool().clone()),
             ix: dyn_index,
         }
     }
     fn get_column_index(&mut self, plan: &Plan, atom: AtomId, col: ColumnId) -> Prober {
         self.get_index(plan, atom, iter::once(col))
     }
-    fn run_plan(&mut self, plan: &Plan, rule_set: &RuleSet, cur: usize) {
+    fn run_plan(&mut self, plan: &Plan, rule_set: &RuleSet, cur: usize, ps: &PoolSet) {
         if cur >= plan.stages.len() {
             return;
         }
@@ -288,7 +286,7 @@ impl JoinState<'_> {
                     for (atom, subset) in update.refinements.drain(..) {
                         self.subsets.insert(atom, subset);
                     }
-                    self.run_plan(plan, rule_set, cur + 1);
+                    self.run_plan(plan, rule_set, cur + 1, ps);
                 }
             };
         }
@@ -299,7 +297,7 @@ impl JoinState<'_> {
                 }
                 let prev = self.subsets.take(*atom);
                 self.subsets.insert(*atom, subset.clone());
-                self.run_plan(plan, rule_set, cur + 1);
+                self.run_plan(plan, rule_set, cur + 1, ps);
                 self.subsets.insert(*atom, prev);
             }
             JoinStage::Intersect { var, scans } => match scans.as_slice() {
@@ -308,12 +306,13 @@ impl JoinState<'_> {
                     if self.subsets[a.atom].is_empty() {
                         return;
                     }
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let prober = self.get_column_index(plan, a.atom, a.column);
                     prober.for_each(|val, x| {
-                        let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                        let mut update: Pooled<FrameUpdate> = ps.get();
                         update.push_binding(*var, val[0]);
-                        let sub = x.to_owned(self.db.pool_set.get_pool());
+                        let sub = x.to_owned(&ps.get_pool());
                         update.refine_atom(a.atom, sub);
                         updates.push(update);
                         if updates.len() >= CHUNK_SIZE {
@@ -327,16 +326,14 @@ impl JoinState<'_> {
                     if self.subsets[a.atom].is_empty() {
                         return;
                     }
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let prober = self.get_column_index(plan, a.atom, a.column);
                     prober.for_each(|val, x| {
-                        let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                        let mut update: Pooled<FrameUpdate> = ps.get();
                         update.push_binding(*var, val[0]);
-                        let sub = self.db.tables[plan.atoms[a.atom].table].table.refine(
-                            x.to_owned(self.db.pool_set.get_pool()),
-                            &a.cs,
-                            &self.db.pool_set,
-                        );
+                        let sub = self.db.tables[plan.atoms[a.atom].table]
+                            .table
+                            .refine(x.to_owned(&ps.get_pool()), &a.cs);
                         if sub.is_empty() {
                             return;
                         }
@@ -350,7 +347,7 @@ impl JoinState<'_> {
                     self.subsets.insert(a.atom, prober.subset);
                 }
                 [a, b] => {
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let a_prober = self.get_column_index(plan, a.atom, a.column);
                     let b_prober = self.get_column_index(plan, b.atom, b.column);
 
@@ -368,26 +365,23 @@ impl JoinState<'_> {
                             if !larger_scan.cs.is_empty() {
                                 large_sub = self.db.tables[plan.atoms[larger_atom].table]
                                     .table
-                                    .refine(large_sub, &larger_scan.cs, &self.db.pool_set);
+                                    .refine(large_sub, &larger_scan.cs);
                                 if large_sub.is_empty() {
                                     return;
                                 }
                             }
                             let small_sub = if smaller_scan.cs.is_empty() {
-                                small_sub.to_owned(self.db.pool_set.get_pool())
+                                small_sub.to_owned(&ps.get_pool())
                             } else {
-                                let sub =
-                                    self.db.tables[plan.atoms[smaller_atom].table].table.refine(
-                                        small_sub.to_owned(self.db.pool_set.get_pool()),
-                                        &smaller_scan.cs,
-                                        &self.db.pool_set,
-                                    );
+                                let sub = self.db.tables[plan.atoms[smaller_atom].table]
+                                    .table
+                                    .refine(small_sub.to_owned(&ps.get_pool()), &smaller_scan.cs);
                                 if sub.is_empty() {
                                     return;
                                 }
                                 sub
                             };
-                            let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                            let mut update: Pooled<FrameUpdate> = ps.get();
                             update.push_binding(*var, val[0]);
                             update.refine_atom(smaller_atom, small_sub);
                             update.refine_atom(larger_atom, large_sub);
@@ -403,7 +397,7 @@ impl JoinState<'_> {
                     self.subsets.insert(b.atom, b_prober.subset);
                 }
                 rest => {
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let mut smallest = 0;
                     let mut smallest_size = usize::MAX;
                     let mut probers = Vec::with_capacity(rest.len());
@@ -423,7 +417,7 @@ impl JoinState<'_> {
 
                     // Smallest leads the scan
                     probers[smallest].for_each(|key, sub| {
-                        let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                        let mut update: Pooled<FrameUpdate> = ps.get();
                         update.push_binding(*var, key[0]);
                         for (i, scan) in rest.iter().enumerate() {
                             if i == smallest {
@@ -433,7 +427,7 @@ impl JoinState<'_> {
                                 if !rest[i].cs.is_empty() {
                                     sub = self.db.tables[plan.atoms[rest[i].atom].table]
                                         .table
-                                        .refine(sub, &rest[i].cs, &self.db.pool_set);
+                                        .refine(sub, &rest[i].cs);
                                     if sub.is_empty() {
                                         return;
                                     }
@@ -445,11 +439,11 @@ impl JoinState<'_> {
                             }
                         }
                         let main_spec = &rest[smallest];
-                        let mut sub = sub.to_owned(self.db.pool_set.get_pool());
+                        let mut sub = sub.to_owned(&ps.get_pool());
                         if !main_spec.cs.is_empty() {
                             sub = self.db.tables[plan.atoms[main_spec.atom].table]
                                 .table
-                                .refine(sub, &main_spec.cs, &self.db.pool_set);
+                                .refine(sub, &main_spec.cs);
                             if sub.is_empty() {
                                 return;
                             }
@@ -475,11 +469,11 @@ impl JoinState<'_> {
                 if self.subsets[cover_atom].is_empty() {
                     return;
                 }
-                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
                 let cover_subset = self.subsets.take(cover_atom);
                 let mut cur = Offset::new(0);
-                let mut buffer = TaggedRowBuffer::new(bind.len(), &self.db.pool_set);
+                let mut buffer = TaggedRowBuffer::new(bind.len());
                 loop {
                     buffer.clear();
                     let table = &self.db.tables[plan.atoms[cover_atom].table].table;
@@ -492,7 +486,7 @@ impl JoinState<'_> {
                         &mut buffer,
                     );
                     for (row, key) in buffer.iter_non_stale() {
-                        let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                        let mut update: Pooled<FrameUpdate> = ps.get();
                         update.refine_atom(
                             cover_atom,
                             Subset::Dense(OffsetRange::new(row, row.inc())),
@@ -540,11 +534,11 @@ impl JoinState<'_> {
                         )
                     })
                     .collect::<SmallVec<[(usize, AtomId, Prober); 4]>>();
-                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = self.db.pool_set.get();
+                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
                 let cover_subset = self.subsets.take(cover_atom);
                 let mut cur = Offset::new(0);
-                let mut buffer = TaggedRowBuffer::new(bind.len(), &self.db.pool_set);
+                let mut buffer = TaggedRowBuffer::new(bind.len());
                 loop {
                     buffer.clear();
                     let table = &self.db.tables[plan.atoms[cover_atom].table].table;
@@ -557,7 +551,7 @@ impl JoinState<'_> {
                         &mut buffer,
                     );
                     'mid: for (row, key) in buffer.iter_non_stale() {
-                        let mut update: Pooled<FrameUpdate> = self.db.pool_set.get();
+                        let mut update: Pooled<FrameUpdate> = ps.get();
                         update.refine_atom(
                             cover_atom,
                             Subset::Dense(OffsetRange::new(row, row.inc())),
@@ -582,7 +576,7 @@ impl JoinState<'_> {
                             let table_info = &self.db.tables[plan.atoms[*atom].table];
                             let cs = &to_intersect[*i].0.constraints;
                             if !cs.is_empty() {
-                                subset = table_info.table.refine(subset, cs, &self.db.pool_set);
+                                subset = table_info.table.refine(subset, cs);
                             }
                             if subset.is_empty() {
                                 // There are no possible values for this subset
@@ -617,16 +611,15 @@ impl JoinState<'_> {
                 let mut len = 0;
                 action_state.n_runs += 1;
                 for (var, val) in self.bindings.iter() {
-                    let vals = action_state
-                        .bindings
-                        .get_or_insert(var, || self.db.pool_set.get());
+                    let vals = action_state.bindings.get_or_insert(var, || ps.get());
                     vals.push(*val);
                     len = vals.len();
                 }
                 if len > VAR_BATCH_SIZE {
                     let mut state = ExecutionState {
-                        db: self.db,
+                        db: self.db.read_only_view(),
                         predicted: self.preds,
+                        buffers: Default::default(),
                     };
                     state.run_instrs(&rule_set.actions[*actions], &mut action_state.bindings);
                     action_state.bindings.clear();

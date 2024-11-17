@@ -55,11 +55,13 @@ impl<T: Clear> Clear for Rc<T> {
     }
 }
 
-impl<T: Clear> Clone for Pooled<Rc<T>> {
+impl<T: Clear> Clone for Pooled<Rc<T>>
+where
+    Rc<T>: InPoolSet<PoolSet>,
+{
     fn clone(&self) -> Self {
         Pooled {
             data: self.data.clone(),
-            pool: self.pool.clone(),
         }
     }
 }
@@ -130,47 +132,51 @@ impl<T: Clear> Default for Pool<T> {
     }
 }
 
-impl<T: Clear> Pool<T> {
+impl<T: Clear + InPoolSet<PoolSet>> Pool<T> {
     /// Get an empty value of type `T`, potentially reused from the pool.
     pub(crate) fn get(&self) -> Pooled<T> {
         let empty = self.data.borrow_mut().pop().unwrap_or_default();
 
         Pooled {
             data: ManuallyDrop::new(empty),
-            pool: self.clone(),
         }
     }
 }
 
 /// An owned value of type `T` that can be returned to a memory pool when it is
 /// no longer used.
-pub struct Pooled<T: Clear> {
+pub struct Pooled<T: Clear + InPoolSet<PoolSet>> {
     data: ManuallyDrop<T>,
-    pool: Pool<T>,
 }
 
-impl<T: Clear + fmt::Debug> fmt::Debug for Pooled<T> {
+impl<T: Clear + InPoolSet<PoolSet>> Default for Pooled<T> {
+    fn default() -> Self {
+        with_pool_set(|ps| ps.get::<T>())
+    }
+}
+
+impl<T: Clear + fmt::Debug + InPoolSet<PoolSet>> fmt::Debug for Pooled<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let data: &T = &self.data;
         data.fmt(f)
     }
 }
-impl<T: Clear + PartialEq> PartialEq for Pooled<T> {
+impl<T: Clear + PartialEq + InPoolSet<PoolSet>> PartialEq for Pooled<T> {
     fn eq(&self, other: &Self) -> bool {
         // This form rid of a spuriou clippy warning about unconditional recursion.
         <T as PartialEq>::eq(&self.data, &other.data)
     }
 }
 
-impl<T: Clear + Eq> Eq for Pooled<T> {}
+impl<T: Clear + InPoolSet<PoolSet> + Eq> Eq for Pooled<T> {}
 
-impl<T: Clear + Hash> Hash for Pooled<T> {
+impl<T: Clear + Hash + InPoolSet<PoolSet>> Hash for Pooled<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.data.hash(state)
     }
 }
 
-impl<T: Clear> Pooled<T> {
+impl<T: Clear + InPoolSet<PoolSet> + 'static> Pooled<T> {
     /// Clear the contents the wrapped object. If the object cannot be reused,
     /// attempt to fetch another value from the pool.
     ///
@@ -184,32 +190,24 @@ impl<T: Clear> Pooled<T> {
         if this.data.reuse() {
             return;
         }
-        if let Some(mut other) = this.pool.data.borrow_mut().pop() {
-            let slot: &mut T = &mut this.data;
-            mem::swap(slot, &mut other);
-        }
-    }
-
-    /// Transfer the given object to a pool of boxed (`Rc`) objects of the same
-    /// type.
-    pub(crate) fn transfer_rc(mut this: Pooled<T>, rc_pool: &Pool<Rc<T>>) -> Pooled<Rc<T>> {
-        let item: &mut T = &mut this;
-        let mut new_container = rc_pool.get();
-        let mut_slot = Rc::get_mut(&mut new_container).unwrap();
-        mem::swap(mut_slot, item);
-        new_container
+        let pool = with_pool_set(|ps| ps.get_pool::<T>());
+        let Some(mut other) = pool.data.borrow_mut().pop() else {
+            return;
+        };
+        let slot: &mut T = &mut this.data;
+        mem::swap(slot, &mut other);
     }
 }
 
-impl<T: Clear + Clone> Pooled<T> {
+impl<T: Clear + Clone + InPoolSet<PoolSet>> Pooled<T> {
     pub(crate) fn cloned(this: &Pooled<T>) -> Pooled<T> {
-        let mut res = this.pool.get();
+        let mut res = with_pool_set(|ps| ps.get::<T>());
         res.clone_from(this);
         res
     }
 }
 
-impl<T: Clear> Drop for Pooled<T> {
+impl<T: Clear + InPoolSet<PoolSet>> Drop for Pooled<T> {
     fn drop(&mut self) {
         let reuse = self.data.reuse();
         if !reuse {
@@ -221,11 +219,15 @@ impl<T: Clear> Drop for Pooled<T> {
         self.data.clear();
         let t: &T = &self.data;
         // SAFETY: ownership of `self.data` is transferred to the pool
-        self.pool.data.borrow_mut().push(unsafe { ptr::read(t) });
+        with_pool_set(|ps| {
+            T::with_pool(ps, |pool| {
+                pool.data.borrow_mut().push(unsafe { ptr::read(t) })
+            })
+        });
     }
 }
 
-impl<T: Clear> Deref for Pooled<T> {
+impl<T: Clear + InPoolSet<PoolSet>> Deref for Pooled<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -233,7 +235,7 @@ impl<T: Clear> Deref for Pooled<T> {
     }
 }
 
-impl<T: Clear> DerefMut for Pooled<T> {
+impl<T: Clear + InPoolSet<PoolSet>> DerefMut for Pooled<T> {
     fn deref_mut(&mut self) -> &mut T {
         &mut self.data
     }
@@ -245,7 +247,7 @@ pub trait InPoolSet<PoolSet>
 where
     Self: Sized + Clear,
 {
-    fn get(pool_set: &PoolSet) -> &Pool<Self>;
+    fn with_pool<R>(pool_set: &PoolSet, f: impl FnOnce(&Pool<Self>) -> R) -> R;
 }
 
 macro_rules! pool_set {
@@ -258,8 +260,8 @@ macro_rules! pool_set {
         }
 
         impl $name {
-            $vis fn get_pool<T: InPoolSet<Self>>(&self) -> &Pool<T> {
-                T::get(self)
+            $vis fn get_pool<T: InPoolSet<Self>>(&self) -> Pool<T> {
+                T::with_pool(self, Pool::clone)
             }
 
             $vis fn get<T: InPoolSet<Self> + Default>(&self) -> Pooled<T> {
@@ -269,8 +271,8 @@ macro_rules! pool_set {
 
         $(
             impl InPoolSet<$name> for $ty {
-                fn get(pool_set: &$name) -> &Pool<Self> {
-                    &pool_set.$ident
+                fn with_pool<R>(pool_set: &$name, f: impl FnOnce(&Pool<Self>) -> R) -> R {
+                    f(&pool_set.$ident)
                 }
             }
         )*
@@ -282,7 +284,6 @@ pool_set! {
         vec_vals: Vec<Value>,
         // TODO: work on scaffolding/DI/etc. so that we can share allocations
         // between vec_vals and shared_vals.
-        shared_vals: Rc<Vec<Value>>,
         rows: Vec<RowId>,
         offset_vec: SortedOffsetVector,
         column_index: IndexMap<Value, BufferedSubset>,
@@ -294,4 +295,21 @@ pool_set! {
         frame_updates: FrameUpdate,
         frame_update_vecs: Vec<Pooled<FrameUpdate>>,
     }
+}
+
+/// Run `f` on the thread-local [`PoolSet`].
+pub(crate) fn with_pool_set<R>(f: impl FnOnce(&PoolSet) -> R) -> R {
+    POOL_SET.with(|pool_set| f(pool_set))
+}
+
+thread_local! {
+    /// A thread-local pool set. All pooled allocations land back in the local thread.
+    ///
+    /// We don't drop this PoolSet because it does not contain any resources
+    /// that need to be released, other than memory (which will be reclaimed
+    /// when the process exits, right after drop runs).
+    ///
+    /// For large egraphs, this be a big runtime win. The main egglog binary
+    /// avoids dropping the egraph for the same reason.
+    static POOL_SET: ManuallyDrop<PoolSet> = Default::default();
 }

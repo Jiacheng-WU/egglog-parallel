@@ -32,25 +32,29 @@ fn basic_query() {
 
     // Add the numbers 1 through 10 to the num table at timestamp 0.
     let mut ids = Vec::new();
-    for i in 0..10 {
-        let id = db.inc_counter(id_counter);
-        let i = db.primitives_mut().get::<i64>(i as i64);
-        ids.push(i);
-        db.get_table_mut(num)
-            .stage_insert(&[i, Value::from_usize(id), Value::new(0)]);
-    }
+    {
+        let mut num_buf = db.get_table(num).new_buffer();
+        for i in 0..10 {
+            let id = db.inc_counter(id_counter);
+            let i = db.primitives().get::<i64>(i as i64);
+            ids.push(i);
+            num_buf.stage_insert(&[i, Value::from_usize(id), Value::new(0)]);
+        }
+    } // num_buf flushed
 
     db.merge_all();
 
     let mut add_ids = Vec::new();
-    for i in ids.chunks(2) {
-        let &[x, y] = i else { unreachable!() };
-        // Insert (add x y) into the database with a fresh id at timestamp 0
-        let id = Value::from_usize(db.inc_counter(id_counter));
-        add_ids.push(id);
-        db.get_table_mut(add)
-            .stage_insert(&[x, y, id, Value::new(0)]);
-    }
+    {
+        let mut add_buf = db.get_table(add).new_buffer();
+        for i in ids.chunks(2) {
+            let &[x, y] = i else { unreachable!() };
+            // Insert (add x y) into the database with a fresh id at timestamp 0
+            let id = Value::from_usize(db.inc_counter(id_counter));
+            add_ids.push(id);
+            add_buf.stage_insert(&[x, y, id, Value::new(0)]);
+        }
+    } // add_buf flushed
 
     db.merge_all();
 
@@ -89,12 +93,12 @@ fn basic_query() {
 
     assert!(db.run_rule_set(&rule_set));
     let num_table = db.get_table(num);
-    let all_num = num_table.all(&db.pool_set);
-    let items = num_table.scan(all_num.as_ref(), db.pool_set());
+    let all_num = num_table.all();
+    let items = num_table.scan(all_num.as_ref());
     let mut res = Vec::from_iter(
         items
             .iter()
-            .map(|(_, row)| *db.primitives_mut().unwrap::<i64>(row[0])),
+            .map(|(_, row)| db.primitives().unwrap::<i64>(row[0])),
     );
     res.sort();
     assert_eq!(res, Vec::from_iter((0..10).chain([13, 17].into_iter())));
@@ -117,23 +121,20 @@ fn line_graph_1_gj() {
 
 fn line_graph_1_test(strat: PlanStrategy) {
     let mut db = Database::default();
-    let edge_impl = SortedWritesTable::new(
-        2,
-        2,
-        None,
-        move |_, a, b, _| {
-            if a != b {
-                panic!("merge not supported")
-            } else {
-                false
-            }
-        },
-        db.pool_set(),
-    );
+    let edge_impl = SortedWritesTable::new(2, 2, None, move |_, a, b, _| {
+        if a != b {
+            panic!("merge not supported")
+        } else {
+            false
+        }
+    });
     let edges = db.add_table(edge_impl);
     let nodes = Vec::from_iter((0..10).map(Value::new));
-    for edge in nodes.windows(2) {
-        db.get_table_mut(edges).stage_insert(edge);
+    {
+        let mut edge_buf = db.get_table(edges).new_buffer();
+        for edge in nodes.windows(2) {
+            edge_buf.stage_insert(edge);
+        }
     }
     db.merge_all();
 
@@ -162,8 +163,8 @@ fn line_graph_1_test(strat: PlanStrategy) {
     expected.sort();
 
     let edges_table = db.get_table(edges);
-    let all = edges_table.all(&db.pool_set);
-    let vals = edges_table.scan(all.as_ref(), db.pool_set());
+    let all = edges_table.all();
+    let vals = edges_table.scan(all.as_ref());
     let mut got = Vec::from_iter(vals.iter().map(|(_, row)| row.to_vec()));
     got.sort();
     assert_eq!(expected, got);
@@ -186,23 +187,20 @@ fn line_graph_2_gj() {
 
 fn line_graph_2_test(strat: PlanStrategy) {
     let mut db = Database::default();
-    let edge_impl = SortedWritesTable::new(
-        2,
-        2,
-        None,
-        move |_, a, b, _| {
-            if a != b {
-                panic!("merge not supported")
-            } else {
-                false
-            }
-        },
-        db.pool_set(),
-    );
+    let edge_impl = SortedWritesTable::new(2, 2, None, move |_, a, b, _| {
+        if a != b {
+            panic!("merge not supported")
+        } else {
+            false
+        }
+    });
     let edges = db.add_table(edge_impl);
     let nodes = Vec::from_iter((0..10).map(Value::new));
-    for edge in nodes.windows(2) {
-        db.get_table_mut(edges).stage_insert(edge);
+    {
+        let mut edge_buf = db.get_table_mut(edges).new_buffer();
+        for edge in nodes.windows(2) {
+            edge_buf.stage_insert(edge);
+        }
     }
     db.merge_all();
 
@@ -242,8 +240,8 @@ fn line_graph_2_test(strat: PlanStrategy) {
     expected.sort();
 
     let edges_table = db.get_table(edges);
-    let all = edges_table.all(&db.pool_set);
-    let vals = edges_table.scan(all.as_ref(), db.pool_set());
+    let all = edges_table.all();
+    let vals = edges_table.scan(all.as_ref());
     let mut got = Vec::from_iter(vals.iter().map(|(_, row)| row.to_vec()));
     got.sort();
     assert_eq!(expected, got);
@@ -257,12 +255,14 @@ fn minimal_ac() {
         mut db,
         ..
     } = basic_math_egraph();
-    let add_table = db.get_table_mut(add);
-    add_table.stage_insert(&[v(0), v(0), v(1), v(0)]);
-    add_table.stage_insert(&[v(0), v(1), v(2), v(0)]);
-    add_table.stage_insert(&[v(0), v(2), v(3), v(0)]);
-    add_table.stage_insert(&[v(1), v(0), v(2), v(1)]);
-    add_table.stage_insert(&[v(1), v(1), v(3), v(1)]);
+    {
+        let mut add_buf = db.get_table(add).new_buffer();
+        add_buf.stage_insert(&[v(0), v(0), v(1), v(0)]);
+        add_buf.stage_insert(&[v(0), v(1), v(2), v(0)]);
+        add_buf.stage_insert(&[v(0), v(2), v(3), v(0)]);
+        add_buf.stage_insert(&[v(1), v(0), v(2), v(1)]);
+        add_buf.stage_insert(&[v(1), v(1), v(3), v(1)]);
+    }
     db.merge_all();
     let mut rsb = db.new_rule_set();
     let mut add_assoc = rsb.new_query();
@@ -333,8 +333,8 @@ fn minimal_ac() {
 
     db.run_rule_set(&rule_set);
     let add_table = db.get_table(add);
-    let all_add = add_table.all(&db.pool_set);
-    let items = add_table.scan(all_add.as_ref(), db.pool_set());
+    let all_add = add_table.all();
+    let items = add_table.scan(all_add.as_ref());
     let mut res = Vec::from_iter(items.iter().map(|(_, row)| row.to_vec()));
     res.sort();
     let expected = vec![
@@ -382,11 +382,13 @@ fn ac_test(strat: PlanStrategy) {
 
     // Add the numbers 1 through 10 to the num table at timestamp 0.
     let mut ids = Vec::new();
+    db.primitives_mut().register_type::<i64>();
     for i in 0..N {
         let id = db.inc_counter(id_counter);
-        let i = db.primitives_mut().get::<i64>(i as i64);
+        let i = db.primitives().get::<i64>(i as i64);
         ids.push(i);
-        db.get_table_mut(num)
+        db.get_table(num)
+            .new_buffer()
             .stage_insert(&[i, Value::from_usize(id), Value::new(0)]);
     }
 
@@ -400,7 +402,8 @@ fn ac_test(strat: PlanStrategy) {
         let mut prev = ids[0];
         for num in &ids[1..] {
             let id = Value::from_usize(db.inc_counter(id_counter));
-            db.get_table_mut(add)
+            db.get_table(add)
+                .new_buffer()
                 .stage_insert(&[*num, prev, id, Value::new(0)]);
             prev = id;
             add_ids.push(id);
@@ -410,7 +413,8 @@ fn ac_test(strat: PlanStrategy) {
         prev = *ids.last().unwrap();
         for num in ids[0..(N - 1)].iter().rev() {
             let id = Value::from_usize(db.inc_counter(id_counter));
-            db.get_table_mut(add)
+            db.get_table(add)
+                .new_buffer()
                 .stage_insert(&[prev, *num, id, Value::new(0)]);
             prev = id;
             add_ids.push(id);
@@ -797,11 +801,11 @@ fn ac_test(strat: PlanStrategy) {
     }
     let uf_table = db.get_table(uf);
     let l_canon = uf_table
-        .get_row(&[left_root], db.pool_set())
+        .get_row(&[left_root])
         .map(|row| row.vals[1])
         .unwrap_or(left_root);
     let r_canon = uf_table
-        .get_row(&[right_root], db.pool_set())
+        .get_row(&[right_root])
         .map(|row| row.vals[1])
         .unwrap_or(right_root);
     assert_eq!(l_canon, r_canon);
@@ -818,41 +822,29 @@ struct MathEgraph {
 fn basic_math_egraph() -> MathEgraph {
     let mut db = Database::default();
     let uf = db.add_table(DisplacedTable::default());
-    let num_impl = SortedWritesTable::new(
-        1,
-        3,
-        Some(ColumnId::new(2)),
-        move |state, a, b, res| {
-            if a[1] != b[1] {
-                // Mark the two ids as equal. Picking b[1] as the 'presumed winner'
-                state.stage_insert(uf, &[a[1], b[1], b[2]]);
-                res.extend_from_slice(b);
-                true
-            } else {
-                false
-            }
-        },
-        db.pool_set(),
-    );
+    let num_impl = SortedWritesTable::new(1, 3, Some(ColumnId::new(2)), move |state, a, b, res| {
+        if a[1] != b[1] {
+            // Mark the two ids as equal. Picking b[1] as the 'presumed winner'
+            state.stage_insert(uf, &[a[1], b[1], b[2]]);
+            res.extend_from_slice(b);
+            true
+        } else {
+            false
+        }
+    });
 
     let id_counter = db.add_counter();
     let num = db.add_table(num_impl);
-    let add_impl = SortedWritesTable::new(
-        2,
-        4,
-        Some(ColumnId::new(3)),
-        move |state, a, b, res| {
-            if a[2] != b[2] {
-                // Mark the two ids as equal. Picking b[2] as the 'presumed winner'
-                state.stage_insert(uf, &[a[2], b[2], b[3]]);
-                res.extend_from_slice(b);
-                true
-            } else {
-                false
-            }
-        },
-        db.pool_set(),
-    );
+    let add_impl = SortedWritesTable::new(2, 4, Some(ColumnId::new(3)), move |state, a, b, res| {
+        if a[2] != b[2] {
+            // Mark the two ids as equal. Picking b[2] as the 'presumed winner'
+            state.stage_insert(uf, &[a[2], b[2], b[3]]);
+            res.extend_from_slice(b);
+            true
+        } else {
+            false
+        }
+    });
 
     let add = db.add_table(add_impl);
 

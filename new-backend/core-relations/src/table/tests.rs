@@ -1,7 +1,8 @@
+use numeric_id::NumericId;
+
 use crate::{
     common::Value,
     offsets::{RowId, SubsetRef},
-    pool::PoolSet,
     row_buffer::TaggedRowBuffer,
     table_shortcuts::{fill_table, v},
     table_spec::{ColumnId, Constraint, Offset, Table, WrappedTable},
@@ -24,7 +25,6 @@ fn dump_subset(table: &impl Table, subset: SubsetRef) -> Vec<(RowId, Vec<Value>)
 
 #[test]
 fn insert_scan() {
-    let pool_set = PoolSet::default();
     let table = fill_table(
         vec![
             vec![v(0), v(1), v(2)],
@@ -38,14 +38,13 @@ fn insert_scan() {
         |_, new| Some(new.to_vec()),
     );
 
-    let all = table.all(&pool_set);
+    let all = table.all();
     let smaller = table.refine_one(
         all,
         &Constraint::GtConst {
             col: ColumnId::new(2),
             val: v(4),
         },
-        &pool_set,
     );
     let rows = dump_subset(&table, smaller.as_ref());
     assert_eq!(
@@ -55,7 +54,7 @@ fn insert_scan() {
             (RowId::new(4), vec![v(2), v(3), v(6)])
         ]
     );
-    let mut buf = TaggedRowBuffer::new(2, &pool_set);
+    let mut buf = TaggedRowBuffer::new(2);
     let table = WrappedTable::new(table);
     table.scan_project(
         smaller.as_ref(),
@@ -78,7 +77,6 @@ fn insert_scan() {
 
 #[test]
 fn insert_scan_sorted() {
-    let pool_set = PoolSet::default();
     let table = fill_table(
         vec![
             vec![v(0), v(1), v(2)],
@@ -92,14 +90,13 @@ fn insert_scan_sorted() {
         |_, new| Some(new.to_vec()),
     );
 
-    let all = table.all(&pool_set);
+    let all = table.all();
     let smaller = table.refine_one(
         all,
         &Constraint::LtConst {
             col: ColumnId::new(1),
             val: v(4),
         },
-        &pool_set,
     );
     let rows = dump_subset(&table, smaller.as_ref());
     assert_eq!(
@@ -111,14 +108,13 @@ fn insert_scan_sorted() {
         ]
     );
 
-    let all = table.all(&pool_set);
+    let all = table.all();
     let sorted_smaller = table.refine_one(
         all,
         &Constraint::LtConst {
             col: ColumnId::new(2),
             val: v(5),
         },
-        &pool_set,
     );
     let rows = dump_subset(&table, sorted_smaller.as_ref());
     assert_eq!(

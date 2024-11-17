@@ -5,7 +5,10 @@ use std::ops::Range;
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 
-use crate::pool::{Pool, Pooled};
+use crate::{
+    pool::{InPoolSet, Pool, Pooled},
+    PoolSet,
+};
 
 /// A subset of offsets that are still active.
 #[derive(Debug)]
@@ -28,8 +31,8 @@ pub(crate) struct Mask {
 // the bindings.).
 
 impl Mask {
-    pub(crate) fn new(range: Range<usize>, pool: &Pool<FixedBitSet>) -> Mask {
-        let mut data = pool.get();
+    pub(crate) fn new(range: Range<usize>, ps: &PoolSet) -> Mask {
+        let mut data = ps.get::<FixedBitSet>();
         data.grow(range.end);
         data.set_range(range, true);
         Mask { data }
@@ -169,7 +172,10 @@ pub(crate) struct MaskIterDynamicSource<'slice, 'mask, T> {
 
 // NB: We could get this to work by passing references as well. This way is just
 // a bit easier when `T = Value`
-impl<T: Clone> MaskIter for MaskIterDynamicSource<'_, '_, T> {
+impl<T: Clone> MaskIter for MaskIterDynamicSource<'_, '_, T>
+where
+    Vec<T>: InPoolSet<PoolSet>,
+{
     type Item = Pooled<Vec<T>>;
     fn inc_counter(&mut self) -> usize {
         let res = self.counter;

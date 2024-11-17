@@ -20,7 +20,7 @@ fn basic_primitive() {
     let b = prims.get(2i32);
     let c = prims.apply_op(add32, &[a, b]).unwrap();
 
-    assert_eq!(prims.unwrap::<i32>(c), &3);
+    assert_eq!(prims.unwrap::<i32>(c), 3);
 
     let t = prims.get(true);
     let f = prims.get(false);
@@ -29,8 +29,8 @@ fn basic_primitive() {
     let z = prims.apply_op(maybe_add, &[t, x, y]).unwrap();
     let w = prims.apply_op(maybe_add, &[f, x, y]).unwrap();
 
-    assert_eq!(prims.unwrap::<i64>(z), &6);
-    assert_eq!(prims.unwrap::<i64>(w), &-4);
+    assert_eq!(prims.unwrap::<i64>(z), 6);
+    assert_eq!(prims.unwrap::<i64>(w), -4);
 }
 
 #[test]
@@ -58,6 +58,8 @@ fn operation_type_mismatch() {
 #[should_panic]
 fn value_type_mismatch() {
     let mut prims = Primitives::default();
+    prims.register_type::<i64>();
+    prims.register_type::<i32>();
     let x = prims.get(1i64);
     prims.unwrap::<i32>(x);
 }
@@ -65,6 +67,7 @@ fn value_type_mismatch() {
 #[test]
 fn prim_printing() {
     let mut prims = Primitives::default();
+    prims.register_type::<i64>();
     let ty = prims.get_ty::<i64>();
     let val = prims.get(24i64);
     assert_eq!(

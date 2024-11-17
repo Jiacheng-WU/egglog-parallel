@@ -8,6 +8,7 @@ use std::{
     any::{Any, TypeId},
     fmt::{self, Debug},
     hash::Hash,
+    ops::Deref,
 };
 
 use numeric_id::{define_id, DenseIdMap};
@@ -28,8 +29,8 @@ mod tests;
 define_id!(pub PrimitiveId, u32, "an identifier for primitive types");
 define_id!(pub PrimitiveFunctionId, u32, "an identifier for primitive operations");
 
-pub trait Primitive: Clone + Hash + Eq + Any + Debug {
-    fn intern(&self, table: &mut InternTable<Self, Value>) -> Value {
+pub trait Primitive: Clone + Hash + Eq + Any + Debug + Send + Sync {
+    fn intern(&self, table: &InternTable<Self, Value>) -> Value {
         table.intern(self)
     }
     fn as_any(&self) -> &dyn Any {
@@ -37,7 +38,7 @@ pub trait Primitive: Clone + Hash + Eq + Any + Debug {
     }
 }
 
-impl<T: Clone + Hash + Eq + Any + Debug> Primitive for T {}
+impl<T: Clone + Hash + Eq + Any + Debug + Send + Sync> Primitive for T {}
 
 /// A wrapper used to print a primitive value.
 ///
@@ -64,37 +65,47 @@ pub struct Primitives {
 }
 
 impl Primitives {
+    /// Register the given type `P` as a primitive type in this registry.
+    pub fn register_type<P: Primitive>(&mut self) -> PrimitiveId {
+        let id = self.get_ty::<P>();
+        self.tables
+            .get_or_insert(id, || Box::<InternTable<P, Value>>::default());
+        id
+    }
+
     /// Get the [`PrimitiveId`] for the given primitive type `P`.
-    pub fn get_ty<P: Primitive>(&mut self) -> PrimitiveId {
+    pub fn get_ty<P: Primitive>(&self) -> PrimitiveId {
         self.type_ids.intern(&TypeId::of::<P>())
     }
 
     /// Get a [`Value`] representing the given primitive `p`.
-    pub fn get<P: Primitive>(&mut self, p: P) -> Value {
+    pub fn get<P: Primitive>(&self, p: P) -> Value {
         let id = self.get_ty::<P>();
-        let table = self
-            .tables
-            .get_or_insert(id, || Box::<InternTable<P, Value>>::default())
-            .as_any_mut()
-            .downcast_mut::<InternTable<P, Value>>()
+        let table = self.tables[id]
+            .as_any()
+            .downcast_ref::<InternTable<P, Value>>()
             .unwrap();
         p.intern(table)
     }
 
     /// Get a reference to the primitive value represented by the given [`Value`].
-    pub fn unwrap<P: Primitive>(&mut self, v: Value) -> &P {
+    pub fn unwrap_ref<P: Primitive>(&self, v: Value) -> impl Deref<Target = P> + '_ {
         let id = self.get_ty::<P>();
         let table = self
             .tables
             .get(id)
-            .unwrap()
+            .expect("types must be registered before unwrapping")
             .as_any()
             .downcast_ref::<InternTable<P, Value>>()
             .unwrap();
         table.get(v)
     }
+    pub fn unwrap<P: Primitive>(&self, v: Value) -> P {
+        self.unwrap_ref::<P>(v).clone()
+    }
 
     pub fn register_op(&mut self, op: impl PrimitiveOperation + 'static) -> PrimitiveFunctionId {
+        op.register_types(self);
         self.operations.push(DynamicPrimitveOperation::new(op))
     }
 
@@ -107,13 +118,13 @@ impl Primitives {
     /// This operation is not particularly efficient, but it is useful when
     /// writing tests or external proof checkers.
     pub fn apply_op(&mut self, id: PrimitiveFunctionId, args: &[Value]) -> Option<Value> {
-        let mut dyn_op = self.operations.take(id);
+        let dyn_op = self.operations.take(id);
         let res = dyn_op.op.apply(self, args);
         self.operations.insert(id, dyn_op);
         res
     }
     pub(crate) fn apply_vectorized(
-        &mut self,
+        &self,
         id: PrimitiveFunctionId,
         pool: Pool<Vec<Value>>,
         mask: &mut Mask,
@@ -121,11 +132,10 @@ impl Primitives {
         args: &[QueryEntry],
         out_var: Variable,
     ) {
-        let mut dyn_op = self.operations.take(id);
+        let dyn_op = &self.operations[id];
         dyn_op
             .op
             .apply_vectorized(self, pool, mask, bindings, args, out_var);
-        self.operations.insert(id, dyn_op);
     }
 }
 
@@ -141,7 +151,6 @@ impl DynamicPrimitveOperation {
 
 trait DynamicInternTable: Any {
     fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
     fn print_value(&self, val: Value, f: &mut fmt::Formatter) -> fmt::Result;
 }
 
@@ -150,13 +159,9 @@ impl<P: Primitive> DynamicInternTable for InternTable<P, Value> {
         self
     }
 
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
-
     fn print_value(&self, val: Value, f: &mut fmt::Formatter) -> fmt::Result {
         let p = self.get(val);
-        write!(f, "{p:?}")
+        write!(f, "{:?}", &*p)
     }
 }
 
@@ -170,15 +175,16 @@ pub struct PrimitiveFunctionSignature<'a> {
 ///
 /// Most of the time you can get away with using the `lift_operation` macro,
 /// which implements this under the hood.
-pub trait PrimitiveOperation {
+pub trait PrimitiveOperation: Send + Sync {
     fn signature(&self) -> PrimitiveFunctionSignature;
-    fn apply(&mut self, prims: &mut Primitives, args: &[Value]) -> Option<Value>;
+    fn register_types(&self, prims: &mut Primitives);
+    fn apply(&self, prims: &Primitives, args: &[Value]) -> Option<Value>;
 }
 
 pub(crate) trait PrimitiveOperationExt: PrimitiveOperation {
     fn apply_vectorized(
-        &mut self,
-        prims: &mut Primitives,
+        &self,
+        prims: &Primitives,
         pool: Pool<Vec<Value>>,
         mask: &mut Mask,
         bindings: &mut Bindings,
@@ -223,7 +229,7 @@ macro_rules! lift_operation_impl {
                     }
                 }
 
-                impl<F: FnMut($($ty),*) -> $ret> PrimitiveOperation for Impl<F> {
+                impl<F: Fn($($ty),*) -> $ret + Send + Sync> PrimitiveOperation for Impl<F> {
                     fn signature(&self) -> PrimitiveFunctionSignature {
                         PrimitiveFunctionSignature {
                             args: &self.arg_prims,
@@ -231,10 +237,15 @@ macro_rules! lift_operation_impl {
                         }
                     }
 
-                    fn apply(&mut self, prims: &mut Primitives, args: &[Value]) -> Option<Value> {
+                    fn apply(&self, prims: &Primitives, args: &[Value]) -> Option<Value> {
                         assert_eq!(args.len(), $arity, "wrong number of arguments to {}", stringify!($name));
                         let ret = (self.f)($(prims.unwrap::<$ty>(args[$n]).clone()),*);
                         Some(prims.get(ret))
+                    }
+
+                    fn register_types(&self, prims: &mut Primitives) {
+                        $( prims.register_type::<$ty>();)*
+                        prims.register_type::<$ret>();
                     }
                 }
 

@@ -8,7 +8,7 @@ use smallvec::SmallVec;
 use crate::{
     common::Value,
     offsets::RowId,
-    pool::{PoolSet, Pooled},
+    pool::{with_pool_set, Pooled},
 };
 
 #[cfg(test)]
@@ -37,7 +37,7 @@ impl Clone for RowBuffer {
 
 impl RowBuffer {
     /// Create a new RowBuffer with the given arity.
-    pub(crate) fn new(n_columns: usize, pool_set: &PoolSet) -> RowBuffer {
+    pub(crate) fn new(n_columns: usize) -> RowBuffer {
         assert_ne!(
             n_columns, 0,
             "attempting to create a row batch with no columns"
@@ -45,8 +45,13 @@ impl RowBuffer {
         RowBuffer {
             n_columns,
             total_rows: 0,
-            data: pool_set.get(),
+            data: with_pool_set(|ps| ps.get()),
         }
+    }
+
+    /// The size of the rows accepted by this buffer.
+    pub(crate) fn arity(&self) -> usize {
+        self.n_columns
     }
 
     /// Return an iterator over the non-stale rows in the buffer.
@@ -171,9 +176,9 @@ pub struct TaggedRowBuffer {
 
 impl TaggedRowBuffer {
     /// Create a new buffer with the given arity.
-    pub fn new(n_columns: usize, pool_set: &PoolSet) -> TaggedRowBuffer {
+    pub fn new(n_columns: usize) -> TaggedRowBuffer {
         TaggedRowBuffer {
-            inner: RowBuffer::new(n_columns + 1, pool_set),
+            inner: RowBuffer::new(n_columns + 1),
         }
     }
 

@@ -1,6 +1,6 @@
 use numeric_id::NumericId;
 
-use crate::{common::Value, offsets::RowId, pool::PoolSet};
+use crate::{common::Value, offsets::RowId};
 
 use super::{RowBuffer, TaggedRowBuffer};
 
@@ -10,8 +10,7 @@ fn v(n: usize) -> Value {
 
 #[test]
 fn remap_basic() {
-    let pool_set = PoolSet::default();
-    let mut rows = RowBuffer::new(2, &pool_set);
+    let mut rows = RowBuffer::new(2);
     let r1 = rows.add_row(&[v(0), v(1)]);
     let r2 = rows.add_row(&[v(2), v(3)]);
     let r3 = rows.add_row(&[v(4), v(5)]);
@@ -32,8 +31,7 @@ fn remap_basic() {
 
 #[test]
 fn remap_narrow() {
-    let pool_set = PoolSet::default();
-    let mut rows = RowBuffer::new(1, &pool_set);
+    let mut rows = RowBuffer::new(1);
     let r1 = rows.add_row(&[v(0)]);
     let r2 = rows.add_row(&[v(1)]);
     let r3 = rows.add_row(&[v(2)]);
@@ -49,8 +47,7 @@ fn remap_narrow() {
 
 #[test]
 fn basic_tagged_row() {
-    let pool_set = PoolSet::default();
-    let mut rows = TaggedRowBuffer::new(2, &pool_set);
+    let mut rows = TaggedRowBuffer::new(2);
     let r1 = rows.add_row(RowId::new(4), &[v(0), v(1)]);
     let r2 = rows.add_row(RowId::new(7), &[v(2), v(3)]);
     assert_eq!(rows.get_row(r1), (RowId::new(4), [v(0), v(1)].as_slice()));

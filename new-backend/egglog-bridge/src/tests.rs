@@ -7,7 +7,7 @@ use crate::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, MergeFn}
 fn ac() {
     const N: usize = 5;
     let mut egraph = EGraph::default();
-    let int_prim = egraph.primitives_mut().get_ty::<i64>();
+    let int_prim = egraph.primitives_mut().register_type::<i64>();
     let num_table = egraph.add_table(
         vec![ColumnTy::Primitive(int_prim), ColumnTy::Id],
         DefaultVal::FreshId,
@@ -80,7 +80,7 @@ fn ac() {
 fn ac_tracing() {
     const N: usize = 5;
     let mut egraph = EGraph::with_tracing();
-    let int_prim = egraph.primitives_mut().get_ty::<i64>();
+    let int_prim = egraph.primitives_mut().register_type::<i64>();
     let num_table = egraph.add_table(
         vec![ColumnTy::Primitive(int_prim), ColumnTy::Id],
         DefaultVal::FreshId,
@@ -155,6 +155,7 @@ fn ac_tracing() {
 fn ac_fail() {
     const N: usize = 5;
     let mut egraph = EGraph::default();
+    egraph.primitives_mut().register_type::<i64>();
     let int_prim = egraph.primitives_mut().get_ty::<i64>();
     let one = egraph.primitives_mut().get(1i64);
     let num_table = egraph.add_table(
@@ -237,8 +238,8 @@ fn math_tracing() {
 
 fn math_test(mut egraph: EGraph) {
     const N: usize = 8;
-    let rational_ty = egraph.primitives_mut().get_ty::<Rational64>();
-    let string_ty = egraph.primitives_mut().get_ty::<&'static str>();
+    let rational_ty = egraph.primitives_mut().register_type::<Rational64>();
+    let string_ty = egraph.primitives_mut().register_type::<&'static str>();
     // tables
     let diff = egraph.add_table(
         vec![ColumnTy::Id, ColumnTy::Id, ColumnTy::Id],

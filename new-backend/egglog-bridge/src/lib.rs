@@ -8,7 +8,12 @@
 //! of core egglog functionality, but it does not implement algorithms for
 //! joins, union-finds, etc.
 
-use std::{cell::RefCell, rc::Rc, time::Instant};
+use std::{
+    mem,
+    rc::Rc,
+    sync::{Arc, Mutex},
+    time::Instant,
+};
 
 use core_relations::{
     ColumnId, Constraint, CounterId, Database, DisplacedTable, DisplacedTableWithProvenance,
@@ -64,7 +69,7 @@ pub struct EGraph {
     /// as a proof object with a given number of parameters is added.
     reason_tables: IndexMap<usize /* arity */, TableId>,
     term_tables: IndexMap<usize /* arity */, TableId>,
-    side_channel: Rc<RefCell<Option<Vec<Value>>>>,
+    side_channel: Arc<Mutex<Option<Vec<Value>>>>,
     get_first_id: ExternalFunctionId,
     tracing: bool,
 }
@@ -94,7 +99,7 @@ impl EGraph {
     fn create_internal(mut db: Database, uf_table: TableId, tracing: bool) -> EGraph {
         let id_counter = db.add_counter();
         let trace_counter = db.add_counter();
-        let side_channel = Rc::new(RefCell::new(None));
+        let side_channel = Arc::new(Mutex::new(None));
         let get_first = GetFirstMatch {
             side_channel: side_channel.clone(),
         };
@@ -116,9 +121,16 @@ impl EGraph {
             tracing,
         }
     }
-    /// Get the underlying table of primitives for this EGraph.
+
+    /// Get a mutable reference to the underlying table of primitives for this
+    /// EGraph.
     pub fn primitives_mut(&mut self) -> &mut Primitives {
         self.db.primitives_mut()
+    }
+
+    /// Get a reference to the underlying table of primitives for this EGraph.
+    pub fn primitives(&self) -> &Primitives {
+        self.db.primitives()
     }
 
     /// Generate a fresh id.
@@ -131,7 +143,7 @@ impl EGraph {
     ///
     /// This is a lightweight way to pass information returned by a query.
     pub(crate) fn take_side_channel(&self) -> Option<Vec<Value>> {
-        self.side_channel.borrow_mut().take()
+        self.side_channel.lock().unwrap().take()
     }
 
     /// Look up the canonical value for `val` in the union-find.
@@ -139,7 +151,7 @@ impl EGraph {
     /// If the value has never been inserted into the union-find, `val` is returned.
     pub fn get_canon(&self, val: Value) -> Value {
         let table = self.db.get_table(self.uf_table);
-        let row = table.get_row(&[val], self.db.pool_set());
+        let row = table.get_row(&[val]);
         row.map(|row| row.vals[1]).unwrap_or(val)
     }
 
@@ -153,7 +165,6 @@ impl EGraph {
                     spec.n_keys + 1 + 2, // one value for the term id, one for the reason,
                     None,
                     |_, _, _, _| false,
-                    self.db.pool_set(),
                 );
                 let table_id = self.db.add_table(table);
                 *v.insert(table_id)
@@ -171,7 +182,6 @@ impl EGraph {
                     arity + 1, // one value for the reason id
                     None,
                     |_, _, _, _| false,
-                    self.db.pool_set(),
                 );
                 let table_id = self.db.add_table(table);
                 *v.insert(table_id)
@@ -214,8 +224,10 @@ impl EGraph {
             id
         };
         let table_id = self.funcs[func].table;
-        let table = self.db.get_table_mut(table_id);
-        table.stage_insert(&extended_row);
+        self.db
+            .get_table(table_id)
+            .new_buffer()
+            .stage_insert(&extended_row);
         self.db.merge_all();
         self.next_ts = self.next_ts.inc();
         self.rebuild().unwrap();
@@ -233,13 +245,16 @@ impl EGraph {
         let mut term_key = Vec::with_capacity(key.len() + 1);
         term_key.push(Value::new(func.rep()));
         term_key.extend(key);
-        if let Some(row) = table.get_row(&term_key, self.db.pool_set()) {
+        if let Some(row) = table.get_row(&term_key) {
             row.vals[row.vals.len() - 2]
         } else {
             let result = Value::from_usize(self.db.inc_counter(self.id_counter));
             term_key.push(result);
             term_key.push(reason);
-            self.db.get_table_mut(term_table_id).stage_insert(&term_key);
+            self.db
+                .get_table(term_table_id)
+                .new_buffer()
+                .stage_insert(&term_key);
             self.db.merge_table(term_table_id);
             result
         }
@@ -250,7 +265,7 @@ impl EGraph {
     pub fn lookup_id(&self, func: FunctionId, key: &[Value]) -> Option<Value> {
         let table_id = self.funcs[func].table;
         let table = self.db.get_table(table_id);
-        let row = table.get_row(key, self.db.pool_set())?;
+        let row = table.get_row(key)?;
         if self.tracing {
             // Return the "term id"
             Some(row.vals[row.vals.len() - 1])
@@ -266,7 +281,8 @@ impl EGraph {
         let reason_spec_id = self.proof_specs.push(reason);
         let reason_id = Value::from_usize(self.db.inc_counter(self.reason_counter));
         self.db
-            .get_table_mut(reason_table)
+            .get_table(reason_table)
+            .new_buffer()
             .stage_insert(&[Value::new(reason_spec_id.rep()), reason_id]);
         self.db.merge_table(reason_table);
         reason_id
@@ -292,6 +308,7 @@ impl EGraph {
         } else {
             None
         };
+        let mut bufs = DenseIdMap::default();
         for (func, row) in values.into_iter() {
             extended_row.extend_from_slice(&row);
             extended_row.push(self.next_ts.to_value());
@@ -300,8 +317,11 @@ impl EGraph {
             if let Some(reason_id) = reason_id {
                 // Get the term id itself
                 let term_id = self.get_term(func, &row[0..row.len() - 1], reason_id);
+                let buf = bufs.get_or_insert(self.uf_table, || {
+                    self.db.get_table(self.uf_table).new_buffer()
+                });
                 // Then union it with the value being set for this term.
-                self.db.get_table_mut(self.uf_table).stage_insert(&[
+                buf.stage_insert(&[
                     *row.last().unwrap(),
                     term_id,
                     self.next_ts.to_value(),
@@ -309,9 +329,12 @@ impl EGraph {
                 ]);
                 extended_row.push(term_id);
             }
-            self.db.get_table_mut(table_id).stage_insert(&extended_row);
+            let buf = bufs.get_or_insert(table_id, || self.db.get_table(table_id).new_buffer());
+            buf.stage_insert(&extended_row);
             extended_row.clear();
         }
+        // Flush the buffers.
+        mem::drop(bufs);
         self.db.merge_all();
         self.next_ts = self.next_ts.inc();
         self.rebuild().unwrap();
@@ -322,9 +345,7 @@ impl EGraph {
     }
 
     pub fn table_size(&mut self, table: FunctionId) -> usize {
-        self.db
-            .get_table(self.funcs[table].table)
-            .len(self.db.pool_set())
+        self.db.get_table(self.funcs[table].table).len()
     }
 
     /// Generate a proof explaining why a given term is in the database.
@@ -376,9 +397,9 @@ impl EGraph {
         let table = self.funcs[table].table;
         let imp = self.db.get_table(table);
         let truncate = if self.tracing { 2 } else { 1 };
-        let all = imp.all(self.db.pool_set());
+        let all = imp.all();
         let mut cur = Offset::new(0);
-        let mut buf = TaggedRowBuffer::new(imp.spec().arity(), self.db.pool_set());
+        let mut buf = TaggedRowBuffer::new(imp.spec().arity());
         while let Some(next) = imp.scan_bounded(all.as_ref(), cur, 500, &mut buf) {
             buf.iter_non_stale()
                 .for_each(|(_, row)| f(&row[0..row.len() - truncate]));
@@ -429,10 +450,9 @@ impl EGraph {
     /// A helper for scanning the entries in a table.
     fn scan_table(&self, table: &WrappedTable, mut f: impl FnMut(&[Value])) {
         const BATCH_SIZE: usize = 128;
-        let ps = self.db.pool_set();
-        let all = table.all(ps);
+        let all = table.all();
         let mut cur = Offset::new(0);
-        let mut out = TaggedRowBuffer::new(table.spec().arity(), ps);
+        let mut out = TaggedRowBuffer::new(table.spec().arity());
         while let Some(next) = table.scan_bounded(all.as_ref(), cur, BATCH_SIZE, &mut out) {
             out.iter_non_stale().for_each(|(_, row)| f(row));
             out.clear();
@@ -484,7 +504,6 @@ impl EGraph {
                         false
                     }
                 },
-                self.db.pool_set(),
             ),
             MergeFn::Table(merge_table) => {
                 let id_counter = self.id_counter;
@@ -528,7 +547,6 @@ impl EGraph {
                         out.extend_from_slice(&new[n_args + 1..]);
                         true
                     },
-                    self.db.pool_set(),
                 )
             }
         };
@@ -779,16 +797,20 @@ fn marker_nonincremental_rebuild<R>(f: impl FnOnce() -> R) -> R {
 
 /// An external function used to grab a value out of the database matching a
 /// particular query.
+//
+// TODO: once we have parallelism wired in, we'll want to replace this with a
+// more efficient solution (e.g. one baesd on crossbeam or arcswap).
 pub(crate) struct GetFirstMatch {
-    pub(crate) side_channel: Rc<RefCell<Option<Vec<Value>>>>,
+    pub(crate) side_channel: Arc<Mutex<Option<Vec<Value>>>>,
 }
 
 impl ExternalFunction for GetFirstMatch {
-    fn invoke(&self, _: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
-        if self.side_channel.borrow().is_some() {
+    fn invoke(&self, _: &core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
+        let mut guard = self.side_channel.lock().unwrap();
+        if guard.is_some() {
             return None;
         }
-        *self.side_channel.borrow_mut() = Some(args.to_vec());
+        *guard = Some(args.to_vec());
         Some(Value::new(0))
     }
 }

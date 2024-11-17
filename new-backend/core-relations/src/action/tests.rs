@@ -6,7 +6,7 @@ use super::mask::{Mask, MaskIter};
 fn mask_iter() {
     let ps = PoolSet::default();
     let offs = Vec::from_iter(0..100);
-    let mut mask = Mask::new(0..100, ps.get_pool());
+    let mut mask = Mask::new(0..100, &ps);
     let mut res = Vec::new();
     mask.iter(&offs).for_each(|x| res.push(*x));
     assert_eq!(offs, res);
@@ -17,7 +17,7 @@ fn mask_iter_zip() {
     let ps = PoolSet::default();
     let offs1 = Vec::from_iter(0..100);
     let offs2 = Vec::from_iter(100..200);
-    let mut mask = Mask::new(0..100, ps.get_pool());
+    let mut mask = Mask::new(0..100, &ps);
     let mut res = Vec::new();
     mask.iter(&offs1)
         .zip(&offs2)
@@ -32,7 +32,7 @@ fn mask_iter_zip() {
 fn retain() {
     let ps = PoolSet::default();
     let offs = Vec::from_iter(0..100);
-    let mut mask = Mask::new(0..100, ps.get_pool());
+    let mut mask = Mask::new(0..100, &ps);
     mask.iter(&offs).retain(|x| *x % 2 == 0);
     let mut got = Vec::new();
     mask.iter(&offs).for_each(|x| got.push(*x));
@@ -46,7 +46,7 @@ fn retain() {
 fn fill_vec() {
     let ps = PoolSet::default();
     let offs = Vec::from_iter(0..100);
-    let mut mask = Mask::new(0..100, ps.get_pool());
+    let mut mask = Mask::new(0..100, &ps);
     let mut out = Vec::new();
     mask.iter(&offs).fill_vec(
         &mut out,

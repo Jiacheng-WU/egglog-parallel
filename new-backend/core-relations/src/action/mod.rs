@@ -2,18 +2,18 @@
 //!
 //! This allows us to execute the "right-hand-side" of a rule. The
 //! implementation here is optimized to execute on a batch of rows at a time.
-use std::rc::Rc;
+use std::{ops::Deref, sync::atomic::AtomicUsize};
 
 use numeric_id::{DenseIdMap, NumericId};
 use smallvec::SmallVec;
 
 use crate::{
-    common::{HashMap, Value},
-    free_join::{inc_counter, CounterId, Database, TableId, Variable},
-    pool::{PoolSet, Pooled},
+    common::{DashMap, Value},
+    free_join::{CounterId, ExternalFunctionExt, TableId, TableInfo, Variable},
+    pool::{with_pool_set, PoolSet, Pooled},
     primitives::PrimitiveFunctionId,
-    table_spec::ColumnId,
-    ExternalFunctionId,
+    table_spec::{ColumnId, MutationBuffer},
+    ExternalFunctionId, Primitives, WrappedTable,
 };
 
 use self::mask::{Mask, MaskIter, ValueSource};
@@ -96,77 +96,64 @@ pub(crate) type Bindings = DenseIdMap<Variable, Pooled<Vec<Value>>>;
 #[derive(Default)]
 pub(crate) struct PredictedVals {
     #[allow(clippy::type_complexity)]
-    data: HashMap<(TableId, SmallVec<[Value; 3]>), Pooled<Rc<Vec<Value>>>>,
+    data: DashMap<(TableId, SmallVec<[Value; 3]>), Pooled<Vec<Value>>>,
 }
 
 impl PredictedVals {
     pub(crate) fn get_val(
-        &mut self,
+        &self,
         table: TableId,
         key: &[Value],
-        default: impl FnOnce() -> Pooled<Rc<Vec<Value>>>,
-    ) -> &Pooled<Rc<Vec<Value>>> {
+        default: impl FnOnce() -> Pooled<Vec<Value>>,
+    ) -> impl Deref<Target = Pooled<Vec<Value>>> + '_ {
         self.data
             .entry((table, SmallVec::from_slice(key)))
             .or_insert_with(default)
     }
 }
 
-pub struct ExecutionState<'a> {
-    pub(crate) predicted: &'a mut PredictedVals,
-    pub(crate) db: &'a mut Database,
+pub trait TableInfoMap {
+    fn get_table_info(&self, table: TableId) -> &TableInfo;
+    fn get_table(&self, table: TableId) -> &WrappedTable {
+        &self.get_table_info(table).table
+    }
 }
 
-impl ExecutionState<'_> {
-    pub fn pool_set(&self) -> &PoolSet {
-        &self.db.pool_set
+impl TableInfoMap for DenseIdMap<TableId, TableInfo> {
+    fn get_table_info(&self, table: TableId) -> &TableInfo {
+        self.get(table).expect("table not found")
     }
-    pub(crate) fn run_instrs(&mut self, instrs: &[Instr], bindings: &mut Bindings) {
-        let Some(batch_size) = bindings.iter().map(|(_, x)| x.len()).next() else {
-            // Empty bindings; nothing to do.
-            return;
-        };
-        let mut mask = Mask::new(0..batch_size, self.db.pool_set.get_pool());
-        for instr in instrs {
-            if mask.is_empty() {
-                break;
-            }
-            self.run_instr(&mut mask, instr, bindings);
-        }
-    }
+}
 
-    pub(crate) fn merge_all(&mut self) -> bool {
-        let mut ever_changed = false;
-        loop {
-            let mut changed = false;
-            for id in 0..self.db.tables.n_ids() {
-                // Move the table out of the tables map. Run the merge (which can
-                // access the rest of the db). Then put it back.
-                let table = TableId::from_usize(id);
-                let mut info = self.db.tables.take(table);
-                let table_changed = info.table.merge(self);
-                changed |= table_changed;
-                self.db.tables.insert(table, info);
-            }
-            ever_changed |= changed;
-            if !changed {
-                break;
-            }
-        }
-        ever_changed
-    }
+pub(crate) struct DbView<'a, Tables> {
+    pub(crate) table_info: &'a Tables,
+    pub(crate) counters: &'a DenseIdMap<CounterId, AtomicUsize>,
+    pub(crate) external_funcs: &'a DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
+    pub(crate) prims: &'a Primitives,
+}
 
-    pub(crate) fn merge_table(&mut self, table: TableId) {
-        let mut info = self.db.tables.take(table);
-        let _table_changed = info.table.merge(self);
-        self.db.tables.insert(table, info);
+impl<T> DbView<'_, T> {
+    fn inc_counter(&self, ctr: CounterId) -> usize {
+        self.counters[ctr].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
+}
 
+pub struct ExecutionState<'a, T = DenseIdMap<TableId, TableInfo>> {
+    pub(crate) predicted: &'a PredictedVals,
+    pub(crate) db: DbView<'a, T>,
+    pub(crate) buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+}
+
+impl<T: TableInfoMap> ExecutionState<'_, T> {
     pub fn stage_insert(&mut self, table: TableId, vals: &[Value]) {
-        self.db.get_table_mut(table).stage_insert(vals);
+        self.buffers
+            .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
+            .stage_insert(vals);
     }
     pub fn stage_remove(&mut self, table: TableId, vals: &[Value]) {
-        self.db.get_table_mut(table).stage_remove(vals);
+        self.buffers
+            .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
+            .stage_remove(vals);
     }
 
     /// Get the _current_ value for a given key in `table`, or otherwise insert
@@ -181,28 +168,61 @@ impl ExecutionState<'_> {
         table: TableId,
         key: &[Value],
         vals: impl ExactSizeIterator<Item = MergeVal>,
-    ) -> Pooled<Rc<Vec<Value>>> {
-        if let Some(row) = self.db.get_table(table).get_row(key, self.db.pool_set()) {
-            return Pooled::transfer_rc(row.vals, self.db.pool_set.get_pool());
-        }
-        self.predicted
-            .get_val(table, key, || {
-                let mut new = self.db.pool_set.get::<Rc<Vec<Value>>>();
-                let new_mut = Rc::get_mut(&mut new).unwrap();
-                new_mut.reserve(key.len() + vals.len());
-                new_mut.extend_from_slice(key);
-                for val in vals {
-                    new_mut.push(match val {
-                        MergeVal::Counter(ctr) => Value::from_usize(self.db.inc_counter(ctr)),
-                        MergeVal::Constant(c) => c,
+    ) -> Pooled<Vec<Value>> {
+        with_pool_set(|ps| {
+            if let Some(row) = self.db.table_info.get_table(table).get_row(key) {
+                return row.vals;
+            }
+            Pooled::cloned(
+                self.predicted
+                    .get_val(table, key, || -> Pooled<Vec<Value>> {
+                        let mut new = ps.get::<Vec<Value>>();
+                        new.reserve(key.len() + vals.len());
+                        new.extend_from_slice(key);
+                        for val in vals {
+                            new.push(match val {
+                                MergeVal::Counter(ctr) => {
+                                    Value::from_usize(self.db.inc_counter(ctr))
+                                }
+                                MergeVal::Constant(c) => c,
+                            })
+                        }
+                        self.buffers
+                            .get_or_insert(table, || {
+                                self.db.table_info.get_table(table).new_buffer()
+                            })
+                            .stage_insert(&new);
+                        new
                     })
-                }
-                self.db.get_table_mut(table).stage_insert(&new);
-                new
-            })
-            .clone()
+                    .deref(),
+            )
+        })
     }
-    fn run_instr(&mut self, mask: &mut Mask, inst: &Instr, bindings: &mut Bindings) {
+}
+
+impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
+    pub(crate) fn run_instrs(&mut self, instrs: &[Instr], bindings: &mut Bindings) {
+        let Some(batch_size) = bindings.iter().map(|(_, x)| x.len()).next() else {
+            // Empty bindings; nothing to do.
+            return;
+        };
+        with_pool_set(|ps| {
+            let mut mask = Mask::new(0..batch_size, ps);
+            for instr in instrs {
+                if mask.is_empty() {
+                    break;
+                }
+                self.run_instr(&mut mask, instr, bindings, ps);
+            }
+        })
+    }
+    fn run_instr(
+        &mut self,
+        mask: &mut Mask,
+        inst: &Instr,
+        bindings: &mut Bindings,
+        pool_set: &PoolSet,
+    ) {
         fn assert_impl(
             bindings: &mut Bindings,
             mask: &mut Mask,
@@ -261,19 +281,18 @@ impl ExecutionState<'_> {
                 dst_col,
                 dst_var,
             } => {
-                // use the raw fields becaust `table` must be mutable, and we
-                // also need pool_set.
-                let pool_set = &self.db.pool_set;
-                let shared_pool = pool_set.get_pool::<Rc<Vec<Value>>>().clone();
                 let pool = pool_set.get_pool::<Vec<Value>>().clone();
-                let mut table = self.db.tables.get_mut(*table_id).unwrap().table_mut();
+                self.buffers.get_or_insert(*table_id, || {
+                    self.db.table_info.get_table(*table_id).new_buffer()
+                });
+                let table = self.db.table_info.get_table(*table_id);
                 let mut out = pool.get();
 
                 // TODO: we may want to vectorize this one better: do a round of
                 // lookups, then for ones that failed, do a round of inserts.
                 iter_entries!(pool, args).fill_vec(&mut out, Value::stale, |offset, key| {
                     // First, check if the entry is already in the table:
-                    if let Some(row) = table.get_row_column(&key, *dst_col, pool_set) {
+                    if let Some(row) = table.get_row_column(&key, *dst_col) {
                         return Some(row);
                     }
                     // If not, insert the default value.
@@ -281,36 +300,35 @@ impl ExecutionState<'_> {
                     // We avoid doing this more than once by using the
                     // `predicted` map.
                     let prediction_key = (*table_id, SmallVec::<[Value; 3]>::from_slice(&key));
+                    let buffers = &mut self.buffers;
                     // Bind some mutable references because the closure passed
                     // to or_insert_with is `move`.
-                    let ctrs = &mut self.db.counters;
-                    let table = &mut table;
+                    let ctrs = &self.db.counters;
                     let bindings = &bindings;
-                    let pool_ref = &shared_pool;
                     let row = self
                         .predicted
                         .data
                         .entry(prediction_key)
                         .or_insert_with(move || {
-                            let mut row = Pooled::transfer_rc(key, pool_ref);
+                            let mut row = key;
                             // Extend the key with the default values.
-                            let row_mut = Rc::get_mut(&mut row).unwrap();
-                            row_mut.reserve(default.len());
+                            row.reserve(default.len());
                             for val in default {
                                 let val = match val {
                                     WriteVal::QueryEntry(QueryEntry::Const(c)) => *c,
                                     WriteVal::QueryEntry(QueryEntry::Var(v)) => {
                                         bindings[*v][offset]
                                     }
-                                    WriteVal::IncCounter(ctr) => {
-                                        Value::from_usize(inc_counter(ctrs, *ctr))
-                                    }
-                                    WriteVal::CurrentVal(ix) => row_mut[*ix],
+                                    WriteVal::IncCounter(ctr) => Value::from_usize(
+                                        ctrs[*ctr]
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                                    ),
+                                    WriteVal::CurrentVal(ix) => row[*ix],
                                 };
-                                row_mut.push(val)
+                                row.push(val)
                             }
                             // Insert it into the table.
-                            table.stage_insert(&row);
+                            buffers.get_mut(*table_id).unwrap().stage_insert(&row);
                             row
                         });
                     Some(row[dst_col.index()])
@@ -324,15 +342,9 @@ impl ExecutionState<'_> {
                 dst_var,
                 default,
             } => {
-                let table = self.db.get_table(*table);
+                let table = self.db.table_info.get_table(*table);
                 table.lookup_with_default_vectorized(
-                    &self.db.pool_set,
-                    mask,
-                    bindings,
-                    args,
-                    *dst_col,
-                    *default,
-                    *dst_var,
+                    mask, bindings, args, *dst_col, *default, *dst_var,
                 );
             }
             Instr::Lookup {
@@ -341,77 +353,60 @@ impl ExecutionState<'_> {
                 dst_col,
                 dst_var,
             } => {
-                let table = self.db.get_table(*table);
-                table.lookup_row_vectorized(
-                    &self.db.pool_set,
-                    mask,
-                    bindings,
-                    args,
-                    *dst_col,
-                    *dst_var,
-                );
+                let table = self.db.table_info.get_table(*table);
+                table.lookup_row_vectorized(mask, bindings, args, *dst_col, *dst_var);
             }
             Instr::Insert { table, vals } => {
-                let pool = self.db.pool_set().get_pool::<Vec<Value>>().clone();
-                let table = self.db.get_table_mut(*table);
+                let pool = pool_set.get_pool::<Vec<Value>>().clone();
                 iter_entries!(pool, vals).for_each(|vals| {
-                    table.stage_insert(&vals);
+                    self.stage_insert(*table, &vals);
                 })
             }
             Instr::InsertIfEq { table, l, r, vals } => {
-                let pool = self.db.pool_set().get_pool::<Vec<Value>>().clone();
+                let pool = pool_set.get_pool::<Vec<Value>>().clone();
                 match (l, r) {
-                    (QueryEntry::Var(v1), QueryEntry::Var(v2)) => {
-                        let table = self.db.get_table_mut(*table);
-                        iter_entries!(pool, vals)
-                            .zip(&bindings[*v1])
-                            .zip(&bindings[*v2])
-                            .for_each(|((vals, v1), v2)| {
-                                if v1 == v2 {
-                                    table.stage_insert(&vals);
-                                }
-                            })
-                    }
+                    (QueryEntry::Var(v1), QueryEntry::Var(v2)) => iter_entries!(pool, vals)
+                        .zip(&bindings[*v1])
+                        .zip(&bindings[*v2])
+                        .for_each(|((vals, v1), v2)| {
+                            if v1 == v2 {
+                                self.stage_insert(*table, &vals);
+                            }
+                        }),
                     (QueryEntry::Var(v), QueryEntry::Const(c))
-                    | (QueryEntry::Const(c), QueryEntry::Var(v)) => {
-                        let table = self.db.get_table_mut(*table);
-                        iter_entries!(pool, vals)
-                            .zip(&bindings[*v])
-                            .for_each(|(vals, cond)| {
-                                if cond == c {
-                                    table.stage_insert(&vals);
-                                }
-                            })
-                    }
+                    | (QueryEntry::Const(c), QueryEntry::Var(v)) => iter_entries!(pool, vals)
+                        .zip(&bindings[*v])
+                        .for_each(|(vals, cond)| {
+                            if cond == c {
+                                self.stage_insert(*table, &vals);
+                            }
+                        }),
                     (QueryEntry::Const(c1), QueryEntry::Const(c2)) => {
                         if c1 == c2 {
-                            let table = self.db.get_table_mut(*table);
                             iter_entries!(pool, vals).for_each(|vals| {
-                                table.stage_insert(&vals);
+                                self.stage_insert(*table, &vals);
                             })
                         }
                     }
                 }
             }
             Instr::Remove { table, args } => {
-                let pool = self.db.pool_set().get_pool::<Vec<Value>>().clone();
-                let table = self.db.get_table_mut(*table);
+                let pool = pool_set.get_pool::<Vec<Value>>().clone();
                 iter_entries!(pool, args).for_each(|args| {
-                    table.stage_remove(&args);
+                    self.stage_remove(*table, &args);
                 })
             }
             Instr::Prim { func, args, dst } => {
-                let pool = self.db.pool_set().get_pool::<Vec<Value>>().clone();
-                let prims = self.db.primitives_mut();
-                prims.apply_vectorized(*func, pool, mask, bindings, args, *dst);
+                let pool = pool_set.get_pool::<Vec<Value>>().clone();
+                self.db
+                    .prims
+                    .apply_vectorized(*func, pool, mask, bindings, args, *dst);
             }
             Instr::External { func, args, dst } => {
-                let imp = self.db.extract_external_func(*func);
-                imp.invoke_batch(self, mask, bindings, args, *dst);
-                self.db.replace_external_func(*func, imp)
+                self.db.external_funcs[*func].invoke_batch(self, mask, bindings, args, *dst);
             }
             Instr::AssertAnyNe { ops, divider } => {
-                let pool = self.db.pool_set().get_pool::<Vec<Value>>().clone();
+                let pool = pool_set.get_pool::<Vec<Value>>().clone();
                 iter_entries!(pool, ops).retain(|vals| {
                     vals[0..*divider]
                         .iter()

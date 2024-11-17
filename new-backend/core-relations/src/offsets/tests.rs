@@ -1,6 +1,8 @@
-use crate::common::HashSet;
+use numeric_id::NumericId;
 
-use super::*;
+use crate::{common::HashSet, pool::with_pool_set, OffsetRange, Subset};
+
+use super::{Offsets, RowId, SortedOffsetVector};
 
 fn o(u: usize) -> RowId {
     RowId::from_usize(u)
@@ -17,14 +19,13 @@ fn collect<T: Clone>(range: &impl Offsets, elts: &[T]) -> Vec<T> {
 
 #[test]
 fn subset_push() {
-    let pool_set = PoolSet::default();
     let elts = vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
     let mut s = Subset::Dense(OffsetRange::new(o(1), o(2)));
     assert_eq!(collect(&s, &elts), vec![1]);
-    s.add_row_sorted(o(2), &pool_set);
-    s.add_row_sorted(o(3), &pool_set);
+    s.add_row_sorted(o(2));
+    s.add_row_sorted(o(3));
     assert_eq!(collect(&s, &elts), vec![1, 2, 3]);
-    s.add_row_sorted(o(7), &pool_set);
+    s.add_row_sorted(o(7));
     assert_eq!(collect(&s, &elts), vec![1, 2, 3, 7]);
 }
 
@@ -61,7 +62,6 @@ fn intersect() {
         Vec::from_iter(2..100),
         Vec::from_iter(4..50),
     ];
-    let pool_set = PoolSet::default();
 
     for l in &elts {
         for r in &elts {
@@ -70,13 +70,16 @@ fn intersect() {
             let l_set = HashSet::from_iter(l.iter().copied().map(o));
             let r_set = HashSet::from_iter(r.iter().copied().map(o));
             for row in l {
-                l_sub.add_row_sorted(o(*row), &pool_set);
+                l_sub.add_row_sorted(o(*row));
             }
             for row in r {
-                r_sub.add_row_sorted(o(*row), &pool_set);
+                r_sub.add_row_sorted(o(*row));
             }
             let mut expected = Vec::from_iter(l_set.intersection(&r_set).copied());
-            l_sub.intersect(r_sub.as_ref(), pool_set.get_pool());
+            l_sub.intersect(
+                r_sub.as_ref(),
+                &with_pool_set(|pool_set| pool_set.get_pool().clone()),
+            );
             expected.sort();
             let mut got = Vec::new();
             l_sub.offsets(|row| got.push(row));
@@ -87,7 +90,6 @@ fn intersect() {
 
 #[test]
 fn iter_bounded() {
-    let ps = PoolSet::default();
     let mut s1 = Subset::empty();
     assert!(s1
         .as_ref()
@@ -95,8 +97,8 @@ fn iter_bounded() {
         .is_none());
     let mut s2 = Subset::empty();
     for i in 0..100 {
-        s1.add_row_sorted(RowId::new(i), &ps);
-        s2.add_row_sorted(RowId::new(i * 2), &ps);
+        s1.add_row_sorted(RowId::new(i));
+        s2.add_row_sorted(RowId::new(i * 2));
     }
     assert!(matches!(s1, Subset::Dense(..)));
     assert!(matches!(s2, Subset::Sparse(..)));

@@ -1,7 +1,12 @@
 //! A table implementation backed by a union-find.
 
-use std::{any::Any, cell::RefCell, mem};
+use std::{
+    any::Any,
+    mem,
+    sync::{Arc, Weak},
+};
 
+use crossbeam_queue::SegQueue;
 use indexmap::IndexMap;
 use numeric_id::{DenseIdMap, NumericId};
 use petgraph::{algo::dijkstra, graph::NodeIndex, visit::EdgeRef, Direction, Graph};
@@ -10,14 +15,18 @@ use crate::{
     action::ExecutionState,
     common::{HashMap, IndexSet, Value},
     offsets::{OffsetRange, RowId, Subset, SubsetRef},
-    pool::PoolSet,
-    table_spec::{ColumnId, Constraint, Generation, Offset, Row, Table, TableSpec, TableVersion},
+    pool::with_pool_set,
+    row_buffer::RowBuffer,
+    table_spec::{
+        ColumnId, Constraint, Generation, MutationBuffer, Offset, Row, Table, TableSpec,
+        TableVersion,
+    },
 };
 
 #[cfg(test)]
 mod tests;
 
-type UnionFind = union_find::UnionFind<Value>;
+type UnionFind = union_find::concurrent::UnionFind<Value>;
 
 /// A special table backed by a union-find used to efficiently implement
 /// egglog-style canonicaliztion.
@@ -43,23 +52,59 @@ type UnionFind = union_find::UnionFind<Value>;
 /// `ts` is the current timestamp. Note that all tie-breaks and other encoding
 /// decisions are made internally, so there may not literally be a row added
 /// with this value.
-#[derive(Default)]
 pub struct DisplacedTable {
-    uf: RefCell<UnionFind>,
+    uf: UnionFind,
     displaced: Vec<(Value, Value)>,
     changed: bool,
     lookup_table: HashMap<Value, RowId>,
+    buffered_writes: Arc<SegQueue<RowBuffer>>,
+}
+
+impl Default for DisplacedTable {
+    fn default() -> Self {
+        Self {
+            uf: UnionFind::with_capacity(1 << 20),
+            displaced: Vec::new(),
+            changed: false,
+            lookup_table: HashMap::default(),
+            buffered_writes: Arc::new(SegQueue::new()),
+        }
+    }
 }
 
 impl Clone for DisplacedTable {
     fn clone(&self) -> Self {
-        let uf = self.uf.borrow().clone();
         DisplacedTable {
-            uf: RefCell::new(uf),
+            uf: self.uf.deep_copy(),
             displaced: self.displaced.clone(),
             changed: self.changed,
             lookup_table: self.lookup_table.clone(),
+            buffered_writes: Default::default(),
         }
+    }
+}
+
+struct UfBuffer {
+    to_insert: RowBuffer,
+    buffered_writes: Weak<SegQueue<RowBuffer>>,
+}
+
+impl Drop for UfBuffer {
+    fn drop(&mut self) {
+        let Some(buffered_writes) = self.buffered_writes.upgrade() else {
+            return;
+        };
+        let arity = self.to_insert.arity();
+        buffered_writes.push(mem::replace(&mut self.to_insert, RowBuffer::new(arity)));
+    }
+}
+
+impl MutationBuffer for UfBuffer {
+    fn stage_insert(&mut self, row: &[Value]) {
+        self.to_insert.add_row(row);
+    }
+    fn stage_remove(&mut self, _: &[Value]) {
+        panic!("attempting to remove data from a DisplacedTable")
     }
 }
 
@@ -83,18 +128,18 @@ impl Table for DisplacedTable {
     }
 
     fn clear(&mut self) {
-        self.uf.borrow_mut().reset();
+        self.uf.reset();
         self.displaced.clear();
     }
 
-    fn all(&self, _: &PoolSet) -> Subset {
+    fn all(&self) -> Subset {
         Subset::Dense(OffsetRange::new(
             RowId::new(0),
             RowId::from_usize(self.displaced.len()),
         ))
     }
 
-    fn len(&self, _: &PoolSet) -> usize {
+    fn len(&self) -> usize {
         self.displaced.len()
     }
 
@@ -105,7 +150,7 @@ impl Table for DisplacedTable {
         }
     }
 
-    fn updates_since(&self, gen: Offset, _: &PoolSet) -> Subset {
+    fn updates_since(&self, gen: Offset) -> Subset {
         Subset::Dense(OffsetRange::new(
             RowId::from_usize(gen.index()),
             RowId::from_usize(self.displaced.len()),
@@ -142,12 +187,12 @@ impl Table for DisplacedTable {
         }
     }
 
-    fn refine_one(&self, mut subset: Subset, c: &Constraint, pool_set: &PoolSet) -> Subset {
-        subset.retain(|row| self.eval(c, row), pool_set);
+    fn refine_one(&self, mut subset: Subset, c: &Constraint) -> Subset {
+        subset.retain(|row| self.eval(c, row));
         subset
     }
 
-    fn fast_subset(&self, constraint: &Constraint, _: &PoolSet) -> Option<Subset> {
+    fn fast_subset(&self, constraint: &Constraint) -> Option<Subset> {
         let ts = ColumnId::new(2);
         match constraint {
             Constraint::Eq { .. } => None,
@@ -217,29 +262,33 @@ impl Table for DisplacedTable {
         }
     }
 
-    fn get_row(&self, key: &[Value], pool_set: &PoolSet) -> Option<Row> {
+    fn get_row(&self, key: &[Value]) -> Option<Row> {
         assert_eq!(key.len(), 1, "attempt to lookup a row with the wrong key");
         let row_id = *self.lookup_table.get(&key[0])?;
-        let mut vals = pool_set.get::<Vec<Value>>();
+        let mut vals = with_pool_set(|ps| ps.get::<Vec<Value>>());
         vals.extend_from_slice(self.expand(row_id).as_slice());
         Some(Row { id: row_id, vals })
     }
 
-    fn get_row_column(&self, key: &[Value], col: ColumnId, _: &PoolSet) -> Option<Value> {
+    fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
         assert_eq!(key.len(), 1, "attempt to lookup a row with the wrong key");
         let row_id = *self.lookup_table.get(&key[0])?;
         Some(self.expand(row_id)[col.index()])
     }
 
-    fn stage_insert(&mut self, row: &[Value]) {
-        self.changed |= self.insert_impl(row).is_some();
-    }
-
-    fn stage_remove(&mut self, _: &[Value]) {
-        panic!("attempting to delete an entry for a DisplacedTable")
+    fn new_buffer(&self) -> Box<dyn MutationBuffer> {
+        Box::new(UfBuffer {
+            to_insert: RowBuffer::new(3),
+            buffered_writes: Arc::downgrade(&self.buffered_writes),
+        })
     }
 
     fn merge(&mut self, _: &mut ExecutionState) -> bool {
+        while let Some(rowbuf) = self.buffered_writes.pop() {
+            for row in rowbuf.iter() {
+                self.changed |= self.insert_impl(row).is_some();
+            }
+        }
         mem::take(&mut self.changed)
     }
 }
@@ -247,7 +296,7 @@ impl Table for DisplacedTable {
 impl DisplacedTable {
     fn expand(&self, row: RowId) -> [Value; 3] {
         let (child, ts) = self.displaced[row.index()];
-        [child, self.uf.borrow_mut().find(child), ts]
+        [child, self.uf.find(child), ts]
     }
     fn timestamp_bounds(&self, val: Value) -> Result<(RowId, RowId), RowId> {
         match self.displaced.binary_search_by_key(&val, |(_, ts)| *ts) {
@@ -270,11 +319,10 @@ impl DisplacedTable {
     }
     fn insert_impl(&mut self, row: &[Value]) -> Option<(Value, Value)> {
         assert_eq!(row.len(), 3, "attempt to insert a row with the wrong arity");
-        let mut uf = self.uf.borrow_mut();
-        if uf.find(row[0]) == uf.find(row[1]) {
+        if self.uf.same_set(row[0], row[1]) {
             return None;
         }
-        let (parent, child) = uf.union(row[0], row[1]);
+        let (parent, child) = self.uf.union(row[0], row[1]);
         let ts = row[2];
         if let Some((_, highest)) = self.displaced.last() {
             assert!(
@@ -313,6 +361,7 @@ pub struct DisplacedTableWithProvenance {
     /// NB: this is different from the 'displaced' table in 'base', which holds
     /// a timestamp.
     displaced: Vec<(Value, Value)>,
+    buffered_writes: Arc<SegQueue<RowBuffer>>,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -320,8 +369,6 @@ struct ProofEdge {
     reason: ProofReason,
     ts: Value,
 }
-
-// TODO: endpoints.
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProofStep {
@@ -361,12 +408,11 @@ impl DisplacedTableWithProvenance {
         }
         let mut l_proofs = IndexMap::new();
         let mut r_proofs = IndexMap::new();
-        let mut uf = self.base.uf.borrow_mut();
-        let canon = uf.find(l);
-        if uf.find(r) != canon {
+        if !self.base.uf.same_set(l, r) {
             // The two values aren't equal.
             return None;
         }
+        let canon = self.base.uf.find(l);
 
         // General case: collect individual equality proofs that point from `l`
         // (sim. `r`) and move towards canon. We stop early and don't always go
@@ -499,11 +545,52 @@ impl DisplacedTableWithProvenance {
             .entry(val)
             .or_insert_with(|| self.proof_graph.add_node(val))
     }
+
+    fn insert_impl(&mut self, row: &[Value]) {
+        let [a, b, ts, reason] = row else {
+            panic!("attempt to insert a row with the wrong arity ({:?})", row);
+        };
+        match self.base.insert_impl(&[*a, *b, *ts]) {
+            Some((parent, child)) => {
+                self.displaced.push((child, parent));
+                self.context
+                    .entry((child, parent))
+                    .or_default()
+                    .insert(*reason);
+                self.base.changed = true;
+
+                let a_node = self.get_or_create_node(*a);
+                let b_node = self.get_or_create_node(*b);
+                self.proof_graph.add_edge(
+                    a_node,
+                    b_node,
+                    ProofEdge {
+                        reason: ProofReason::Forward(*reason),
+                        ts: *ts,
+                    },
+                );
+                self.proof_graph.add_edge(
+                    b_node,
+                    a_node,
+                    ProofEdge {
+                        reason: ProofReason::Backward(*reason),
+                        ts: *ts,
+                    },
+                );
+            }
+            None => {
+                self.context.entry((*a, *b)).or_default().insert(*reason);
+                // We don't register a change, even if we learned a new proof.
+                // We may want to change this behavior in order to search for
+                // smaller proofs.
+            }
+        }
+    }
 }
 
 impl Table for DisplacedTableWithProvenance {
-    fn refine_one(&self, mut subset: Subset, c: &Constraint, pool_set: &PoolSet) -> Subset {
-        subset.retain(|row| self.eval(c, row), pool_set);
+    fn refine_one(&self, mut subset: Subset, c: &Constraint) -> Subset {
+        subset.retain(|row| self.eval(c, row));
         subset
     }
     fn scan_generic_bounded(
@@ -542,53 +629,24 @@ impl Table for DisplacedTableWithProvenance {
             ..self.base.spec()
         }
     }
-    fn stage_insert(&mut self, row: &[Value]) {
-        let [a, b, ts, reason] = row else {
-            panic!("invalid arity for row: {row:?} (expected 4)")
-        };
-        match self.base.insert_impl(&[*a, *b, *ts]) {
-            Some((parent, child)) => {
-                self.displaced.push((child, parent));
-                self.context
-                    .entry((child, parent))
-                    .or_default()
-                    .insert(*reason);
-                self.base.changed = true;
 
-                let a_node = self.get_or_create_node(*a);
-                let b_node = self.get_or_create_node(*b);
-                self.proof_graph.add_edge(
-                    a_node,
-                    b_node,
-                    ProofEdge {
-                        reason: ProofReason::Forward(*reason),
-                        ts: *ts,
-                    },
-                );
-                self.proof_graph.add_edge(
-                    b_node,
-                    a_node,
-                    ProofEdge {
-                        reason: ProofReason::Backward(*reason),
-                        ts: *ts,
-                    },
-                );
-            }
-            None => {
-                self.context.entry((*a, *b)).or_default().insert(*reason);
-                // We don't register a change, even if we learned a new proof.
-                // We may want to change this behavior in order to search for
-                // smaller proofs.
+    // fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
+    //     let rows = mem::take(&mut *self.buffered_writes.borrow_mut());
+    //     for row in rows.iter() {
+    //         self.insert_impl(row);
+    //     }
+    // }
+    fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
+        while let Some(rowbuf) = self.buffered_writes.pop() {
+            for row in rowbuf.iter() {
+                self.insert_impl(row);
             }
         }
-    }
-
-    fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
         self.base.merge(exec_state)
     }
 
-    fn get_row(&self, key: &[Value], pool_set: &PoolSet) -> Option<Row> {
-        let mut inner = self.base.get_row(key, pool_set)?;
+    fn get_row(&self, key: &[Value]) -> Option<Row> {
+        let mut inner = self.base.get_row(key)?;
         let (child, parent) = self.displaced[inner.id.index()];
         debug_assert_eq!(child, inner.vals[0]);
         let proof = *self.context[&(child, parent)].get_index(0).unwrap();
@@ -596,13 +654,20 @@ impl Table for DisplacedTableWithProvenance {
         Some(inner)
     }
 
-    fn get_row_column(&self, key: &[Value], col: ColumnId, pool_set: &PoolSet) -> Option<Value> {
+    fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
         if col == ColumnId::new(3) {
             let row = *self.base.lookup_table.get(&key[0])?;
             Some(self.expand(row)[3])
         } else {
-            self.base.get_row_column(key, col, pool_set)
+            self.base.get_row_column(key, col)
         }
+    }
+
+    fn new_buffer(&self) -> Box<dyn MutationBuffer> {
+        Box::new(UfBuffer {
+            to_insert: RowBuffer::new(4),
+            buffered_writes: Arc::downgrade(&self.buffered_writes),
+        })
     }
 
     // Many of these methods just delgate to `base`:
@@ -616,23 +681,20 @@ impl Table for DisplacedTableWithProvenance {
     fn clear(&mut self) {
         self.base.clear()
     }
-    fn all(&self, pool_set: &PoolSet) -> Subset {
-        self.base.all(pool_set)
+    fn all(&self) -> Subset {
+        self.base.all()
     }
-    fn len(&self, pool_set: &PoolSet) -> usize {
-        self.base.len(pool_set)
+    fn len(&self) -> usize {
+        self.base.len()
     }
-    fn updates_since(&self, gen: Offset, pool_set: &PoolSet) -> Subset {
-        self.base.updates_since(gen, pool_set)
+    fn updates_since(&self, gen: Offset) -> Subset {
+        self.base.updates_since(gen)
     }
     fn version(&self) -> TableVersion {
         self.base.version()
     }
-    fn fast_subset(&self, c: &Constraint, ps: &PoolSet) -> Option<Subset> {
-        self.base.fast_subset(c, ps)
-    }
-    fn stage_remove(&mut self, key: &[Value]) {
-        self.base.stage_remove(key)
+    fn fast_subset(&self, c: &Constraint) -> Option<Subset> {
+        self.base.fast_subset(c)
     }
 }
 

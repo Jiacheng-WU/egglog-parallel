@@ -1,10 +1,19 @@
-//! This crate contains a basic union-find implementation.
+//! This crate contains two basic union-find implementations:
 //!
-//! This is in a separate crate because we use it in a number of places. We may
-//! eventually make this better (e.g. with ranks, etc.) but for now this works
-//! well enough.
+//! * [`UnionFind`], a basic single-threaded union-find data-structure.
+//! * [`concurrent::UnionFind`], a concurrent union-find data-structure.
+//!
+//! Both structures are fairly rudimentary and are customized to be used in an
+//! egraph-related setting. In particular, they do "union by min id", which is a
+//! strategy that _does not_ guarantee the same asymptotic complexity as the
+//! main techniques in the literature (e.g. union by rank). Union by min is a
+//! heuristic introduced to reduce the number of ids perturbed during congruence
+//! closure. There's likely more to do in this area but for now it seems to work
+//! well enough. It doesn't hurt that it's also simpler to implement.
 use numeric_id::NumericId;
 use std::cmp;
+
+pub mod concurrent;
 
 #[cfg(test)]
 mod tests;
@@ -48,10 +57,6 @@ impl<Value: NumericId> UnionFind<Value> {
         let a = self.find(a);
         let b = self.find(b);
         if a != b {
-            // TODO: probably want to do union-by-rank here. We need a rule that
-            // avoids spurious changes to the database when we create a new id
-            // only to immediately union it with a preexisting e-class, at which
-            // point things get deduped.
             let parent = cmp::min(a, b);
             let child = cmp::max(a, b);
             self.parents[child.index()] = parent;
@@ -73,6 +78,25 @@ impl<Value: NumericId> UnionFind<Value> {
             let grand = self.parents[parent.index()];
             self.parents[cur.index()] = grand;
             cur = grand;
+        }
+        cur
+    }
+
+    /// Find the representative of an equivalence class without using path compression.
+    ///
+    /// The primary advantage of this method is that it allows the ability to answer `find` queries
+    /// without holding a mutable reference to the union-find.
+    pub fn find_naive(&self, id: Value) -> Value {
+        if self.parents.len() <= id.index() {
+            return id;
+        }
+        let mut cur = id;
+        loop {
+            let parent = self.parents[cur.index()];
+            if cur == parent {
+                break;
+            }
+            cur = parent;
         }
         cur
     }

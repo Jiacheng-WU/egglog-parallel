@@ -3,7 +3,7 @@ use std::{cmp, fmt, mem};
 use numeric_id::{define_id, NumericId};
 
 use crate::{
-    pool::{Clear, PoolSet, Pooled},
+    pool::{with_pool_set, Clear, Pooled},
     Pool,
 };
 
@@ -96,7 +96,7 @@ impl SortedOffsetVector {
     pub(crate) fn fill_from_dense(&mut self, range: &OffsetRange) {
         self.0.clear();
         self.0
-            .extend((range.start.index()..range.end.index()).map(|x| RowId::new(x as _)));
+            .extend((range.start.index()..range.end.index()).map(RowId::from_usize));
     }
 }
 
@@ -325,13 +325,13 @@ impl Subset {
         }
     }
 
-    pub(crate) fn retain(&mut self, mut filter: impl FnMut(RowId) -> bool, pool_set: &PoolSet) {
+    pub(crate) fn retain(&mut self, mut filter: impl FnMut(RowId) -> bool) {
         match self {
             Subset::Dense(offs) => {
                 let mut res = Subset::empty();
                 offs.offsets(|row| {
                     if filter(row) {
-                        res.add_row_sorted(row, pool_set);
+                        res.add_row_sorted(row);
                     }
                 });
                 *self = res;
@@ -391,7 +391,7 @@ impl Subset {
     /// # Panics
     /// The row id in question must be greater than or equal to the upper bound
     /// of the subset. This method will panic if it is not.
-    pub(crate) fn add_row_sorted(&mut self, row: RowId, pool_set: &PoolSet) {
+    pub(crate) fn add_row_sorted(&mut self, row: RowId) {
         match self {
             Subset::Dense(range) => {
                 if range.end == range.start {
@@ -403,7 +403,7 @@ impl Subset {
                     range.end = row.inc();
                     return;
                 }
-                let mut vec = pool_set.get::<SortedOffsetVector>();
+                let mut vec = with_pool_set(|pool_set| pool_set.get::<SortedOffsetVector>());
                 vec.fill_from_dense(range);
                 vec.push(row);
                 *self = Subset::Sparse(vec);

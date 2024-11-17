@@ -17,6 +17,8 @@ fn basic_uf() {
     for ids in [&ids1, &ids2] {
         ids.windows(2).for_each(|w| {
             let (parent, child) = uf.union(w[0], w[1]);
+            assert_eq!(uf.find_naive(w[0]), parent);
+            assert_eq!(uf.find_naive(w[1]), parent);
             assert_eq!(uf.find(w[0]), parent);
             assert_eq!(uf.find(w[1]), parent);
             assert!(child == w[0] || child == w[1]);
