@@ -12,7 +12,6 @@ use std::{
     mem,
     rc::Rc,
     sync::{Arc, Mutex},
-    time::Instant,
 };
 
 use core_relations::{
@@ -24,6 +23,7 @@ use indexmap::{map::Entry, IndexMap};
 use numeric_id::{define_id, DenseIdMap, NumericId};
 use proof_spec::{ProofReason, ProofReconstructionState, ReasonSpecId};
 use smallvec::SmallVec;
+use web_time::Instant;
 
 pub mod macros;
 pub(crate) mod proof_spec;

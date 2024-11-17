@@ -1,7 +1,8 @@
-use std::{mem, time::Instant};
+use std::mem;
 
 use egglog_bridge::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, MergeFn};
 use num_rational::Rational64;
+use web_time::Instant;
 
 fn main() {
     const N: usize = 12;

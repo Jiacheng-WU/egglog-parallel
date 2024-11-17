@@ -1,13 +1,10 @@
-use std::{
-    collections::{HashMap, HashSet},
-    iter,
-    rc::Rc,
-};
+use std::{iter, rc::Rc};
 
 use core_relations::{
     ColumnId, DisplacedTableWithProvenance, PrimitiveFunctionId, PrimitivePrinter,
     ProofReason as UfProofReason, ProofStep, RuleBuilder, Value,
 };
+use hashbrown::{HashMap, HashSet};
 use numeric_id::{define_id, NumericId};
 
 use crate::{

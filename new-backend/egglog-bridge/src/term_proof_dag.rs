@@ -3,11 +3,13 @@ use core_relations::{PrimitiveId, PrimitivePrinter, Value};
 use thiserror::Error;
 
 use std::{
-    collections::{hash_map::Entry, BTreeMap, HashMap},
+    collections::BTreeMap,
     fmt,
     io::{self, Write},
     rc::Rc,
 };
+
+use hashbrown::{hash_map::Entry, HashMap};
 
 use crate::{
     rule::Variable,

@@ -4,12 +4,12 @@ use std::{
     hash::{Hash, Hasher},
     iter, mem,
     rc::Rc,
-    time::{Duration, Instant},
 };
 
 use numeric_id::{DenseIdMap, NumericId};
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
+use web_time::{Duration, Instant};
 
 use crate::{
     action::{Bindings, ExecutionState, PredictedVals},
