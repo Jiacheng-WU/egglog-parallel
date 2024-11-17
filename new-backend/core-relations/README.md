@@ -296,10 +296,190 @@ the rest of the loop as before.
 We can then vary the "morsel size" here by changing the `CHUNK_SIZE` constant.
 
 ### Inter-table Write Parallelism
-TODO
+All writes to a table happen in its `merge` method. `merge` happens in a
+fixed-point loop in the `merge_all` method in `src/free_join/mod.rs`:
+
+```rust
+pub fn merge_all(&mut self) -> bool {
+    let mut ever_changed = false;
+    loop {
+        let mut changed = false;
+        let predicted = PredictedVals::default();
+        for id in 0..self.tables.n_ids() {
+            // Move the table out of the tables map. Run the merge (which can
+            // access the rest of the db). Then put it back.
+            let table = TableId::from_usize(id);
+            let mut info = self.tables.take(table);
+            let table_changed = info.table.merge(&mut ExecutionState {
+                predicted: &predicted,
+                db: self.read_only_view(),
+                buffers: Default::default(),
+            });
+            changed |= table_changed;
+            self.tables.insert(table, info);
+        }
+        ever_changed |= changed;
+        if !changed {
+            break;
+        }
+    }
+    ever_changed
+}
+```
+
+This loop is not straightforward to parallelize in its current state, because we
+remove each table from the database and then run that table's `merge` with
+access to the rest of the database (that's what `read_only_view()` is doing).
+
+This is a general and interesting problem: `merge` functions can depend on other
+tables: in particular table merge functions can stage `union`s which are a table
+write. I think we have two options here:
+
+1. Move _all_ tables into a separate `DenseIdMap<TableId, ReadOptimizedLock<TableInfo>>`:
+a table runs its merge function with an exclusive lock on its table, and then
+references to other tables acquire a shared lock. This will cause recursive
+table dependencies to deadlock (these panic in egglog today). Legal, acyclic
+dependencies will naturally resolve themselves as later tables in the dependency
+graph block waiting for earlier ones to finish.
+
+2. Tables explicitly declare their merge dependencies at construction time. We
+then run merge in topological order, where tables that do not depend on one
+another can still be merged in parallel.
+
+I think that option (2) is probably the better one here, though it may take a
+bit more time to code up.
 
 ### Intra-table Write Parallelism
-TODO
+Parallelizing the outer `merge` loop may not be sufficient to get good write
+parallelism. We may not have that many tables, and even if we do a small number
+of tables may get most of the write load. To address this, we will want to
+perform the writes themselves in parallel. This involves looking at all the
+kinds of tables and parallelizing their `merge` method:
+
+#### Parallelizing `SortedWritesTable::merge`
+`SortedWritesTable` is a generalized variant of the main table data-structure in
+egglog. It's a raw `HashTable` whose entries are stored in a flat array
+optionally sorted by some timestamp column. To parallelize writes we need to
+solve the problem of parallel hashtable updates and parallel updates to the
+backing vector. Finally, we will also want to parallelize compaction of the
+array. A few notes on how to do this:
+
+* Shard the hash table _N_ ways, where _N_ is proportional to the available
+  parallelism.
+* Have one queue of updates per shard, rather than a global queue for the whole table.
+* In parallel, drain each queue and write out a vector (per shard) of writes
+  that will have to happen to the global vector.
+* Resize the vector to account for the number of additional writes needed then
+  write to the end of that vector in parallel. (This may require some degree of
+  unsafe code)
+* Now that we have offsets for new values, go back to each shard (in parallel)
+  and remap the table entries to point to their new entries:
+  - We can also update staleness markers here. This may _also_ require some
+    amount of unsafe code, unless we want to store staleness bits in a separate
+    bitset.
+* Finally, we may need to compact. I think we can do this using rayon parallel
+  iterators.
+  - create an vector of the size of the current backing vector (the "mapping"),
+    with all entries pointing to `AtomicU32::max_value`
+  - iterate over the array of (row, stale) pairs.
+  - enumerate
+  - filter by !stale. This gives an iterator of (old offset, row) pairs.
+  - collect into two vectors [offset vec, new vals vec]
+  - Now build the reverse mapping in parallel by doing a parallel iterator over
+    offset vec and enumerating. That gives an iterator over (new_offset, old_offset). We can then do
+    `mapping[old_offset].set(new_offset)`.
+  - Now we can iterate over the hash maps in parallel and then rewrite all their
+    entries to point to the new offset, using `mapping`.
+
+#### Parallelizing `DisplacedTable::merge`
+`DisplacedTabe` is the table storing updates to the union-find. Unlike
+`SortedWritesTable` it's possible that we could get away with doing these
+updates in a single-threaded way. (Doing so could actually speed up reads on the
+table).
+
+If we _did_ want to parallelize this I think we could:
+
+* Iterate over the updates in parallel, call `union` on the concurrent UF
+  data-structure, returning a new parent new child, and timestamp if the union
+  changed the UF.
+* Then we could write out the updates to a new vector and sort that vector to
+  get a coherent order for the unions. (Note that we always pick the min value
+  when unioning)
+* At that point we may want to copy the updates and update the `lookup_table`
+  map in a single-threaded way. I suspect there is a way to parallelize this
+  final step but it may not be worth it.
+
+#### Parallelizing `DisplacedTableWithProvenance::merge`
+`DisplacedTableWithProvenance` is that variant of the union-find that runs when
+proofs are enabled. I think we would want to parallelize this last, once we have
+a strategy for the underlying `DisplacedTable`. Once we have a solution there,
+the only added work needed is to figure out how to update the proof graph: if we
+choose not to parallelize updates to the displaced vector or the lookup table,
+we can also update the proof graph in a single thread. If not, we need a similar
+strategy for the graph
 
 ### Increasing Rebuild Parallelism
-TODO
+Once we have parallel rule execution, we should refactor the rebuild loop in
+`egglog-bridge` to run rules in larger batches. Right now, rebuilding works as
+follows (see `EGraph::rebuild` in `egglog-bridge/src/lib.rs` for the actual
+code):
+
+```
+do:
+  for table in tables:
+    if incremental-rebuild-heuristic(table):
+      for col in table.schema:
+        db.run(table.incremental-rebuild-rule[col]);
+    else:
+      db.run(table.nonincremental-rebuild-rule)
+until fixed point
+```
+
+We run the incremental rebuild rules one after another to avoid rebuilding a row
+twice. If we can prarallelize across rules, we should probably do the follwing
+instead:
+
+```
+do:
+  nonincremental-rules = []
+  incremental-rules = {}
+  for table in tables:
+    if incremental-rebuild-heuristic(table):
+      for col in table.schema:
+        incremental-rules[col].append(table.incremental-rebuild-rule[col])
+    else:
+      nonincremental-rules.append(table.nonincremental-rebuild-rule)
+  db.run(nonincremental-rules + incremental-rules[0])
+  for (col, rules) in ((x, y) in incremental-rules if x != 0):
+    db.run(rules)
+until fixed point
+```
+This allows us to run more rules at once, in fewer parallel rounds.
+
+#### A custom rebuilding algorithm?
+If we want to get better rebuild performance, I think we could hand-write our
+own version as part of `SortedWritesTable::merge`, but I think we should try the
+above strategy first as it would be less effort overall.
+
+### Misc
+
+* Storing the `id` counter in a single `AtomicUsize` is probably going to cause
+  contention. Do we want to do a Silo-style prefecting of ids here?
+* We should add calls to `rayon::yield` in `ReadOptimizedLock` to do other work
+  before blocking.
+
+### Performance / Measuring Speedups
+
+The changes made to facilitate parallelism here can slow down single-threaded
+execution. If you are interested in measuring that slowdown, check out the
+initial commit on this branch.
+
+To measure performance, time the examples in the `egglog-bridge` crate. You can
+run these commands from the crate root.
+
+```
+$ cargo build --release --example ac
+$ time target/release/examples/ac
+$ cargo build --release --example math
+$ time target/release/examples/math
+```
