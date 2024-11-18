@@ -240,7 +240,7 @@ impl JoinState<'_> {
                     }
                 }
             } else if cols.len() != 1 {
-                DynamicIndex::Dynamic(info.table.pivot(subset.as_ref(), &cols))
+                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
             } else {
                 DynamicIndex::DynamicColumn(if subset.size() > 16 {
                     let mut hasher = FxHasher::default();
@@ -255,12 +255,12 @@ impl JoinState<'_> {
                         .or_insert_with(|| {
                             (
                                 (cols[0], subset.clone()),
-                                Rc::new(info.table.pivot_col(subset.as_ref(), cols[0])),
+                                Rc::new(info.table.group_by_col(subset.as_ref(), cols[0])),
                             )
                         });
                     res.clone()
                 } else {
-                    Rc::new(info.table.pivot_col(subset.as_ref(), cols[0]))
+                    Rc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
                 })
             };
         Prober {

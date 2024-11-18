@@ -136,7 +136,7 @@ fn shard_math() {
     // Should be rounded up to 16.
     assert_eq!(table.mut_shards().len(), 16);
 
-    // If we generate a hundred thousand random numbers, we should see more than 100
+    // If we generate a hundred thousand random rows, we should see more than 100
     // items in each shard.
     let mut rng = thread_rng();
     let mut hist = HashMap::default();

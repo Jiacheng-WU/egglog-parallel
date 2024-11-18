@@ -521,12 +521,12 @@ impl WrappedTable {
     }
 
     /// Group the contents of the given subset by the given column.
-    pub(crate) fn pivot_col(&self, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
+    pub(crate) fn group_by_col(&self, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
         self.wrapper.group_by_col(&*self.inner, subset, col)
     }
 
     /// A multi-column vairant of [`WrappedTable::pivot_col`].
-    pub(crate) fn pivot(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
+    pub(crate) fn group_by_key(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
         self.wrapper.group_by_key(&*self.inner, subset, cols)
     }
 
