@@ -51,7 +51,6 @@ use std::io::Read;
 use std::iter::once;
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::str::FromStr;
 use std::{fmt::Debug, sync::Arc};
 use std::sync::RwLock;
@@ -1520,8 +1519,6 @@ impl EGraph {
     }
 }
 
-unsafe impl Send for EGraph {}
-unsafe impl Sync for EGraph {}
 
 // Currently, only the following errors can thrown without location information:
 // * PrimitiveError
