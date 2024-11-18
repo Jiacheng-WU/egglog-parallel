@@ -911,7 +911,7 @@ impl EGraph {
                 let search_results_arc = Arc::new(RwLock::new(search_results));
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
-                let _ = copy_rules.par_iter().map(|(rule_name, rule)| {
+                let _ = copy_rules.par_iter().for_each(|(rule_name, rule)| {
                     let mut all_matches = vec![];
                     let rule_search_start = Instant::now();
                     let mut did_match = false;
