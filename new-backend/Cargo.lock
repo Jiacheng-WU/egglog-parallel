@@ -172,6 +172,8 @@ dependencies = [
  "numeric-id",
  "once_cell",
  "petgraph",
+ "rand",
+ "rayon",
  "rustc-hash",
  "smallvec",
  "thiserror 2.0.3",

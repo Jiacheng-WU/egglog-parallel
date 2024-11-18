@@ -1,12 +1,16 @@
 use numeric_id::NumericId;
+use rand::{thread_rng, Rng};
 
 use crate::{
-    common::Value,
+    common::{HashMap, Value},
     offsets::{RowId, SubsetRef},
     row_buffer::TaggedRowBuffer,
+    table::{hash_code, sharded_hash_table::ShardId, TableEntry},
     table_shortcuts::{fill_table, v},
     table_spec::{ColumnId, Constraint, Offset, Table, WrappedTable},
 };
+
+use super::sharded_hash_table::ShardedHashTable;
 
 fn dump_buf(buf: &TaggedRowBuffer) -> Vec<(RowId, Vec<Value>)> {
     let mut res = Vec::new();
@@ -124,4 +128,34 @@ fn insert_scan_sorted() {
             (RowId::new(1), vec![v(1), v(2), v(3)]),
         ]
     );
+}
+
+#[test]
+fn shard_math() {
+    let mut table = ShardedHashTable::<TableEntry>::with_shards(14);
+    // Should be rounded up to 16.
+    assert_eq!(table.mut_shards().len(), 16);
+
+    // If we generate a hundred thousand random numbers, we should see more than 100
+    // items in each shard.
+    let mut rng = thread_rng();
+    let mut hist = HashMap::default();
+    (0..100_000)
+        .map(|_| {
+            hash_code(
+                &table,
+                &[
+                    Value::new(rng.gen()),
+                    Value::new(rng.gen()),
+                    Value::new(rng.gen()),
+                ],
+                2,
+            )
+            .0
+        })
+        .for_each(|id| *hist.entry(id).or_insert(0) += 1);
+    assert!(hist.iter().all(|(_, count)| *count > 100), "{hist:?}");
+
+    // Picking low numbers should all get shard 0.
+    assert!((0..100_000).all(|x| table.shard_id(x as u64) == ShardId::new(0)));
 }

@@ -13,9 +13,9 @@ use std::{
 };
 
 use crossbeam_queue::SegQueue;
-use hashbrown::HashTable;
 use numeric_id::NumericId;
 use rustc_hash::FxHasher;
+use sharded_hash_table::{ShardId, ShardedHashTable};
 
 use crate::{
     action::ExecutionState,
@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+mod sharded_hash_table;
 #[cfg(test)]
 mod tests;
 
@@ -124,7 +125,7 @@ pub(crate) type MergeFn =
 pub struct SortedWritesTable {
     generation: Generation,
     data: Rows,
-    hash: HashTable<TableEntry>,
+    hash: ShardedHashTable<TableEntry>,
 
     n_keys: usize,
     n_columns: usize,
@@ -353,8 +354,9 @@ impl Table for SortedWritesTable {
         // First: handle the removals.
         while let Some(buf) = self.pending_state.pending_removals.pop() {
             for to_remove in buf.non_stale() {
-                let hc = hash_code(to_remove, n_keys);
-                if let Ok(entry) = self.hash.find_entry(hc, |entry| {
+                let (shard_id, hc) = hash_code(&self.hash, to_remove, n_keys);
+                let table = &mut self.hash.mut_shards()[shard_id.index()];
+                if let Ok(entry) = table.find_entry(hc, |entry| {
                     entry.hashcode == (hc as _)
                         && &self.data.get_row(entry.row).unwrap()[0..n_keys] == to_remove
                 }) {
@@ -418,8 +420,8 @@ impl Table for SortedWritesTable {
                         } else {
                             self.offsets.push((sort_val, new));
                         }
-                        let hc = hash_code(query, self.n_keys) as HashCode;
-                        self.hash.insert_unique(
+                        let (shard, hc) = hash_code(&self.hash, query, self.n_keys);
+                        self.hash.mut_shards()[shard.index()].insert_unique(
                             hc as _,
                             TableEntry {
                                 hashcode: hc as _,
@@ -458,9 +460,9 @@ impl Table for SortedWritesTable {
                     } else {
                         // New value: update invariants.
                         let new = self.data.add_row(query);
-                        let hc = hash_code(query, self.n_keys);
-                        self.hash.insert_unique(
-                            hc,
+                        let (shard, hc) = hash_code(&self.hash, query, self.n_keys);
+                        self.hash.mut_shards()[shard.index()].insert_unique(
+                            hc as _,
                             TableEntry {
                                 hashcode: hc as _,
                                 row: new,
@@ -602,11 +604,12 @@ impl SortedWritesTable {
 fn get_entry(
     row: &[Value],
     n_keys: usize,
-    table: &HashTable<TableEntry>,
+    table: &ShardedHashTable<TableEntry>,
     test: impl Fn(RowId) -> bool,
 ) -> Option<RowId> {
-    let hash = hash_code(row, n_keys);
+    let (shard, hash) = hash_code(table, row, n_keys);
     table
+        .get_shard(shard)
         .find(hash, |ent| {
             ent.hashcode == hash as HashCode && test(ent.row)
         })
@@ -616,23 +619,24 @@ fn get_entry(
 fn get_entry_mut<'a>(
     row: &[Value],
     n_keys: usize,
-    table: &'a mut HashTable<TableEntry>,
+    table: &'a mut ShardedHashTable<TableEntry>,
     test: impl Fn(RowId) -> bool,
 ) -> Option<&'a mut RowId> {
-    let hash = hash_code(row, n_keys);
-    table
+    let (shard, hash) = hash_code(table, row, n_keys);
+    table.mut_shards()[shard.index()]
         .find_mut(hash, |ent| {
             ent.hashcode == hash as HashCode && test(ent.row)
         })
         .map(|ent| &mut ent.row)
 }
 
-fn hash_code(row: &[Value], n_keys: usize) -> u64 {
+fn hash_code(table: &ShardedHashTable<TableEntry>, row: &[Value], n_keys: usize) -> (ShardId, u64) {
     let mut hasher = FxHasher::default();
     for val in &row[0..n_keys] {
         hasher.write_usize(val.index());
     }
-    hasher.finish() as HashCode as u64
+    let full_code = hasher.finish();
+    (table.shard_id(full_code), full_code as HashCode as u64)
 }
 
 /// A simple struct for packaging up pending mutations to a `SortedWritesTable`.
