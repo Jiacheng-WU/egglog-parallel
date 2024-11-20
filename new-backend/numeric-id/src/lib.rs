@@ -133,9 +133,15 @@ impl<K: NumericId, V> DenseIdMap<K, V> {
     ///
     /// # Panics
     /// This method panics if `key` is not in the table.
-    pub fn take(&mut self, key: K) -> V {
+    pub fn unwrap_val(&mut self, key: K) -> V {
         self.reserve_space(key);
         self.data.get_mut(key.index()).unwrap().take().unwrap()
+    }
+
+    /// Extract the value mapped to by `key` from the table, if it is present.
+    pub fn take(&mut self, key: K) -> Option<V> {
+        self.reserve_space(key);
+        self.data.get_mut(key.index()).unwrap().take()
     }
 
     /// Get the current mapping for `key` in the table, or insert the value

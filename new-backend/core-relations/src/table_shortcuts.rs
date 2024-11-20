@@ -1,7 +1,5 @@
 //! Utilities helpful in unit tests for manipulating tables.
 
-use std::mem;
-
 use numeric_id::NumericId;
 
 use crate::{
@@ -30,7 +28,7 @@ pub(crate) fn v(n: usize) -> Value {
 }
 
 /// Fill a [`SortedWritesTable`] with the given rows, with conflicts resolved
-/// with the given merg function.
+/// with the given merge function.
 pub(crate) fn fill_table(
     rows: impl IntoIterator<Item = Vec<Value>>,
     n_keys: usize,
@@ -50,12 +48,15 @@ pub(crate) fn fill_table(
             false
         }
     });
-    let mut buf = table.new_buffer();
-    buf.stage_insert(&init);
-    for row in iter {
-        buf.stage_insert(&row);
-    }
-    mem::drop(buf);
+
+    // We write tests that assume that assume rows are inserted in order.
+    // SortedWritesTable does not preserver ordering of writes between two calls
+    // to merge, so we create a buffer and merge for each insertion.
+    table.new_buffer().stage_insert(&init);
     table.merge(&mut e);
+    for row in iter {
+        table.new_buffer().stage_insert(&row);
+        table.merge(&mut e);
+    }
     table
 }

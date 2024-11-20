@@ -33,7 +33,7 @@ fn basic_id_map() {
         vec![(Id::from_usize(0), "zero"), (Id::from_usize(4), "four")]
     );
 
-    assert_eq!(map.take(Id::from_usize(0)), "zero");
+    assert_eq!(map.unwrap_val(Id::from_usize(0)), "zero");
 
     assert_eq!(to_vec(&map), vec![(Id::from_usize(4), "four")]);
 

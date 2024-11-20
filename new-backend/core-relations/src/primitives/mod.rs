@@ -118,7 +118,7 @@ impl Primitives {
     /// This operation is not particularly efficient, but it is useful when
     /// writing tests or external proof checkers.
     pub fn apply_op(&mut self, id: PrimitiveFunctionId, args: &[Value]) -> Option<Value> {
-        let dyn_op = self.operations.take(id);
+        let dyn_op = self.operations.unwrap_val(id);
         let res = dyn_op.op.apply(self, args);
         self.operations.insert(id, dyn_op);
         res

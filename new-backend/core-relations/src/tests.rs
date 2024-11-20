@@ -256,14 +256,20 @@ fn minimal_ac() {
         ..
     } = basic_math_egraph();
     {
-        let mut add_buf = db.get_table(add).new_buffer();
-        add_buf.stage_insert(&[v(0), v(0), v(1), v(0)]);
-        add_buf.stage_insert(&[v(0), v(1), v(2), v(0)]);
-        add_buf.stage_insert(&[v(0), v(2), v(3), v(0)]);
-        add_buf.stage_insert(&[v(1), v(0), v(2), v(1)]);
-        add_buf.stage_insert(&[v(1), v(1), v(3), v(1)]);
+        {
+            let mut add_buf = db.get_table(add).new_buffer();
+            add_buf.stage_insert(&[v(0), v(0), v(1), v(0)]);
+            add_buf.stage_insert(&[v(0), v(1), v(2), v(0)]);
+            add_buf.stage_insert(&[v(0), v(2), v(3), v(0)]);
+        }
+        db.merge_all();
+        {
+            let mut add_buf = db.get_table(add).new_buffer();
+            add_buf.stage_insert(&[v(1), v(0), v(2), v(1)]);
+            add_buf.stage_insert(&[v(1), v(1), v(3), v(1)]);
+        }
+        db.merge_all();
     }
-    db.merge_all();
     let mut rsb = db.new_rule_set();
     let mut add_assoc = rsb.new_query();
     // Add(x, Add(y, z)) => Add(Add(x, y), z)

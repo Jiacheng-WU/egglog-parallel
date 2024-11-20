@@ -207,7 +207,7 @@ impl JoinState<'_> {
         cols: impl Iterator<Item = ColumnId>,
     ) -> Prober {
         let cols = SmallVec::<[ColumnId; 4]>::from_iter(cols);
-        let subset = self.subsets.take(atom);
+        let subset = self.subsets.unwrap_val(atom);
 
         let info = &self.db.tables[plan.atoms[atom].table];
         let all_cacheable = cols.iter().all(|col| {
@@ -295,7 +295,7 @@ impl JoinState<'_> {
                 if subset.is_empty() {
                     return;
                 }
-                let prev = self.subsets.take(*atom);
+                let prev = self.subsets.unwrap_val(*atom);
                 self.subsets.insert(*atom, subset.clone());
                 self.run_plan(plan, rule_set, cur + 1, ps);
                 self.subsets.insert(*atom, prev);
@@ -471,7 +471,7 @@ impl JoinState<'_> {
                 }
                 let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
-                let cover_subset = self.subsets.take(cover_atom);
+                let cover_subset = self.subsets.unwrap_val(cover_atom);
                 let mut cur = Offset::new(0);
                 let mut buffer = TaggedRowBuffer::new(bind.len());
                 loop {
@@ -536,7 +536,7 @@ impl JoinState<'_> {
                     .collect::<SmallVec<[(usize, AtomId, Prober); 4]>>();
                 let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
-                let cover_subset = self.subsets.take(cover_atom);
+                let cover_subset = self.subsets.unwrap_val(cover_atom);
                 let mut cur = Offset::new(0);
                 let mut buffer = TaggedRowBuffer::new(bind.len());
                 loop {

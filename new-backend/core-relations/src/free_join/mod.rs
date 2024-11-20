@@ -292,7 +292,7 @@ impl Database {
                 // Move the table out of the tables map. Run the merge (which can
                 // access the rest of the db). Then put it back.
                 let table = TableId::from_usize(id);
-                let mut info = self.tables.take(table);
+                let mut info = self.tables.unwrap_val(table);
                 let table_changed = info.table.merge(&mut ExecutionState {
                     predicted: &predicted,
                     db: self.read_only_view(),
@@ -316,7 +316,7 @@ impl Database {
     /// elesewhere. The `merge_all` method runs merges to a fixed point to avoid
     /// surprises here.
     pub fn merge_table(&mut self, table: TableId) {
-        let mut info = self.tables.take(table);
+        let mut info = self.tables.unwrap_val(table);
         let predicted = PredictedVals::default();
         let _table_changed = info.table.merge(&mut ExecutionState {
             db: self.read_only_view(),

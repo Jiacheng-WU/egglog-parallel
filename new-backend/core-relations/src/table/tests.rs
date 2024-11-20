@@ -143,7 +143,7 @@ fn shard_math() {
     (0..100_000)
         .map(|_| {
             hash_code(
-                &table,
+                table.shard_data(),
                 &[
                     Value::new(rng.gen()),
                     Value::new(rng.gen()),
@@ -157,5 +157,5 @@ fn shard_math() {
     assert!(hist.iter().all(|(_, count)| *count > 100), "{hist:?}");
 
     // Picking low numbers should all get shard 0.
-    assert!((0..100_000).all(|x| table.shard_id(x as u64) == ShardId::new(0)));
+    assert!((0..100_000).all(|x| table.shard_data().shard_id(x as u64) == ShardId::new(0)));
 }
