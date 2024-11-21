@@ -13,6 +13,7 @@ use std::{
 
 use crossbeam_queue::SegQueue;
 use numeric_id::{DenseIdMap, NumericId};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHasher;
 use sharded_hash_table::{ShardData, ShardId, ShardedHashTable};
 
@@ -372,23 +373,7 @@ impl Table for SortedWritesTable {
         let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
 
         // First: handle the removals.
-        for (_outer_shard, queue) in self.pending_state.pending_removals.iter() {
-            while let Some(buf) = queue.pop() {
-                for to_remove in buf.non_stale() {
-                    let (shard_id, hc) = hash_code(self.hash.shard_data(), to_remove, n_keys);
-                    debug_assert_eq!(shard_id, _outer_shard);
-                    let table = &mut self.hash.mut_shards()[shard_id.index()];
-                    if let Ok(entry) = table.find_entry(hc, |entry| {
-                        entry.hashcode == (hc as _)
-                            && &self.data.get_row(entry.row).unwrap()[0..n_keys] == to_remove
-                    }) {
-                        let (ent, _) = entry.remove();
-                        changed = true;
-                        self.data.set_stale(ent.row);
-                    }
-                }
-            }
-        }
+        changed |= self.parallel_delete();
 
         // Now the insertions.
         for (_outer_shard, queue) in self.pending_state.pending_rows.iter() {
@@ -554,6 +539,49 @@ impl SortedWritesTable {
             merge: Arc::new(merge_fn),
         }
     }
+
+    /// Flush all pending removals, in parallel.
+    fn parallel_delete(&mut self) -> bool {
+        let shard_data = self.hash.shard_data();
+        let stale_delta: usize = self
+            .hash
+            .mut_shards()
+            .par_iter_mut()
+            .enumerate()
+            .map(|(shard_id, shard)| {
+                let shard_id = ShardId::from_usize(shard_id);
+                let queue = &self.pending_state.pending_removals[shard_id];
+                let mut marked_stale = 0;
+                while let Some(buf) = queue.pop() {
+                    for to_remove in buf.non_stale() {
+                        let (actual_shard, hc) = hash_code(shard_data, to_remove, self.n_keys);
+                        assert_eq!(actual_shard, shard_id);
+                        if let Ok(entry) = shard.find_entry(hc, |entry| {
+                            entry.hashcode == (hc as _)
+                                && &self.data.get_row(entry.row).unwrap()[0..self.n_keys]
+                                    == to_remove
+                        }) {
+                            let (ent, _) = entry.remove();
+                            // SAFETY: The safety requirements of
+                            // `set_stale_shared` are that there are no
+                            // concurrent accesses to `row`. No other threads
+                            // can access this row within this method because
+                            // different `shards` partition the space
+                            // (guaranteed by the assertion above), and we
+                            // launch at most one thread per shard.
+                            marked_stale +=
+                                unsafe { !self.data.data.set_stale_shared(ent.row) } as usize;
+                        }
+                    }
+                }
+                marked_stale
+            })
+            .sum();
+        // Update the stale count with the total marked stale.
+        self.data.stale_rows += stale_delta;
+        stale_delta > 0
+    }
+
     fn binary_search_sort_val(&self, val: Value) -> Result<(RowId, RowId), RowId> {
         match self.offsets.binary_search_by_key(&val, |(v, _)| *v) {
             Ok(got) => Ok((

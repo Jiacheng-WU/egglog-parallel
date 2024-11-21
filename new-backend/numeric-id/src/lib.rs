@@ -10,7 +10,7 @@ use std::{
 mod tests;
 
 /// A trait describing "newtypes" that wrap an integer.
-pub trait NumericId: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Hash {
+pub trait NumericId: Copy + Clone + PartialEq + Eq + PartialOrd + Ord + Hash + Send + Sync {
     type Rep;
     type Atomic;
     fn new(val: Self::Rep) -> Self;
@@ -157,6 +157,7 @@ impl<K: NumericId, V> DenseIdMap<K, V> {
             .enumerate()
             .filter_map(|(i, v)| Some((K::from_usize(i), v.as_ref()?)))
     }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
         self.data
             .iter_mut()
@@ -170,6 +171,16 @@ impl<K: NumericId, V> DenseIdMap<K, V> {
         if index >= self.data.len() {
             self.data.resize_with(index + 1, || None);
         }
+    }
+}
+
+impl<K: NumericId, V: Send + Sync> DenseIdMap<K, V> {
+    /// Get a parallel iterator over the entries in the table.
+    pub fn par_iter(&self) -> impl ParallelIterator<Item = (K, &V)> {
+        self.data
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, v)| Some((K::from_usize(i), v.as_ref()?)))
     }
 }
 
@@ -274,6 +285,7 @@ mod context {
 }
 
 pub use context::ContextHandle;
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 #[macro_export]
 #[doc(hidden)]

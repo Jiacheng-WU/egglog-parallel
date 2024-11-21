@@ -1,7 +1,7 @@
 //! Utilities for pooling object allocations.
 
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     fmt,
     hash::{Hash, Hasher},
     mem::{self, ManuallyDrop},
@@ -282,6 +282,7 @@ macro_rules! pool_set {
 pool_set! {
     pub PoolSet {
         vec_vals: Vec<Value>,
+        vec_cell_vals: Vec<Cell<Value>>,
         // TODO: work on scaffolding/DI/etc. so that we can share allocations
         // between vec_vals and shared_vals.
         rows: Vec<RowId>,

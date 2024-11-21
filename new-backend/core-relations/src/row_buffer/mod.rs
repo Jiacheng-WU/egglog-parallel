@@ -1,6 +1,7 @@
 //! A basic data-structure encapsulating a batch of rows.
 
 use core::slice;
+use std::{cell::Cell, mem};
 
 use numeric_id::NumericId;
 use smallvec::SmallVec;
@@ -22,8 +23,22 @@ mod tests;
 pub(crate) struct RowBuffer {
     n_columns: usize,
     total_rows: usize,
-    data: Pooled<Vec<Value>>,
+    data: Pooled<Vec<Cell<Value>>>,
 }
+
+// Safety constraints for RowBuffer.
+//
+// All of the unsafe code in RowBuffer is due to the use of `Cell<Value>` for
+// the backing `data`. We do not want to expose raw `Cell`s to users (they
+// complicate the API), but every use-case for RowBuffer uses entries in data
+// like normal values _but one_: that is the `set_stale_shared` method. See the
+// documentation for that method for more context.
+//
+// This method enabled multiple threads to write to exclusive rows in the table
+// without performing any additional synchronization, or slowing down future
+// readers by requiring atomic operations for every read.
+unsafe impl Send for RowBuffer {}
+unsafe impl Sync for RowBuffer {}
 
 impl Clone for RowBuffer {
     fn clone(&self) -> Self {
@@ -58,12 +73,24 @@ impl RowBuffer {
     pub(crate) fn non_stale(&self) -> impl Iterator<Item = &[Value]> {
         self.data
             .chunks(self.n_columns)
-            .filter(|row| !row[0].is_stale())
+            .filter(|row| !row[0].get().is_stale())
+            // SAFETY: This kind of transmutation is safe so long as no one
+            // modifies any of the values behind the `Cell` while this value is
+            // borrowed.
+            //
+            // The only time we modify these values is in safe methods requiring
+            // a mutable reference (`set_stale`, `get_row_mut`), or in the
+            // unsafe `set_stale_shared` method whose safety requirements imply
+            // that no call will overlap with borrowing such a row.
+            .map(|row| unsafe { mem::transmute::<&[Cell<Value>], &[Value]>(row) })
     }
 
     /// Return an iterator over all rows in the buffer.
     pub(crate) fn iter(&self) -> impl Iterator<Item = &[Value]> {
-        self.data.chunks(self.n_columns)
+        self.data
+            .chunks(self.n_columns)
+            // SAFETY: see comment in `non_stale`.
+            .map(|row| unsafe { mem::transmute::<&[Cell<Value>], &[Value]>(row) })
     }
 
     /// Clear the contents of the buffer.
@@ -77,18 +104,43 @@ impl RowBuffer {
         self.total_rows
     }
 
+    /// Mark a row as stale in the buffer with shared access to it. Returns
+    /// whether the row was already stale.
+    ///
+    /// # Safety
+    /// This method is unsafe because we implement `Send` and `Sync` for the
+    /// `RowBuffer` type. That means that you can call `set_stale_shared(row)`
+    /// and `get_row(row)` concurrently, which would be a data race.
+    ///
+    /// To safely use this method, you must ensure that there are no concurrent
+    /// reads or writes to `row`. Indeed, that is what this method is for:
+    /// parallel writes to exclusive rows in a shared `RowBuffer`. Any other
+    /// use-case should use the [`set_stale`] method, which requires a mutable
+    /// reference.
+    pub(crate) unsafe fn set_stale_shared(&self, row: RowId) -> bool {
+        let cells = &self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns];
+        let was_stale = cells[0].get().is_stale();
+        cells[0].set(Value::stale());
+        was_stale
+    }
+
     /// Get the row corresponding to the given RowId.
     ///
     /// # Panics
     /// This method panics if `row` is out of bounds.
     pub(crate) fn get_row(&self, row: RowId) -> &[Value] {
-        &self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns]
+        // SAFETY: see the comment in `non_stale`.
+        unsafe {
+            mem::transmute::<&[Cell<Value>], &[Value]>(
+                &self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns],
+            )
+        }
     }
 
     /// Get the row corresponding to the given RowId without bounds checking.
     pub(crate) unsafe fn get_row_unchecked(&self, row: RowId) -> &[Value] {
         slice::from_raw_parts(
-            self.data.as_ptr().add(row.index() * self.n_columns),
+            self.data.as_ptr().add(row.index() * self.n_columns) as *const Value,
             self.n_columns,
         )
     }
@@ -98,7 +150,12 @@ impl RowBuffer {
     /// # Panics
     /// This method panics if `row` is out of bounds.
     pub(crate) fn get_row_mut(&mut self, row: RowId) -> &mut [Value] {
-        &mut self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns]
+        // SAFETY: see the comment in `non_stale`.
+        unsafe {
+            mem::transmute::<&mut [Cell<Value>], &mut [Value]>(
+                &mut self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns],
+            )
+        }
     }
 
     /// Set the given row to be stale. By convention, this calls `set_stale` on
@@ -128,7 +185,7 @@ impl RowBuffer {
             Pooled::refresh(&mut self.data);
         }
         let res = RowId::from_usize(self.total_rows);
-        self.data.extend_from_slice(row);
+        self.data.extend(row.iter().copied().map(Cell::new));
         self.total_rows += 1;
         res
     }
@@ -144,14 +201,14 @@ impl RowBuffer {
         let mut scratch = SmallVec::<[Value; 8]>::new();
         self.data.retain(|entry| {
             if within_row == 0 {
-                keep_row = !entry.is_stale();
+                keep_row = !entry.get().is_stale();
                 if keep_row {
-                    scratch.push(*entry);
+                    scratch.push(entry.get());
                     row_out += 1;
                 }
                 row_in += 1;
             } else if keep_row {
-                scratch.push(*entry);
+                scratch.push(entry.get());
             }
             within_row += 1;
             if within_row == self.n_columns {
@@ -217,8 +274,8 @@ impl TaggedRowBuffer {
             Pooled::refresh(&mut self.inner.data);
         }
         let res = RowId::from_usize(self.inner.total_rows);
-        self.inner.data.extend_from_slice(row);
-        self.inner.data.push(Value::new(row_id.rep()));
+        self.inner.data.extend(row.iter().copied().map(Cell::new));
+        self.inner.data.push(Cell::new(Value::new(row_id.rep())));
         self.inner.total_rows += 1;
         res
     }
