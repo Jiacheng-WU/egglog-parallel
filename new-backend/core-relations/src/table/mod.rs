@@ -1083,9 +1083,10 @@ fn do_parallel(_workload_size: usize) -> bool {
         use rand::{thread_rng, Rng};
         thread_rng().gen::<bool>()
     }
+
     #[cfg(not(test))]
     {
-        _workload_size > 100_000
+        _workload_size > 100_000 && rayon::current_num_threads() > 1
     }
 }
 

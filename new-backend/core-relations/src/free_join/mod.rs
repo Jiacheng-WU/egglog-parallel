@@ -247,6 +247,17 @@ impl Database {
         &mut self.primitives
     }
 
+    /// Run `f` with access to an `ExecutionState` mapped to this database.
+    pub fn with_execution_state<R>(&self, f: impl FnOnce(&mut ExecutionState) -> R) -> R {
+        let predicted = PredictedVals::default();
+        let mut state = ExecutionState {
+            db: self.read_only_view(),
+            predicted: &predicted,
+            buffers: Default::default(),
+        };
+        f(&mut state)
+    }
+
     pub(crate) fn read_only_view(&self) -> DbView<DenseIdMap<TableId, TableInfo>> {
         DbView {
             table_info: &self.tables,

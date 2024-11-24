@@ -165,6 +165,7 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "dashmap",
+ "divan",
  "fixedbitset 0.5.7",
  "hashbrown 0.15.1",
  "indexmap",

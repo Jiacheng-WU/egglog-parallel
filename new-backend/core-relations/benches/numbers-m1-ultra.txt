@@ -1,0 +1,24 @@
+Timer precision: 41 ns
+writes                                     fastest       │ slowest       │ median        │ mean          │ samples │ iters
+├─ parallel_insert                                       │               │               │               │         │
+│  ├─ 1                                    61.13 ms      │ 89.78 ms      │ 63.98 ms      │ 64.23 ms      │ 100     │ 100
+│  │                                       17.15 Mitem/s │ 11.67 Mitem/s │ 16.38 Mitem/s │ 16.32 Mitem/s │         │
+│  ├─ 2                                    55.43 ms      │ 70.45 ms      │ 58.27 ms      │ 58.43 ms      │ 100     │ 100
+│  │                                       18.91 Mitem/s │ 14.88 Mitem/s │ 17.99 Mitem/s │ 17.94 Mitem/s │         │
+│  ├─ 4                                    29.58 ms      │ 45.37 ms      │ 40.14 ms      │ 39.31 ms      │ 100     │ 100
+│  │                                       35.43 Mitem/s │ 23.1 Mitem/s  │ 26.12 Mitem/s │ 26.66 Mitem/s │         │
+│  ├─ 8                                    19.1 ms       │ 35.61 ms      │ 24.45 ms      │ 25.05 ms      │ 100     │ 100
+│  │                                       54.88 Mitem/s │ 29.43 Mitem/s │ 42.87 Mitem/s │ 41.85 Mitem/s │         │
+│  ╰─ 16                                   13.9 ms       │ 26.73 ms      │ 16.7 ms       │ 17.22 ms      │ 100     │ 100
+│                                          75.41 Mitem/s │ 39.22 Mitem/s │ 62.76 Mitem/s │ 60.86 Mitem/s │         │
+╰─ parallel_insert_remove_with_collisions                │               │               │               │         │
+   ├─ 1                                    50.04 ms      │ 82.68 ms      │ 51.66 ms      │ 52.32 ms      │ 100     │ 100
+   │                                       20.95 Mitem/s │ 12.68 Mitem/s │ 20.29 Mitem/s │ 20.04 Mitem/s │         │
+   ├─ 2                                    42.23 ms      │ 59.56 ms      │ 43.51 ms      │ 43.85 ms      │ 100     │ 100
+   │                                       24.82 Mitem/s │ 17.6 Mitem/s  │ 24.09 Mitem/s │ 23.9 Mitem/s  │         │
+   ├─ 4                                    24.28 ms      │ 39.1 ms       │ 30.64 ms      │ 30.03 ms      │ 100     │ 100
+   │                                       43.17 Mitem/s │ 26.81 Mitem/s │ 34.21 Mitem/s │ 34.9 Mitem/s  │         │
+   ├─ 8                                    16.39 ms      │ 25.69 ms      │ 19.06 ms      │ 19.79 ms      │ 100     │ 100
+   │                                       63.94 Mitem/s │ 40.8 Mitem/s  │ 54.99 Mitem/s │ 52.96 Mitem/s │         │
+   ╰─ 16                                   11.83 ms      │ 16.5 ms       │ 13.4 ms       │ 13.73 ms      │ 100     │ 100
+                                           88.61 Mitem/s │ 63.51 Mitem/s │ 78.21 Mitem/s │ 76.35 Mitem/s │         │
