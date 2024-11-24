@@ -263,7 +263,7 @@ pub trait Table: Any + Send + Sync {
 /// Dropping an object implementing this trait should "flush" the pending
 /// mutations to the table. Calling  [`Table::merge`] on that table would then
 /// apply those mutations, making them visible for future readers.
-pub trait MutationBuffer: Any {
+pub trait MutationBuffer: Any + Send + Sync {
     /// Stage the keyed entries for insertion. Changes may not be visible until
     /// this buffer is dropped, and after `merge` is called on the underlying
     /// table.
@@ -275,7 +275,7 @@ pub trait MutationBuffer: Any {
     fn stage_remove(&mut self, key: &[Value]);
 }
 
-struct WrapperImpl<T>(PhantomData<*const T>);
+struct WrapperImpl<T>(PhantomData<T>);
 
 pub(crate) fn wrapper<T: Table>() -> Box<dyn TableWrapper> {
     Box::new(WrapperImpl::<T>(PhantomData))
@@ -598,7 +598,7 @@ impl DerefMut for WrappedTable {
     }
 }
 
-pub(crate) trait TableWrapper {
+pub(crate) trait TableWrapper: Send + Sync {
     fn dyn_clone(&self) -> Box<dyn TableWrapper>;
     fn scan_bounded(
         &self,

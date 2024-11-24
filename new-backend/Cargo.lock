@@ -162,6 +162,7 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "concurrency",
+ "crossbeam-channel",
  "crossbeam-queue",
  "dashmap",
  "fixedbitset 0.5.7",

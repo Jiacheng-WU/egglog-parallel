@@ -149,7 +149,7 @@ impl DynamicPrimitveOperation {
     }
 }
 
-trait DynamicInternTable: Any {
+trait DynamicInternTable: Any + Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn print_value(&self, val: Value, f: &mut fmt::Formatter) -> fmt::Result;
 }

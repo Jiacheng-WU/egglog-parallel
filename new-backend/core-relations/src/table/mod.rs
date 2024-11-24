@@ -8,10 +8,15 @@ use std::{
     any::Any,
     cmp,
     hash::Hasher,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Weak,
+    },
 };
 
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossbeam_queue::SegQueue;
+use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHasher;
@@ -27,6 +32,7 @@ use crate::{
         ColumnId, Constraint, Generation, MutationBuffer, Offset, Row, Table, TableSpec,
         TableVersion,
     },
+    Pooled,
 };
 
 mod sharded_hash_table;
@@ -163,17 +169,28 @@ impl MutationBuffer for Buffer {
 impl Drop for Buffer {
     fn drop(&mut self) {
         if let Some(state) = self.state.upgrade() {
-            for (staged, queues) in [
-                (&mut self.pending_rows, &state.pending_rows),
-                (&mut self.pending_removals, &state.pending_removals),
+            for (staged, queues, counter) in [
+                (
+                    &mut self.pending_rows,
+                    &state.pending_rows,
+                    &state.total_rows,
+                ),
+                (
+                    &mut self.pending_removals,
+                    &state.pending_removals,
+                    &state.total_removals,
+                ),
             ] {
+                let mut rows = 0;
                 for shard_id in 0..staged.n_ids() {
                     let shard = ShardId::from_usize(shard_id);
                     let Some(buf) = staged.take(shard) else {
                         continue;
                     };
+                    rows += buf.len();
                     queues[shard].push(buf);
                 }
+                counter.fetch_add(rows, Ordering::Relaxed);
             }
         }
     }
@@ -369,120 +386,9 @@ impl Table for SortedWritesTable {
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
         let mut changed = false;
 
-        let n_keys = self.n_keys;
-        let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
-
         // First: handle the removals.
-        changed |= self.parallel_delete();
-
-        // Now the insertions.
-        for (_outer_shard, queue) in self.pending_state.pending_rows.iter() {
-            if let Some(sort_by) = self.sort_by {
-                while let Some(buf) = queue.pop() {
-                    for query in buf.non_stale() {
-                        let key = &query[0..n_keys];
-                        let entry = get_entry_mut(query, n_keys, &mut self.hash, |row| {
-                            let Some(row) = self.data.get_row(row) else {
-                                return false;
-                            };
-                            &row[0..n_keys] == key
-                        });
-
-                        let sort_val = query[sort_by.index()];
-                        if let Some(row) = entry {
-                            // First case: overwriting an existing value. Apply merge
-                            // function. Insert new row  and update hash table if merge
-                            // changes anything.
-                            let cur = self
-                                .data
-                                .get_row(*row)
-                                .expect("table should not point to stale entry");
-                            if (self.merge)(exec_state, cur, query, &mut scratch) {
-                                let new = self.data.add_row(&scratch);
-                                if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
-                                    assert!(sort_val >= largest, "inserting row that violates sort order ({sort_val:?} vs. {largest:?})");
-                                    if sort_val > largest {
-                                        self.offsets.push((sort_val, new));
-                                    }
-                                } else {
-                                    self.offsets.push((sort_val, new));
-                                }
-                                scratch.clear();
-                                self.data.set_stale(*row);
-                                *row = new;
-                                changed = true;
-                            }
-                        } else {
-                            // New value: update invariants.
-                            let new = self.data.add_row(query);
-                            if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
-                                assert!(
-                                    sort_val >= largest,
-                                    "inserting row that violates sort order"
-                                );
-                                if sort_val > largest {
-                                    self.offsets.push((sort_val, new));
-                                }
-                            } else {
-                                self.offsets.push((sort_val, new));
-                            }
-                            let (shard, hc) = hash_code(self.hash.shard_data(), query, self.n_keys);
-                            debug_assert_eq!(shard, _outer_shard);
-                            self.hash.mut_shards()[shard.index()].insert_unique(
-                                hc as _,
-                                TableEntry {
-                                    hashcode: hc as _,
-                                    row: new,
-                                },
-                                |entry| entry.hashcode(),
-                            );
-                            changed = true;
-                        }
-                    }
-                }
-            } else {
-                // Simplified variant without the sorting constraint.
-                while let Some(buf) = queue.pop() {
-                    for query in buf.non_stale() {
-                        let key = &query[0..n_keys];
-                        let entry = get_entry_mut(query, n_keys, &mut self.hash, |row| {
-                            let Some(row) = self.data.get_row(row) else {
-                                return false;
-                            };
-                            &row[0..n_keys] == key
-                        });
-
-                        if let Some(row) = entry {
-                            let cur = self
-                                .data
-                                .get_row(*row)
-                                .expect("table should not point to stale entry");
-                            if (self.merge)(exec_state, cur, query, &mut scratch) {
-                                let new = self.data.add_row(&scratch);
-                                scratch.clear();
-                                self.data.set_stale(*row);
-                                *row = new;
-                                changed = true;
-                            }
-                        } else {
-                            // New value: update invariants.
-                            let new = self.data.add_row(query);
-                            let (shard, hc) = hash_code(self.hash.shard_data(), query, self.n_keys);
-                            debug_assert_eq!(shard, _outer_shard);
-                            self.hash.mut_shards()[shard.index()].insert_unique(
-                                hc as _,
-                                TableEntry {
-                                    hashcode: hc as _,
-                                    row: new,
-                                },
-                                |entry| entry.hashcode(),
-                            );
-                            changed = true;
-                        }
-                    }
-                }
-            };
-        }
+        changed |= self.do_delete();
+        changed |= self.do_insert(exec_state);
         self.maybe_rehash();
         changed
     }
@@ -548,8 +454,14 @@ impl SortedWritesTable {
             .mut_shards()
             .par_iter_mut()
             .enumerate()
-            .map(|(shard_id, shard)| {
+            .filter_map(|(shard_id, shard)| {
                 let shard_id = ShardId::from_usize(shard_id);
+                if self.pending_state.pending_removals[shard_id].is_empty() {
+                    return None;
+                }
+                Some((shard_id, shard))
+            })
+            .map(|(shard_id, shard)| {
                 let queue = &self.pending_state.pending_removals[shard_id];
                 let mut marked_stale = 0;
                 while let Some(buf) = queue.pop() {
@@ -580,6 +492,313 @@ impl SortedWritesTable {
         // Update the stale count with the total marked stale.
         self.data.stale_rows += stale_delta;
         stale_delta > 0
+    }
+    fn serial_delete(&mut self) -> bool {
+        let shard_data = self.hash.shard_data();
+        let mut changed = false;
+        self.hash
+            .mut_shards()
+            .iter_mut()
+            .enumerate()
+            .for_each(|(shard_id, shard)| {
+                let shard_id = ShardId::from_usize(shard_id);
+                let queue = &self.pending_state.pending_removals[shard_id];
+                while let Some(buf) = queue.pop() {
+                    for to_remove in buf.non_stale() {
+                        let (actual_shard, hc) = hash_code(shard_data, to_remove, self.n_keys);
+                        assert_eq!(actual_shard, shard_id);
+                        if let Ok(entry) = shard.find_entry(hc, |entry| {
+                            entry.hashcode == (hc as _)
+                                && &self.data.get_row(entry.row).unwrap()[0..self.n_keys]
+                                    == to_remove
+                        }) {
+                            let (ent, _) = entry.remove();
+                            self.data.set_stale(ent.row);
+                            changed = true;
+                        }
+                    }
+                }
+            });
+        changed
+    }
+
+    fn do_delete(&mut self) -> bool {
+        let total = self.pending_state.total_removals.swap(0, Ordering::Relaxed);
+        if do_parallel(total) {
+            self.parallel_delete()
+        } else {
+            self.serial_delete()
+        }
+    }
+
+    fn do_insert(&mut self, exec_state: &mut ExecutionState) -> bool {
+        let total = self.pending_state.total_rows.swap(0, Ordering::Relaxed);
+        if do_parallel(total) {
+            if let Some(col) = self.sort_by {
+                self.parallel_insert(
+                    exec_state,
+                    SortChecker {
+                        col,
+                        current: None,
+                        baseline: self.offsets.last().map(|(v, _)| *v),
+                    },
+                )
+            } else {
+                self.parallel_insert(exec_state, ())
+            }
+        } else {
+            self.serial_insert(exec_state)
+        }
+    }
+
+    fn serial_insert(&mut self, exec_state: &mut ExecutionState) -> bool {
+        let mut changed = false;
+        let n_keys = self.n_keys;
+        let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
+        for (_outer_shard, queue) in self.pending_state.pending_rows.iter() {
+            if let Some(sort_by) = self.sort_by {
+                while let Some(buf) = queue.pop() {
+                    for query in buf.non_stale() {
+                        let key = &query[0..n_keys];
+                        let entry = get_entry_mut(query, n_keys, &mut self.hash, |row| {
+                            let Some(row) = self.data.get_row(row) else {
+                                return false;
+                            };
+                            &row[0..n_keys] == key
+                        });
+
+                        let sort_val = query[sort_by.index()];
+                        if let Some(row) = entry {
+                            // First case: overwriting an existing value. Apply merge
+                            // function. Insert new row  and update hash table if merge
+                            // changes anything.
+                            let cur = self
+                                .data
+                                .get_row(*row)
+                                .expect("table should not point to stale entry");
+                            if (self.merge)(exec_state, cur, query, &mut scratch) {
+                                let new = self.data.add_row(&scratch);
+                                if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
+                                    assert!(sort_val >= largest, "inserting row that violates sort order ({sort_val:?} vs. {largest:?})");
+                                    if sort_val > largest {
+                                        self.offsets.push((sort_val, new));
+                                    }
+                                } else {
+                                    self.offsets.push((sort_val, new));
+                                }
+                                self.data.set_stale(*row);
+                                *row = new;
+                                changed = true;
+                            }
+                            scratch.clear();
+                        } else {
+                            // New value: update invariants.
+                            let new = self.data.add_row(query);
+                            if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
+                                assert!(
+                                    sort_val >= largest,
+                                    "inserting row that violates sort order"
+                                );
+                                if sort_val > largest {
+                                    self.offsets.push((sort_val, new));
+                                }
+                            } else {
+                                self.offsets.push((sort_val, new));
+                            }
+                            let (shard, hc) = hash_code(self.hash.shard_data(), query, self.n_keys);
+                            debug_assert_eq!(shard, _outer_shard);
+                            self.hash.mut_shards()[shard.index()].insert_unique(
+                                hc as _,
+                                TableEntry {
+                                    hashcode: hc as _,
+                                    row: new,
+                                },
+                                |entry| entry.hashcode(),
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+            } else {
+                // Simplified variant without the sorting constraint.
+                while let Some(buf) = queue.pop() {
+                    for query in buf.non_stale() {
+                        let key = &query[0..n_keys];
+                        let entry = get_entry_mut(query, n_keys, &mut self.hash, |row| {
+                            let Some(row) = self.data.get_row(row) else {
+                                return false;
+                            };
+                            &row[0..n_keys] == key
+                        });
+
+                        if let Some(row) = entry {
+                            let cur = self
+                                .data
+                                .get_row(*row)
+                                .expect("table should not point to stale entry");
+                            if (self.merge)(exec_state, cur, query, &mut scratch) {
+                                let new = self.data.add_row(&scratch);
+                                self.data.set_stale(*row);
+                                *row = new;
+                                changed = true;
+                            }
+                            scratch.clear();
+                        } else {
+                            // New value: update invariants.
+                            let new = self.data.add_row(query);
+                            let (shard, hc) = hash_code(self.hash.shard_data(), query, self.n_keys);
+                            debug_assert_eq!(shard, _outer_shard);
+                            self.hash.mut_shards()[shard.index()].insert_unique(
+                                hc as _,
+                                TableEntry {
+                                    hashcode: hc as _,
+                                    row: new,
+                                },
+                                |entry| entry.hashcode(),
+                            );
+                            changed = true;
+                        }
+                    }
+                }
+            };
+        }
+        changed
+    }
+
+    fn parallel_insert<C: OrderingChecker>(
+        &mut self,
+        exec_state: &ExecutionState,
+        checker: C,
+    ) -> bool {
+        let shard_data = self.hash.shard_data();
+        let n_keys = self.n_keys;
+        let n_cols = self.n_columns;
+        let pending_adds = self
+            .hash
+            .mut_shards()
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(shard_id, shard)| {
+                let shard_id = ShardId::from_usize(shard_id);
+                if self.pending_state.pending_rows[shard_id].is_empty() {
+                    return None;
+                }
+                Some((shard_id, shard))
+            })
+            .map(|(shard_id, shard)| {
+                let mut checker = checker.clone();
+                let mut exec_state = exec_state.new_handle();
+                let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
+                let queue = &self.pending_state.pending_rows[shard_id];
+                let mut marked_stale = 0usize;
+                let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                while let Some(buf) = queue.pop() {
+                    for row in buf.non_stale() {
+                        checker.check_local(row);
+                        let key = &row[0..n_keys];
+                        let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
+                        assert_eq!(shard_id, _actual_shard);
+                        match shard.find_entry(hash, |ent| {
+                            ent.hashcode == hash as HashCode
+                                && self
+                                    .data
+                                    .get_row(ent.row)
+                                    .map(|r| &r[0..n_keys] == key)
+                                    .unwrap_or(false)
+                        }) {
+                            Ok(occ) => {
+                                let cur = self
+                                    .data
+                                    .get_row(occ.get().row)
+                                    .expect("table should not point to stale entry");
+                                // Need to run a merge function.
+                                if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
+                                    // SAFETY: The safety requirements of
+                                    // `set_stale_shared` are that there are no
+                                    // concurrent accesses to `row`. We have
+                                    // exclusive access to this shard.
+                                    unsafe {
+                                        let _was_stale =
+                                            self.data.data.set_stale_shared(occ.get().row);
+                                        debug_assert!(!_was_stale);
+                                    };
+                                    // We have a new entry. Stage it to be added
+                                    // and then remove this entry.
+                                    staged.insert(&scratch, |cur, new, out| {
+                                        (self.merge)(&mut exec_state, cur, new, out)
+                                    });
+                                    occ.remove();
+                                    marked_stale += 1;
+                                }
+                                scratch.clear()
+                            }
+                            Err(_) => {
+                                // Stage this row to get inserted later.
+                                staged.insert(row, |cur, new, out| {
+                                    (self.merge)(&mut exec_state, cur, new, out)
+                                });
+                            }
+                        }
+                    }
+                }
+                (checker, marked_stale, shard_id, staged.into_rows())
+            })
+            .collect_vec_list();
+        let checker = C::check_global(
+            pending_adds
+                .iter()
+                .flatten()
+                .map(|(checker, _, _, _)| checker),
+        );
+        let next_offset = RowId::from_usize(self.data.data.len());
+        checker.update_offsets(next_offset, &mut self.offsets);
+        // Now we need to insert the new rows into the backing vector. We spawn
+        // more work for each shard.
+        rayon::scope(|scope| {
+            let mut channels = Vec::with_capacity(shard_data.n_shards());
+            channels.resize_with(shard_data.n_shards(), || {
+                crossbeam_channel::bounded::<(RowId, RowBuffer)>(32)
+            });
+            let mut changed = false;
+            for (shard_id, ((_, receiver), shard)) in channels
+                .iter()
+                .zip(self.hash.mut_shards().iter_mut())
+                .enumerate()
+            {
+                let shard_id = ShardId::from_usize(shard_id);
+                let receiver = receiver.clone();
+                scope.spawn(move |_| {
+                    while let Some((start_row, to_add)) = recv(&receiver) {
+                        let mut cur_row = start_row;
+                        for row in to_add.non_stale() {
+                            let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
+                            debug_assert_eq!(_actual_shard, shard_id);
+                            shard.insert_unique(
+                                hc,
+                                TableEntry {
+                                    hashcode: hc as _,
+                                    row: cur_row,
+                                },
+                                |entry| entry.hashcode as u64,
+                            );
+                            cur_row = cur_row.inc();
+                        }
+                    }
+                });
+            }
+            for batch in pending_adds {
+                for (_, marked_stale, shard, to_add) in batch {
+                    self.data.stale_rows += marked_stale;
+                    let start_row = RowId::from_usize(self.data.data.len());
+                    changed |= to_add.len() > 0;
+                    for row in to_add.non_stale() {
+                        self.data.add_row(row);
+                    }
+                    send(&channels[shard.index()].0, (start_row, to_add));
+                }
+            }
+            changed
+        })
     }
 
     fn binary_search_sort_val(&self, val: Value) -> Result<(RowId, RowId), RowId> {
@@ -697,6 +916,8 @@ fn hash_code(shard_data: ShardData, row: &[Value], n_keys: usize) -> (ShardId, u
 struct PendingState {
     pending_rows: DenseIdMap<ShardId, SegQueue<RowBuffer>>,
     pending_removals: DenseIdMap<ShardId, SegQueue<RowBuffer>>,
+    total_removals: AtomicUsize,
+    total_rows: AtomicUsize,
 }
 
 impl PendingState {
@@ -712,6 +933,8 @@ impl PendingState {
         PendingState {
             pending_rows,
             pending_removals,
+            total_removals: AtomicUsize::new(0),
+            total_rows: AtomicUsize::new(0),
         }
     }
     fn clear(&self) {
@@ -721,6 +944,209 @@ impl PendingState {
 
         for (_, queue) in self.pending_removals.iter() {
             while queue.pop().is_some() {}
+        }
+    }
+}
+
+/// Send on the crossbeam channel, yielding to other work on the rayon thread
+/// pool if the channel is full.
+fn send<T>(sender: &Sender<T>, mut t: T) {
+    while let Err(err) = sender.try_send(t) {
+        match err {
+            TrySendError::Full(to_retry) => {
+                // Yield once before polling again.
+                rayon::yield_now();
+                t = to_retry;
+            }
+            TrySendError::Disconnected(_) => return,
+        }
+    }
+}
+
+/// Listen on the crossbeam channel, yielding to other work on the rayon thread
+/// pool if the channel is empty.
+fn recv<T>(receiver: &Receiver<T>) -> Option<T> {
+    loop {
+        match receiver.try_recv() {
+            Ok(elt) => return Some(elt),
+            Err(TryRecvError::Disconnected) => {
+                return None;
+            }
+            Err(TryRecvError::Empty) => match rayon::yield_now() {
+                Some(rayon::Yield::Executed) => continue,
+                Some(rayon::Yield::Idle) | None => return receiver.recv().ok(),
+            },
+        }
+    }
+}
+
+/// A trait that encapsulates the logic of potentially checking that written
+/// columns appear in sorted order.
+///
+/// For rows that are sorted by a column, an OrderingChecker asserts that all
+/// new rows have the same value in that column, and that the column is greater
+/// than or equal to the column value coming in. For rows not sorted, these
+/// checks become no-ops.
+trait OrderingChecker: Clone + Send + Sync {
+    /// Check any invariants locally, updating the state of the checker when
+    /// doing so.
+    fn check_local(&mut self, row: &[Value]);
+    /// Combine the states of multiple checkers, returning a new checker with
+    /// all information assimilated. This is the checker that is suitable for
+    /// calling `update_offsets` with.
+    fn check_global<'a>(checkers: impl Iterator<Item = &'a Self>) -> Self
+    where
+        Self: 'a;
+    /// Update the sorted offset vector with the current state of the checker.
+    fn update_offsets(&self, start: RowId, offsets: &mut Vec<(Value, RowId)>);
+}
+
+impl OrderingChecker for () {
+    fn check_local(&mut self, _: &[Value]) {}
+    fn check_global<'a>(_: impl Iterator<Item = &'a ()>) {}
+    fn update_offsets(&self, _: RowId, _: &mut Vec<(Value, RowId)>) {}
+}
+
+#[derive(Copy, Clone)]
+struct SortChecker {
+    col: ColumnId,
+    baseline: Option<Value>,
+    current: Option<Value>,
+}
+
+impl OrderingChecker for SortChecker {
+    fn check_local(&mut self, row: &[Value]) {
+        let val = row[self.col.index()];
+        if let Some(cur) = self.current {
+            assert_eq!(
+                cur, val,
+                "concurrently inserting rows with different sort keys"
+            );
+        } else {
+            self.current = Some(val);
+            if let Some(baseline) = self.baseline {
+                assert!(val >= baseline, "inserted row violates sort order");
+            }
+        }
+    }
+
+    fn check_global<'a>(mut checkers: impl Iterator<Item = &'a Self>) -> Self {
+        let Some(start) = checkers.next() else {
+            return SortChecker {
+                col: ColumnId::new(!0),
+                baseline: None,
+                current: None,
+            };
+        };
+        let mut expected = start.current;
+        for checker in checkers {
+            assert_eq!(checker.baseline, start.baseline);
+            match (&mut expected, checker.current) {
+                (None, None) => {}
+                (cur @ None, Some(x)) => {
+                    *cur = Some(x);
+                }
+                (Some(_), None) => {}
+                (Some(x), Some(y)) => {
+                    assert_eq!(
+                        *x, y,
+                        "concurrently inserting rows with different sort keys"
+                    );
+                }
+            }
+        }
+        SortChecker {
+            col: start.col,
+            baseline: start.baseline,
+            current: expected,
+        }
+    }
+
+    fn update_offsets(&self, start: RowId, offsets: &mut Vec<(Value, RowId)>) {
+        if let Some(cur) = self.current {
+            if let Some((max, _)) = offsets.last() {
+                if cur > *max {
+                    offsets.push((cur, start));
+                }
+            } else {
+                offsets.push((cur, start));
+            }
+        }
+    }
+}
+
+fn do_parallel(_workload_size: usize) -> bool {
+    #[cfg(test)]
+    {
+        // In tests, run serial and parallel variants half the time,
+        // nondeterministically.
+        use rand::{thread_rng, Rng};
+        thread_rng().gen::<bool>()
+    }
+    #[cfg(not(test))]
+    {
+        _workload_size > 100_000
+    }
+}
+
+/// A type similar to a SortedWritesTable used to buffer outputs. The main thing
+/// that StagedOutputs handles is running the merge function for a table on
+/// multiple updates to the same key that show up in the same round of
+/// insertions.
+struct StagedOutputs {
+    shard_data: ShardData,
+    n_keys: usize,
+    hash: HashTable<TableEntry>,
+    rows: RowBuffer,
+    scratch: Pooled<Vec<Value>>,
+}
+
+impl StagedOutputs {
+    fn into_rows(self) -> RowBuffer {
+        self.rows
+    }
+    fn new(shard_data: ShardData, n_keys: usize, n_cols: usize) -> Self {
+        StagedOutputs {
+            shard_data,
+            n_keys,
+            hash: HashTable::default(),
+            rows: RowBuffer::new(n_cols),
+            scratch: with_pool_set(|ps| ps.get::<Vec<Value>>()),
+        }
+    }
+
+    fn insert(
+        &mut self,
+        row: &[Value],
+        mut merge_fn: impl FnMut(&[Value], &[Value], &mut Vec<Value>) -> bool,
+    ) {
+        use hashbrown::hash_table::Entry;
+        let (_, hc) = hash_code(self.shard_data, row, self.n_keys);
+        let entry = self.hash.entry(
+            hc,
+            |te| {
+                te.hashcode() == hc
+                    && self.rows.get_row(te.row)[0..self.n_keys] == row[0..self.n_keys]
+            },
+            TableEntry::hashcode,
+        );
+        match entry {
+            Entry::Occupied(mut occupied_entry) => {
+                let cur = self.rows.get_row(occupied_entry.get().row);
+                if merge_fn(cur, row, &mut self.scratch) {
+                    let new = self.rows.add_row(&self.scratch);
+                    self.rows.set_stale(occupied_entry.get().row);
+                    occupied_entry.get_mut().row = new;
+                }
+                self.scratch.clear();
+            }
+            Entry::Vacant(vacant_entry) => {
+                let next = self.rows.add_row(row);
+                vacant_entry.insert(TableEntry {
+                    hashcode: hc as _,
+                    row: next,
+                });
+            }
         }
     }
 }

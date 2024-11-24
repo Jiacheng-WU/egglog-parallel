@@ -132,6 +132,14 @@ pub(crate) struct DbView<'a, Tables> {
     pub(crate) prims: &'a Primitives,
 }
 
+impl<T> Clone for DbView<'_, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<T> Copy for DbView<'_, T> {}
+
 impl<T> DbView<'_, T> {
     fn inc_counter(&self, ctr: CounterId) -> usize {
         self.counters[ctr].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -145,6 +153,13 @@ pub struct ExecutionState<'a, T = DenseIdMap<TableId, TableInfo>> {
 }
 
 impl<T: TableInfoMap> ExecutionState<'_, T> {
+    pub fn new_handle(&self) -> ExecutionState<'_, T> {
+        ExecutionState {
+            predicted: self.predicted,
+            db: self.db,
+            buffers: DenseIdMap::new(),
+        }
+    }
     pub fn stage_insert(&mut self, table: TableId, vals: &[Value]) {
         self.buffers
             .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
