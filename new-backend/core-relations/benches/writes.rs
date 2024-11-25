@@ -76,6 +76,17 @@ fn parallel_insert<const N: usize>(bench: Bencher) {
     )
 }
 
+#[divan::bench(consts = [1, 2, 4, 8, 16], sample_count=50)]
+fn parallel_insert_merge2<const N: usize>(bench: Bencher) {
+    const WORKLOAD_SIZE: usize = 4 << 20;
+    bench_workload(
+        bench,
+        generate_workload::<3, 5>(WORKLOAD_SIZE, 1.0, 0.05),
+        2,
+        N,
+    )
+}
+
 #[divan::bench(consts = [1, 2, 4, 8, 16])]
 fn parallel_insert_remove_with_collisions<const N: usize>(bench: Bencher) {
     const WORKLOAD_SIZE: usize = 1 << 20;

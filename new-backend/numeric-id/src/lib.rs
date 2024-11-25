@@ -172,6 +172,14 @@ impl<K: NumericId, V> DenseIdMap<K, V> {
             self.data.resize_with(index + 1, || None);
         }
     }
+
+    pub fn drain(&mut self) -> impl Iterator<Item = (K, V)> + '_ {
+        // To avoid the need to write down the return type.
+        self.data
+            .drain(..)
+            .enumerate()
+            .filter_map(|(i, v)| Some((K::from_usize(i), v?)))
+    }
 }
 
 impl<K: NumericId, V: Send + Sync> DenseIdMap<K, V> {
@@ -181,6 +189,14 @@ impl<K: NumericId, V: Send + Sync> DenseIdMap<K, V> {
             .par_iter()
             .enumerate()
             .filter_map(|(i, v)| Some((K::from_usize(i), v.as_ref()?)))
+    }
+
+    /// Get a parallel iterator over mutable references to the entries in the table.
+    pub fn par_iter_mut(&mut self) -> impl ParallelIterator<Item = (K, &mut V)> {
+        self.data
+            .par_iter_mut()
+            .enumerate()
+            .filter_map(|(i, v)| Some((K::from_usize(i), v.as_mut()?)))
     }
 }
 
@@ -285,7 +301,9 @@ mod context {
 }
 
 pub use context::ContextHandle;
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 
 #[macro_export]
 #[doc(hidden)]

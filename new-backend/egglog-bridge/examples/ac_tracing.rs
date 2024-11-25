@@ -5,8 +5,15 @@ use egglog_bridge::{define_rule, ColumnTy, DefaultVal, EGraph, MergeFn};
 fn main() {
     const N: usize = 12;
     env_logger::init();
+    #[cfg(feature = "serial_examples")]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global()
+            .unwrap();
+    }
     let mut egraph = EGraph::with_tracing();
-    let int_prim = egraph.primitives_mut().get_ty::<i64>();
+    let int_prim = egraph.primitives_mut().register_type::<i64>();
     let num_table = egraph.add_table(
         vec![ColumnTy::Primitive(int_prim), ColumnTy::Id],
         DefaultVal::FreshId,
@@ -39,7 +46,7 @@ fn main() {
     let num_rows = (0..N)
         .map(|i| {
             let id = egraph.fresh_id();
-            let i = egraph.primitives_mut().get(i as i64);
+            let i = egraph.primitives().get(i as i64);
             ids.push(id);
             (num_table, vec![i, id])
         })

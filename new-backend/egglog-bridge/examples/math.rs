@@ -8,9 +8,16 @@ use web_time::Instant;
 fn main() {
     const N: usize = 12;
     env_logger::init();
+    #[cfg(feature = "serial_examples")]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build_global()
+            .unwrap();
+    }
     let mut egraph = EGraph::default();
-    let rational_ty = egraph.primitives_mut().get_ty::<Rational64>();
-    let string_ty = egraph.primitives_mut().get_ty::<&'static str>();
+    let rational_ty = egraph.primitives_mut().register_type::<Rational64>();
+    let string_ty = egraph.primitives_mut().register_type::<&'static str>();
     // tables
     let diff = egraph.add_table(
         vec![ColumnTy::Id, ColumnTy::Id, ColumnTy::Id],
@@ -92,12 +99,12 @@ fn main() {
         "var",
     );
 
-    let zero = egraph.primitives_mut().get(Rational64::new(0, 1));
-    let one = egraph.primitives_mut().get(Rational64::new(1, 1));
-    let neg1 = egraph.primitives_mut().get(Rational64::new(-1, 1));
-    let two = egraph.primitives_mut().get(Rational64::new(2, 1));
-    let three = egraph.primitives_mut().get(Rational64::new(3, 1));
-    let seven = egraph.primitives_mut().get(Rational64::new(7, 1));
+    let zero = egraph.primitives().get(Rational64::new(0, 1));
+    let one = egraph.primitives().get(Rational64::new(1, 1));
+    let neg1 = egraph.primitives().get(Rational64::new(-1, 1));
+    let two = egraph.primitives().get(Rational64::new(2, 1));
+    let three = egraph.primitives().get(Rational64::new(3, 1));
+    let seven = egraph.primitives().get(Rational64::new(7, 1));
     let rules = [
         define_rule! {
             [egraph] ((-> (add x y) id)) => ((set (add y x) id))

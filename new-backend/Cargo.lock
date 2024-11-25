@@ -291,6 +291,7 @@ dependencies = [
  "num-rational",
  "numeric-id",
  "petgraph",
+ "rayon",
  "smallvec",
  "thiserror 1.0.69",
  "union-find",

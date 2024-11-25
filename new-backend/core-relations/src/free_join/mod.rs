@@ -9,6 +9,7 @@ use std::{
 
 use concurrency::ReadOptimizedLock;
 use numeric_id::{define_id, DenseIdMap, NumericId};
+use rayon::iter::ParallelIterator;
 use smallvec::SmallVec;
 
 use crate::{
@@ -17,6 +18,7 @@ use crate::{
         Bindings, DbView,
     },
     common::DashMap,
+    dependency_graph::DependencyGraph,
     hash_index::{ColumnIndex, Index},
     offsets::Subset,
     pool::{with_pool_set, Pool, Pooled},
@@ -179,6 +181,8 @@ pub struct Database {
     // because we keep an array per id in the UF.
     pub(crate) counters: DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_functions: DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
+    // Tracks the relative dependencies between tables during merge operations.
+    deps: DependencyGraph,
     primitives: Primitives,
     stack: Vec<DbState>,
 }
@@ -299,18 +303,27 @@ impl Database {
         loop {
             let mut changed = false;
             let predicted = PredictedVals::default();
-            for id in 0..self.tables.n_ids() {
-                // Move the table out of the tables map. Run the merge (which can
-                // access the rest of the db). Then put it back.
-                let table = TableId::from_usize(id);
-                let mut info = self.tables.unwrap_val(table);
-                let table_changed = info.table.merge(&mut ExecutionState {
-                    predicted: &predicted,
-                    db: self.read_only_view(),
-                    buffers: Default::default(),
-                });
-                changed |= table_changed;
-                self.tables.insert(table, info);
+            let mut tables_merging =
+                DenseIdMap::<TableId, TableInfo>::with_capacity(self.tables.n_ids());
+            for stratum in self.deps.strata() {
+                for table in stratum.iter().copied() {
+                    tables_merging.insert(table, self.tables.unwrap_val(table));
+                }
+                let db = self.read_only_view();
+                changed |= tables_merging
+                    .par_iter_mut()
+                    .map(|(_, info)| {
+                        info.table.merge(&mut ExecutionState {
+                            predicted: &predicted,
+                            db,
+                            buffers: Default::default(),
+                        })
+                    })
+                    .max()
+                    .unwrap_or(false);
+                for (id, table) in tables_merging.drain() {
+                    self.tables.insert(id, table);
+                }
             }
             ever_changed |= changed;
             if !changed {
@@ -354,15 +367,21 @@ impl Database {
     ///
     /// The table must have a compatible spec with `types` (e.g. same number of
     /// columns).
-    pub fn add_table<T: Table + Sized + 'static>(&mut self, table: T) -> TableId {
+    pub fn add_table<T: Table + Sized + 'static>(
+        &mut self,
+        table: T,
+        deps: impl IntoIterator<Item = TableId>,
+    ) -> TableId {
         let spec = table.spec();
         let table = WrappedTable::new(table);
-        self.tables.push(TableInfo {
+        let res = self.tables.push(TableInfo {
             spec,
             table,
             indexes: Default::default(),
             column_indexes: Default::default(),
-        })
+        });
+        self.deps.add_table(res, deps);
+        res
     }
 
     /// Get direct mutable access to the table.

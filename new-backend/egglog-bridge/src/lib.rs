@@ -9,7 +9,7 @@
 //! joins, union-finds, etc.
 
 use std::{
-    mem,
+    iter, mem,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -80,7 +80,7 @@ pub type Result<T> = std::result::Result<T, anyhow::Error>;
 impl Default for EGraph {
     fn default() -> Self {
         let mut db = Database::new();
-        let uf_table = db.add_table(DisplacedTable::default());
+        let uf_table = db.add_table(DisplacedTable::default(), iter::empty());
         EGraph::create_internal(db, uf_table, false)
     }
 }
@@ -93,7 +93,7 @@ impl EGraph {
     /// came to appera.
     pub fn with_tracing() -> EGraph {
         let mut db = Database::new();
-        let uf_table = db.add_table(DisplacedTableWithProvenance::default());
+        let uf_table = db.add_table(DisplacedTableWithProvenance::default(), iter::empty());
         EGraph::create_internal(db, uf_table, true)
     }
 
@@ -167,7 +167,7 @@ impl EGraph {
                     None,
                     |_, _, _, _| false,
                 );
-                let table_id = self.db.add_table(table);
+                let table_id = self.db.add_table(table, iter::empty());
                 *v.insert(table_id)
             }
         }
@@ -184,7 +184,7 @@ impl EGraph {
                     None,
                     |_, _, _, _| false,
                 );
-                let table_id = self.db.add_table(table);
+                let table_id = self.db.add_table(table, iter::empty());
                 *v.insert(table_id)
             }
         }
@@ -483,6 +483,10 @@ impl EGraph {
         let uf_table = self.uf_table;
         let tracing = self.tracing;
         let next_func_id = self.funcs.next_id();
+        let mut deps = SmallVec::<[TableId; 2]>::new();
+        if !tracing {
+            deps.push(uf_table);
+        }
         let table = match merge {
             MergeFn::UnionId => SortedWritesTable::new(
                 n_args,
@@ -507,6 +511,7 @@ impl EGraph {
                 },
             ),
             MergeFn::Table(merge_table) => {
+                deps.push(merge_table);
                 let id_counter = self.id_counter;
                 SortedWritesTable::new(
                     n_args,
@@ -551,7 +556,7 @@ impl EGraph {
                 )
             }
         };
-        let table_id = self.db.add_table(table);
+        let table_id = self.db.add_table(table, deps.iter().copied());
         let res = self.funcs.push(FunctionInfo {
             table: table_id,
             schema: schema.clone(),

@@ -3,6 +3,7 @@
 pub(crate) mod table_shortcuts;
 pub(crate) mod action;
 pub(crate) mod common;
+pub(crate) mod dependency_graph;
 pub(crate) mod free_join;
 pub(crate) mod hash_index;
 pub(crate) mod offsets;
