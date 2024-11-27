@@ -197,6 +197,20 @@ impl<T: Clear + InPoolSet<PoolSet> + 'static> Pooled<T> {
         let slot: &mut T = &mut this.data;
         mem::swap(slot, &mut other);
     }
+
+    pub(crate) fn into_inner(this: Pooled<T>) -> T {
+        // SAFETY: ownership of `this.data` is transferred to the caller. We
+        // will not drop `this` or use it again.
+        let inner = unsafe { ptr::read(&this.data) };
+        mem::forget(this);
+        ManuallyDrop::into_inner(inner)
+    }
+
+    pub(crate) fn new(data: T) -> Pooled<T> {
+        Pooled {
+            data: ManuallyDrop::new(data),
+        }
+    }
 }
 
 impl<T: Clear + Clone + InPoolSet<PoolSet>> Pooled<T> {

@@ -8,13 +8,13 @@ use std::{
     any::Any,
     cmp,
     hash::Hasher,
+    mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
 
-use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
@@ -27,7 +27,7 @@ use crate::{
     common::Value,
     offsets::{OffsetRange, Offsets, RowId, Subset, SubsetRef},
     pool::with_pool_set,
-    row_buffer::RowBuffer,
+    row_buffer::{ParallelRowBufWriter, RowBuffer},
     table_spec::{
         ColumnId, Constraint, Generation, MutationBuffer, Offset, Row, Table, TableSpec,
         TableVersion,
@@ -670,9 +670,15 @@ impl SortedWritesTable {
         exec_state: &ExecutionState,
         checker: C,
     ) -> bool {
+        // Parallel insert uses one giant parallel foreach. We have updates
+        // pre-sharded, and one logical thread can process updates for each
+        // shard independently. Updates happen in three phases, which comments
+        // describe below.
         let shard_data = self.hash.shard_data();
         let n_keys = self.n_keys;
         let n_cols = self.n_columns;
+        let next_offset = RowId::from_usize(self.data.data.len());
+        let row_writer = self.data.data.parallel_writer();
         let pending_adds = self
             .hash
             .mut_shards()
@@ -692,7 +698,15 @@ impl SortedWritesTable {
                 let queue = &self.pending_state.pending_rows[shard_id];
                 let mut marked_stale = 0usize;
                 let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                // Phase 1: process all incoming updates:
+                // * Add new values to `staged`
+                // * Removing entries in `shard` and mark them as stale in
+                // `data` if they will be overwritten.
                 while let Some(buf) = queue.pop() {
+                    // We create a read_handle once per batch to avoid blocking
+                    // too many threads if someone needs to resize the row
+                    // writer.
+                    let read_handle = row_writer.read_handle();
                     for row in buf.non_stale() {
                         checker.check_local(row);
                         let key = &row[0..n_keys];
@@ -700,17 +714,10 @@ impl SortedWritesTable {
                         assert_eq!(shard_id, _actual_shard);
                         match shard.find_entry(hash, |ent| {
                             ent.hashcode == hash as HashCode
-                                && self
-                                    .data
-                                    .get_row(ent.row)
-                                    .map(|r| &r[0..n_keys] == key)
-                                    .unwrap_or(false)
+                                && &read_handle.get_row(ent.row)[0..n_keys] == key
                         }) {
                             Ok(occ) => {
-                                let cur = self
-                                    .data
-                                    .get_row(occ.get().row)
-                                    .expect("table should not point to stale entry");
+                                let cur = read_handle.get_row(occ.get().row);
                                 // Need to run a merge function.
                                 if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
                                     // SAFETY: The safety requirements of
@@ -719,7 +726,7 @@ impl SortedWritesTable {
                                     // exclusive access to this shard.
                                     unsafe {
                                         let _was_stale =
-                                            self.data.data.set_stale_shared(occ.get().row);
+                                            read_handle.set_stale_shared(occ.get().row);
                                         debug_assert!(!_was_stale);
                                     };
                                     // We have a new entry. Stage it to be added
@@ -741,64 +748,57 @@ impl SortedWritesTable {
                         }
                     }
                 }
-                (checker, marked_stale, shard_id, staged.into_rows())
+                // Phase 2: Write the staged rows to the row writer. This only
+                // works due to the `ParallelRowBufWriter` machinery.
+                let start_row = staged.write_output(&row_writer);
+                // Phase 3: With the values buffered in the row buffer, we can
+                // write them back to the shard, pointed to the correct rows.
+
+                // In the serial implementation, we do phases2 and 3 inline with
+                // processing the incoming mutation, but separating them out
+                // this way allows us to do a single write to the shared row
+                // buffer, rather than one per row, which would cause
+                // contention.
+                let to_add = staged.into_rows();
+                let changed = marked_stale > 0 || to_add.len() > 0;
+                let mut cur_row = start_row;
+                for row in to_add.non_stale() {
+                    let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
+                    debug_assert_eq!(_actual_shard, shard_id);
+                    shard.insert_unique(
+                        hc,
+                        TableEntry {
+                            hashcode: hc as _,
+                            row: cur_row,
+                        },
+                        |entry| entry.hashcode as u64,
+                    );
+                    cur_row = cur_row.inc();
+                }
+                (checker, marked_stale, changed)
             })
             .collect_vec_list();
-        let checker = C::check_global(
-            pending_adds
-                .iter()
-                .flatten()
-                .map(|(checker, _, _, _)| checker),
-        );
-        let next_offset = RowId::from_usize(self.data.data.len());
+        mem::drop(row_writer);
+        // Now we just need to reset our invariants.
+
+        // Confirm none of the writes violated sort order and update the
+        // `offsets` vector.
+        let checker = C::check_global(pending_adds.iter().flatten().map(|(checker, _, _)| checker));
         checker.update_offsets(next_offset, &mut self.offsets);
-        // Now we need to insert the new rows into the backing vector. We spawn
-        // more work for each shard.
-        rayon::scope(|scope| {
-            let mut channels = Vec::with_capacity(shard_data.n_shards());
-            channels.resize_with(shard_data.n_shards(), || {
-                crossbeam_channel::bounded::<(RowId, RowBuffer)>(32)
-            });
-            let mut changed = false;
-            for (shard_id, ((_, receiver), shard)) in channels
-                .iter()
-                .zip(self.hash.mut_shards().iter_mut())
-                .enumerate()
-            {
-                let shard_id = ShardId::from_usize(shard_id);
-                let receiver = receiver.clone();
-                scope.spawn(move |_| {
-                    while let Some((start_row, to_add)) = recv(&receiver) {
-                        let mut cur_row = start_row;
-                        for row in to_add.non_stale() {
-                            let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
-                            debug_assert_eq!(_actual_shard, shard_id);
-                            shard.insert_unique(
-                                hc,
-                                TableEntry {
-                                    hashcode: hc as _,
-                                    row: cur_row,
-                                },
-                                |entry| entry.hashcode as u64,
-                            );
-                            cur_row = cur_row.inc();
-                        }
-                    }
-                });
-            }
-            for batch in pending_adds {
-                for (_, marked_stale, shard, to_add) in batch {
-                    self.data.stale_rows += marked_stale;
-                    let start_row = RowId::from_usize(self.data.data.len());
-                    changed |= to_add.len() > 0;
-                    for row in to_add.non_stale() {
-                        self.data.add_row(row);
-                    }
-                    send(&channels[shard.index()].0, (start_row, to_add));
-                }
-            }
-            changed
-        })
+
+        // Update the staleness counters.
+        self.data.stale_rows += pending_adds
+            .iter()
+            .flatten()
+            .map(|(_, stale, _)| *stale)
+            .sum::<usize>();
+
+        // Register any changes.
+        let changed = pending_adds
+            .iter()
+            .flatten()
+            .any(|(_, _, changed)| *changed);
+        changed
     }
 
     fn binary_search_sort_val(&self, val: Value) -> Result<(RowId, RowId), RowId> {
@@ -948,38 +948,6 @@ impl PendingState {
     }
 }
 
-/// Send on the crossbeam channel, yielding to other work on the rayon thread
-/// pool if the channel is full.
-fn send<T>(sender: &Sender<T>, mut t: T) {
-    while let Err(err) = sender.try_send(t) {
-        match err {
-            TrySendError::Full(to_retry) => {
-                // Yield once before polling again.
-                rayon::yield_now();
-                t = to_retry;
-            }
-            TrySendError::Disconnected(_) => return,
-        }
-    }
-}
-
-/// Listen on the crossbeam channel, yielding to other work on the rayon thread
-/// pool if the channel is empty.
-fn recv<T>(receiver: &Receiver<T>) -> Option<T> {
-    loop {
-        match receiver.try_recv() {
-            Ok(elt) => return Some(elt),
-            Err(TryRecvError::Disconnected) => {
-                return None;
-            }
-            Err(TryRecvError::Empty) => match rayon::yield_now() {
-                Some(rayon::Yield::Executed) => continue,
-                Some(rayon::Yield::Idle) | None => return receiver.recv().ok(),
-            },
-        }
-    }
-}
-
 /// A trait that encapsulates the logic of potentially checking that written
 /// columns appear in sorted order.
 ///
@@ -1099,6 +1067,7 @@ struct StagedOutputs {
     n_keys: usize,
     hash: HashTable<TableEntry>,
     rows: RowBuffer,
+    n_stale: usize,
     scratch: Pooled<Vec<Value>>,
 }
 
@@ -1110,6 +1079,7 @@ impl StagedOutputs {
         StagedOutputs {
             shard_data,
             n_keys,
+            n_stale: 0,
             hash: HashTable::default(),
             rows: RowBuffer::new(n_cols),
             scratch: with_pool_set(|ps| ps.get::<Vec<Value>>()),
@@ -1137,6 +1107,7 @@ impl StagedOutputs {
                 if merge_fn(cur, row, &mut self.scratch) {
                     let new = self.rows.add_row(&self.scratch);
                     self.rows.set_stale(occupied_entry.get().row);
+                    self.n_stale += 1;
                     occupied_entry.get_mut().row = new;
                 }
                 self.scratch.clear();
@@ -1149,5 +1120,43 @@ impl StagedOutputs {
                 });
             }
         }
+    }
+
+    /// Write the contents of the staged outputs to the given writer, returning
+    /// the initial RowId of the new output.
+    fn write_output(&self, output: &ParallelRowBufWriter) -> RowId {
+        let n_rows = self.rows.len() - self.n_stale;
+        let n_vals = n_rows * self.rows.arity();
+        output.write_raw_values(
+            WithExactSize {
+                iter: self.rows.non_stale().flatten().copied(),
+                size: n_vals,
+            },
+            n_rows,
+        )
+    }
+}
+
+/// A simple type used to attach a known size to an arbitrary iterator.
+struct WithExactSize<I> {
+    iter: I,
+    size: usize,
+}
+
+impl<I: Iterator> Iterator for WithExactSize<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.iter.size_hint()
+    }
+}
+
+impl<I: Iterator> ExactSizeIterator for WithExactSize<I> {
+    fn len(&self) -> usize {
+        self.size
     }
 }

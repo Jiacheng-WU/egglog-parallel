@@ -3,11 +3,13 @@
 pub(crate) mod bitset;
 pub(crate) mod concurrent_vec;
 pub(crate) mod notification;
+pub(crate) mod parallel_writer;
 use arc_swap::{ArcSwap, Guard};
 
 pub use bitset::BitSet;
 pub use concurrent_vec::ConcurrentVec;
 pub use notification::Notification;
+pub use parallel_writer::ParallelVecWriter;
 
 #[cfg(test)]
 mod tests;
@@ -94,6 +96,11 @@ impl<T> ReadOptimizedLock<T> {
             token: ArcSwap::from_pointee(ReadToken::ReadOk(TriggerWhenDone::default())),
             data: SyncUnsafeCell(UnsafeCell::new(data)),
         }
+    }
+
+    /// Extract the inner data from the lock.
+    pub fn into_inner(self) -> T {
+        self.data.0.into_inner()
     }
 
     /// Create a `Reader` object that grants read access to the data.

@@ -1,8 +1,14 @@
 //! A basic data-structure encapsulating a batch of rows.
 
 use core::slice;
-use std::{cell::Cell, mem};
+use std::{
+    cell::Cell,
+    mem,
+    ops::Deref,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
+use concurrency::ParallelVecWriter;
 use numeric_id::NumericId;
 use smallvec::SmallVec;
 
@@ -61,6 +67,15 @@ impl RowBuffer {
             n_columns,
             total_rows: 0,
             data: with_pool_set(|ps| ps.get()),
+        }
+    }
+
+    pub(crate) fn parallel_writer(&mut self) -> ParallelRowBufWriter<'_> {
+        let data = mem::take(&mut self.data);
+        ParallelRowBufWriter {
+            buf: self,
+            vec: Some(ParallelVecWriter::new(Pooled::into_inner(data))),
+            new_rows: AtomicUsize::new(0),
         }
     }
 
@@ -130,11 +145,7 @@ impl RowBuffer {
     /// This method panics if `row` is out of bounds.
     pub(crate) fn get_row(&self, row: RowId) -> &[Value] {
         // SAFETY: see the comment in `non_stale`.
-        unsafe {
-            mem::transmute::<&[Cell<Value>], &[Value]>(
-                &self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns],
-            )
-        }
+        unsafe { get_row(&self.data, self.n_columns, row) }
     }
 
     /// Get the row corresponding to the given RowId without bounds checking.
@@ -303,5 +314,82 @@ impl TaggedRowBuffer {
         let row_id = row[self.base_arity()];
         let row = &row[..self.base_arity()];
         (RowId::new(row_id.rep()), row)
+    }
+}
+
+/// # Safety
+/// This function is safe so long as there are no concurrent writes to the given
+/// row.
+unsafe fn get_row(data: &[Cell<Value>], n_columns: usize, row: RowId) -> &[Value] {
+    mem::transmute::<&[Cell<Value>], &[Value]>(
+        &data[row.index() * n_columns..(row.index() + 1) * n_columns],
+    )
+}
+
+/// A wrapper for a RowBuffer that allows it to be written to in parallel, based
+/// on [`ParallelVecWriter`].
+///
+/// This is a type that is used to speed up parallel `merge` operations on
+/// `SortedWritesTable`. It uses a low-level interface that should be avoided in
+/// most cases.
+pub(crate) struct ParallelRowBufWriter<'a> {
+    buf: &'a mut RowBuffer,
+    // This is only an option so we can move out of it in `drop`. It is always
+    // populated.
+    vec: Option<ParallelVecWriter<Cell<Value>>>,
+    new_rows: AtomicUsize,
+}
+
+impl ParallelRowBufWriter<'_> {
+    pub(crate) fn read_handle(&self) -> ReadHandle<impl Deref<Target = [Cell<Value>]> + '_> {
+        ReadHandle {
+            buf: self.buf,
+            data: self.vec.as_ref().unwrap().read_access(),
+        }
+    }
+    pub(crate) fn write_raw_values(
+        &self,
+        vals: impl ExactSizeIterator<Item = Value>,
+        new_rows: usize,
+    ) -> RowId {
+        debug_assert_eq!(vals.len() % self.buf.n_columns, 0);
+        debug_assert_eq!(vals.len() / self.buf.n_columns, new_rows);
+        let start_off = self
+            .vec
+            .as_ref()
+            .unwrap()
+            .write_contents(vals.map(Cell::new));
+        self.new_rows.fetch_add(new_rows, Ordering::Release);
+        RowId::from_usize(start_off / self.buf.n_columns)
+    }
+}
+
+impl Drop for ParallelRowBufWriter<'_> {
+    fn drop(&mut self) {
+        self.buf.data = Pooled::new(self.vec.take().unwrap().finish());
+        self.buf.total_rows += self.new_rows.load(Ordering::Acquire);
+    }
+}
+
+/// A handle granting read access to a row buffer's contents.
+pub(crate) struct ReadHandle<'a, T> {
+    buf: &'a RowBuffer,
+    data: T,
+}
+
+impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
+    pub(crate) fn get_row(&self, row: RowId) -> &[Value] {
+        // SAFETY: ParallelVecWriter guarantees that data within bounds is not
+        // being modified concurrently.
+        unsafe { get_row(&self.data, self.buf.n_columns, row) }
+    }
+
+    /// See the documentation for [`RowBuffer::set_stale_shared`].
+    pub(crate) unsafe fn set_stale_shared(&self, row: RowId) -> bool {
+        let cells =
+            &self.data[row.index() * self.buf.n_columns..(row.index() + 1) * self.buf.n_columns];
+        let was_stale = cells[0].get().is_stale();
+        cells[0].set(Value::stale());
+        was_stale
     }
 }

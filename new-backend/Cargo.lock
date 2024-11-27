@@ -162,7 +162,6 @@ dependencies = [
  "anyhow",
  "bumpalo",
  "concurrency",
- "crossbeam-channel",
  "crossbeam-queue",
  "dashmap",
  "divan",

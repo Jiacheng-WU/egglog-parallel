@@ -1,0 +1,131 @@
+//! A Utility Struct for Writing to a Vector in parallel without blocking reads.
+
+use std::{
+    mem,
+    ops::{Deref, Range},
+    sync::atomic::{AtomicUsize, Ordering},
+};
+
+use crate::{MutexReader, ReadOptimizedLock};
+
+/// A struct that wraps a vector and allows for parallel writes to it.
+///
+/// While the writes happen, reads to the vector can proceed without being
+/// blocked by writes (except during a vector resize). The final vector can be
+/// extracted using the `finish` method. Elements written to the vector behind a
+/// ParallelVecWriter will not be dropped unless `finish` is called.
+pub struct ParallelVecWriter<T> {
+    data: ReadOptimizedLock<Vec<T>>,
+    start_len: usize,
+    end_len: AtomicUsize,
+}
+
+impl<T> ParallelVecWriter<T> {
+    pub fn new(data: Vec<T>) -> Self {
+        let start_len = data.len();
+        let end_len = AtomicUsize::new(start_len);
+        Self {
+            data: ReadOptimizedLock::new(data),
+            start_len,
+            end_len,
+        }
+    }
+
+    /// Get read access to the portion of the vector that was present before the
+    /// ParallelVecWriter was created. Unlike the `with_` methods, callers
+    /// should be careful about keeping the object returned from this method
+    /// around for too long.
+    pub fn read_access(&self) -> impl Deref<Target = [T]> + '_ {
+        struct PrefixReader<'a, T> {
+            reader: MutexReader<'a, Vec<T>>,
+        }
+        impl<T> Deref for PrefixReader<'_, T> {
+            type Target = [T];
+
+            fn deref(&self) -> &[T] {
+                self.reader.as_slice()
+            }
+        }
+        PrefixReader {
+            reader: self.data.read(),
+        }
+    }
+
+    /// Runs `f` with access to the element at `idx`.
+    ///
+    /// # Panics
+    /// This method panics if `idx` is greater than or equal to the length of
+    /// the vector when the ParallelVecWriter was created.
+    pub fn with_index<R>(&self, idx: usize, f: impl FnOnce(&T) -> R) -> R {
+        assert!(
+            idx < self.start_len,
+            "index out of bounds {idx} vs. length {}",
+            self.start_len
+        );
+        // SAFETY: idx < self.start_len, which is less than the actual length of
+        // the vector.
+        unsafe { f(self.data.read().get_unchecked(idx)) }
+    }
+
+    /// Runs `f` with access to the slice of elements in the range `slice`.
+    ///
+    /// # Panics
+    /// This method panics if `slice.end` is greater than or equal to the length
+    /// of the vector when the ParallelVecWriter was created.
+    pub fn with_slice<R>(&self, slice: Range<usize>, f: impl FnOnce(&[T]) -> R) -> R {
+        assert!(
+            slice.end <= self.start_len,
+            "index out of bounds {} vs. length {}",
+            slice.end,
+            self.start_len
+        );
+        // SAFETY: slice.end <= self.start_len, which is less than the actual
+        // length of the vector.
+        f(&self.data.read()[slice])
+    }
+
+    /// Write the contents of `items` to a contiguous chunk of the vector,
+    /// returning the index of the first element in `items`.
+    pub fn write_contents(&self, items: impl ExactSizeIterator<Item = T>) -> usize {
+        let start = self.end_len.fetch_add(items.len(), Ordering::AcqRel);
+        let end = start + items.len();
+        let reader = self.data.read();
+        let current_len = reader.len();
+        let current_cap = reader.capacity();
+        mem::drop(reader);
+        if current_cap < end {
+            let mut writer = self.data.lock();
+            if writer.capacity() < end {
+                let new_cap = std::cmp::max(end, current_cap * 2);
+                writer.reserve(new_cap - current_len);
+            }
+        }
+        // SAFETY: the unsafe operations that `write_contents_at` performs are:
+        // * Writing to a shared buffer: this is safe because the `fetch_add` we
+        // perform gives us unique access to the subslice.
+        // * Writing past the length of the vector: this is safe because the
+        // above code pre-reseves sufficient capacity for `items` to write.
+        unsafe { self.write_contents_at(items, start) };
+        start
+    }
+
+    pub fn finish(self) -> Vec<T> {
+        let mut res = self.data.into_inner();
+        // SAFETY: this value is incremented past the original length of the
+        // vector once for each item written to it.
+        unsafe {
+            res.set_len(self.end_len.load(Ordering::Acquire));
+        }
+        res
+    }
+
+    unsafe fn write_contents_at(&self, items: impl ExactSizeIterator<Item = T>, start: usize) {
+        let reader = self.data.read();
+        debug_assert!(reader.capacity() >= start + items.len());
+        let mut mut_ptr = (reader.as_ptr() as *mut T).add(start);
+        for item in items {
+            std::ptr::write(mut_ptr, item);
+            mut_ptr = mut_ptr.offset(1);
+        }
+    }
+}

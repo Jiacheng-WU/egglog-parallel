@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{ConcurrentVec, Notification, ReadOptimizedLock};
+use crate::{ConcurrentVec, Notification, ParallelVecWriter, ReadOptimizedLock};
 
 #[test]
 fn notification_single_threaded() {
@@ -143,4 +143,34 @@ fn basic_parallel_vec_push() {
         results,
         (0..(N_THREADS * PER_THREAD)).collect::<Vec<usize>>()
     );
+}
+
+#[test]
+fn basic_parallel_vec_write() {
+    const N_THREADS: usize = 10;
+    const PER_THREAD: usize = 10;
+    let finish = Arc::new(Notification::new());
+    let v = (0..100).collect::<Vec<usize>>();
+    let v = Arc::new(ParallelVecWriter::new(v));
+    let threads: Vec<_> = (0..N_THREADS)
+        .map(|i| {
+            let finish = finish.clone();
+            let v = v.clone();
+            thread::spawn(move || {
+                let dst = v.write_contents((0..PER_THREAD).map(|j| i * PER_THREAD + j + 100));
+                assert!(dst % 10 == 0);
+                finish.wait();
+            })
+        })
+        .collect();
+    thread::sleep(Duration::from_millis(100));
+    for i in 0..100 {
+        v.with_index(i, |x| assert_eq!(*x, i));
+    }
+    v.with_slice(0..100, |x| assert_eq!(x, (0..100).collect::<Vec<usize>>()));
+    finish.notify();
+    threads.into_iter().for_each(|x| x.join().unwrap());
+    let mut v = Arc::try_unwrap(v).ok().unwrap().finish();
+    v.sort();
+    assert_eq!(v, (0..200).collect::<Vec<usize>>());
 }
