@@ -533,6 +533,7 @@ impl SortedWritesTable {
 
     fn do_insert(&mut self, exec_state: &mut ExecutionState) -> bool {
         let total = self.pending_state.total_rows.swap(0, Ordering::Relaxed);
+        self.data.data.reserve(total);
         if do_parallel(total) {
             if let Some(col) = self.sort_by {
                 self.parallel_insert(
@@ -684,25 +685,21 @@ impl SortedWritesTable {
             .mut_shards()
             .par_iter_mut()
             .enumerate()
-            .filter_map(|(shard_id, shard)| {
-                let shard_id = ShardId::from_usize(shard_id);
-                if self.pending_state.pending_rows[shard_id].is_empty() {
-                    return None;
-                }
-                Some((shard_id, shard))
-            })
             .map(|(shard_id, shard)| {
+                let shard_id = ShardId::from_usize(shard_id);
                 let mut checker = checker.clone();
                 let mut exec_state = exec_state.new_handle();
                 let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
                 let queue = &self.pending_state.pending_rows[shard_id];
                 let mut marked_stale = 0usize;
                 let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                let mut work_done = 0;
                 // Phase 1: process all incoming updates:
                 // * Add new values to `staged`
                 // * Removing entries in `shard` and mark them as stale in
                 // `data` if they will be overwritten.
                 while let Some(buf) = queue.pop() {
+                    work_done += buf.len();
                     // We create a read_handle once per batch to avoid blocking
                     // too many threads if someone needs to resize the row
                     // writer.
@@ -746,6 +743,13 @@ impl SortedWritesTable {
                                 });
                             }
                         }
+                    }
+                    if work_done > 20_000 {
+                        // In high-scale microbenchmarks we've noticed that rayon can get locked up
+                        // if any given chunk of work takes too long. We use this counter as a
+                        // signal yield work to other workers, which seems to help avoid this.
+                        rayon::yield_now();
+                        work_done = 0;
                     }
                 }
                 // Phase 2: Write the staged rows to the row writer. This only

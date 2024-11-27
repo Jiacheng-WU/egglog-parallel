@@ -79,6 +79,11 @@ impl RowBuffer {
         }
     }
 
+    /// Reserve space for `additional` rows.
+    pub(crate) fn reserve(&mut self, additional: usize) {
+        self.data.reserve(additional * self.n_columns);
+    }
+
     /// The size of the rows accepted by this buffer.
     pub(crate) fn arity(&self) -> usize {
         self.n_columns
