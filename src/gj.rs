@@ -5,9 +5,7 @@ use util::HashMap;
 
 use crate::{core::*, function::index::Offset, *};
 use std::{
-    fmt::{self, Debug},
-    ops::Range,
-    sync::RwLockReadGuard,
+    fmt::{self, Debug}, hash::{DefaultHasher, Hasher}, ops::Range, sync::RwLockReadGuard
 };
 
 type Query = crate::core::Query<ResolvedCall, Symbol>;
@@ -245,7 +243,7 @@ impl<'b> Context<'b> {
                             tries[*j] = old_trie;
                             Ok(())
                         },
-                        partition_size,
+                        1,
                     ),
                     [a, b] => {
                         let tries = get_tries(0);
@@ -632,16 +630,19 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
-        let total_threads = 1;
+        let total_threads = 8;
         let intersected_var_len =
             usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
+            // usize::max(1, vars.len());
 
         let partition_size = usize::max(
-            1,
+            2,
             (total_threads as f64)
                 .powf((intersected_var_len as f64).recip())
                 .round() as usize,
         );
+        dbg!(partition_size);
+        dbg!(intersected_var_len);
 
         let var_instrs = vars.iter().map(|(&v, info)| {
             let value_idx = query.vars.get_index_of(&v).unwrap_or_else(|| {
@@ -952,9 +953,6 @@ impl LazyTrie {
             LazyTrieInner::Delayed(..) => {
                 drop(read_lock);
 
-                // Try to acquire a write lock instead;
-                // There might be multiple concurrent write requests,
-                // so if we fail this means some winner thread has already forced it and no write is needed.
                 let mut write_lock = self.0.write().unwrap();
                 let this: &mut LazyTrieInner = &mut write_lock;
 
@@ -963,7 +961,7 @@ impl LazyTrie {
                         *this = access.make_trie_inner(idxs);
                     }
                     LazyTrieInner::Sparse(..) => {}
-                    LazyTrieInner::Borrowed { .. } => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                    LazyTrieInner::Borrowed { .. } => unreachable!(),
                 };
 
                 drop(write_lock);
@@ -986,7 +984,7 @@ impl LazyTrie {
                         *write_lock = LazyTrieInner::Sparse(map);
                     }
                     LazyTrieInner::Sparse(_) => {}
-                    LazyTrieInner::Delayed(..) => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                    LazyTrieInner::Delayed(..) => unreachable!(),
                 }
 
                 drop(write_lock);
@@ -1000,33 +998,45 @@ impl LazyTrie {
         let should_stop = SyncUnsafeCell::new(false);
 
         let LazyTrieInner::Sparse(m) = &lazy_trie as &LazyTrieInner else {
-            if matches!(&lazy_trie as &LazyTrieInner, LazyTrieInner::Delayed(..)) {
-                println!("Delayed");
-            }
-            if matches!(&lazy_trie as &LazyTrieInner, LazyTrieInner::Borrowed { .. }) {
-                println!("Borrowed");
-            }
             std::process::exit(-1);
         };
         let len = m.len();
         if len == 0 {
             return Ok(());
         }
-        let chunk = (len - 1) / partition_size + 1;
+
+        // let chunk = (len - 1) / partition_size + 1;
+        // (0..partition_size).into_par_iter().for_each(|p| {
+        //     let lo = p * chunk;
+        //     let hi = usize::min((p + 1) * chunk, len);
+        //     for i in lo..hi {
+        //         let (k, v) = m.get_index(i).unwrap();
+        //         if f(p, *k, v).is_err() {
+        //             unsafe {
+        //                 *should_stop.get() = true;
+        //             }
+        //             return;
+        //         }
+        //     }
+        // });
+
         (0..partition_size).into_par_iter().for_each(|p| {
-            let lo = p * chunk;
-            let hi = usize::min((p + 1) * chunk, len);
-            for i in lo..hi {
-                let (k, v) = m.get_index(i).unwrap();
-                if f(p, *k, v).is_err() {
-                    unsafe {
-                        *should_stop.get() = true;
+            for (k, v) in m.iter() {
+                // get the hash value of k
+                let mut hasher = DefaultHasher::new();
+                hasher.write_u64(k.bits);
+                let hash = (hasher.finish() as usize) % partition_size;
+                if hash == p {
+                    if f(p, *k, v).is_err() {
+                        *should_stop.get_mut() = true;
+                        return;
                     }
-                    return;
                 }
+
             }
         });
-        // drop(lazy_trie);
+
+
         if unsafe { *should_stop.get() } {
             Err(())
         } else {
@@ -1055,7 +1065,7 @@ impl LazyTrie {
                         *this = access.make_trie_inner(idxs);
                     }
                     LazyTrieInner::Sparse(..) => {}
-                    LazyTrieInner::Borrowed { .. } => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                    LazyTrieInner::Borrowed { .. } => unreachable!(),
                 };
 
                 drop(write_lock);
@@ -1063,7 +1073,7 @@ impl LazyTrie {
                 // Reacquire again
                 let this = self.0.read().unwrap();
                 let LazyTrieInner::Sparse(m) = &this as &LazyTrieInner else {
-                    {eprintln!("UNREACHABLE");std::process::exit(-1);};
+                    unreachable!();
                 };
                 
                 m.get(&value).map(|t| t as *const LazyTrie)
@@ -1093,7 +1103,7 @@ impl LazyTrie {
                         }
                     }
                     LazyTrieInner::Sparse(m) => m.get(&value).map(|t| t as *const LazyTrie),
-                    LazyTrieInner::Delayed(..) => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                    LazyTrieInner::Delayed(..) => unreachable!(),
                 }
                 
             }
@@ -1150,7 +1160,7 @@ impl<'a> TrieAccess<'a> {
                         // if let LazyTrieInner::Delayed(ref mut v) = e.get_mut().0.get_mut() {
                         //     v.push(i as RowIdx)
                         // } else {
-                        //     {eprintln!("UNREACHABLE");std::process::exit(-1);}
+                        //     unreachable!()
                         // }
                     }
                     HEntry::Vacant(e) => {
