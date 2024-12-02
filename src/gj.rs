@@ -735,7 +735,7 @@ impl EGraph {
         include_subsumed: bool,
         mut f: F,
     ) where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         let has_atoms = !cq.query.funcs().collect::<Vec<_>>().is_empty();
 
@@ -749,11 +749,18 @@ impl EGraph {
             }
 
             let do_seminaive = self.seminaive;
-            // for the later atoms, we consider everything
-            let mut timestamp_ranges =
-                vec![0..u32::MAX; cq.query.funcs().collect::<Vec<_>>().len()];
             if do_seminaive {
-                for (atom_i, _atom) in cq.query.funcs().enumerate() {
+                let tasks: Vec<_> = cq.query.funcs().enumerate().collect();
+                tasks.par_iter().for_each(|(atom_i, _atom)| {                    
+                    let atom_i = *atom_i;
+                    // for the later atoms, we consider everything
+                    let mut timestamp_ranges =
+                    vec![0..u32::MAX; cq.query.funcs().collect::<Vec<_>>().len()];
+
+                    for i in 0..atom_i {
+                        timestamp_ranges[i] = 0..timestamp;
+                    }
+
                     timestamp_ranges[atom_i] = timestamp..u32::MAX;
 
                     self.gj_for_atom(
@@ -761,13 +768,13 @@ impl EGraph {
                         &timestamp_ranges,
                         cq,
                         include_subsumed,
-                        &mut f,
+                        &f,
                     );
-                    // now we can fix this atom to be "old stuff" only
-                    // range is half-open; timestamp is excluded
-                    timestamp_ranges[atom_i] = 0..timestamp;
-                }
+                });
             } else {
+                let timestamp_ranges =
+                    vec![0..u32::MAX; cq.query.funcs().collect::<Vec<_>>().len()];
+
                 self.gj_for_atom(None, &timestamp_ranges, cq, include_subsumed, &mut f);
             }
         } else if let Some((mut ctx, program, _)) = Context::new(self, cq, &[], include_subsumed) {

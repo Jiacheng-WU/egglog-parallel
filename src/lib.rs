@@ -29,7 +29,6 @@ mod value;
 use crate::constraint::Problem;
 use crate::core::{AtomTerm, ResolvedCall};
 use crate::typechecking::TypeError;
-use rayon::prelude::*;
 use actions::Program;
 use ast::remove_globals::remove_globals;
 use ast::*;
@@ -42,6 +41,7 @@ use gj::*;
 use index::ColumnIndex;
 use indexmap::map::Entry;
 use instant::{Duration, Instant};
+use rayon::prelude::*;
 pub use serialize::{SerializeConfig, SerializedNode};
 use sort::*;
 use std::fmt::{Display, Formatter};
@@ -52,8 +52,11 @@ use std::iter::once;
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::{fmt::Debug, sync::Arc};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering::SeqCst;
+use std::sync::Mutex;
 use std::sync::RwLock;
+use std::{fmt::Debug, sync::Arc};
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::TypeInfo;
@@ -61,13 +64,11 @@ use unionfind::*;
 use util::*;
 pub use value::*;
 
-
-
 pub type ArcSort = Arc<dyn Sort>;
 
 pub type Subst = IndexMap<Symbol, Value>;
 
-pub trait PrimitiveLike : Send + Sync {
+pub trait PrimitiveLike: Send + Sync {
     fn name(&self) -> Symbol;
     /// Constructs a type constraint for the primitive that uses the span information
     /// for error localization.
@@ -912,28 +913,29 @@ impl EGraph {
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
                 let _ = copy_rules.par_iter().for_each(|(rule_name, rule)| {
-                    let mut all_matches = vec![];
+                    let mut all_matches = Mutex::new(vec![]);
                     let rule_search_start = Instant::now();
-                    let mut did_match = false;
+                    let mut did_match = AtomicBool::new(false);
                     let timestamp = self.rule_last_run_timestamp.get(rule_name).unwrap_or(&0);
                     self.run_query(&rule.query, *timestamp, false, |values| {
-                        did_match = true;
+                        did_match.store(true, SeqCst);
                         assert_eq!(values.len(), rule.query.vars.len());
-                        all_matches.extend_from_slice(values);
+                        all_matches.lock().unwrap().extend_from_slice(values);
                         Ok(())
                     });
                     let rule_search_time = rule_search_start.elapsed();
                     log::trace!(
                         "Searched for {rule_name} in {:.3}s ({} results)",
                         rule_search_time.as_secs_f64(),
-                        all_matches.len()
+                        all_matches.lock().unwrap().len()
                     );
-                    (*run_report_arc.write().unwrap()).add_rule_search_time(*rule_name, rule_search_time);
+                    (*run_report_arc.write().unwrap())
+                        .add_rule_search_time(*rule_name, rule_search_time);
                     (*search_results_arc.write().unwrap()).insert(
                         *rule_name,
                         SearchResult {
-                            all_matches,
-                            did_match,
+                            all_matches: all_matches.into_inner().unwrap(),
+                            did_match: did_match.load(SeqCst),
                         },
                     );
                 });
@@ -1165,13 +1167,13 @@ impl EGraph {
         let ordering = &query.get_vars();
         let query = self.compile_gj_query(query, ordering);
 
-        let mut matched = false;
+        let mut matched = AtomicBool::new(false);
         self.run_query(&query, 0, true, |values| {
             assert_eq!(values.len(), query.vars.len());
-            matched = true;
+            matched.store(true, SeqCst);
             Err(())
         });
-        if !matched {
+        if !matched.load(SeqCst) {
             Err(Error::CheckError(
                 facts.iter().map(|f| f.clone().make_unresolved()).collect(),
                 span.clone(),
@@ -1518,7 +1520,6 @@ impl EGraph {
         std::mem::take(&mut self.msgs)
     }
 }
-
 
 // Currently, only the following errors can thrown without location information:
 // * PrimitiveError

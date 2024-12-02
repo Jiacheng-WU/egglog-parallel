@@ -1,0 +1,5 @@
+one core main: 3.3s
+one core main without borrowed index: 10.5s
+32 core, inter-rule-only : 5s
+32 core, intra-rule+inter-rule, size based partition: 7.75s
+32 core, intra-rule+inter-rule, hash based partition: 6.7s
