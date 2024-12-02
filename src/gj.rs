@@ -5,9 +5,9 @@ use util::HashMap;
 
 use crate::{core::*, function::index::Offset, *};
 use std::{
-    cell::UnsafeCell,
     fmt::{self, Debug},
     ops::Range,
+    sync::RwLockReadGuard,
 };
 
 type Query = crate::core::Query<ResolvedCall, Symbol>;
@@ -19,6 +19,7 @@ enum Instr<'a> {
         variable_name: Symbol,
         info: VarInfo2,
         trie_accesses: Vec<(usize, TrieAccess<'a>)>,
+        partition_size: usize,
     },
     ConstrainConstant {
         index: usize,
@@ -40,26 +41,29 @@ struct VarInfo2 {
     size_guess: usize,
 }
 
+// TODO: removed InputSizes because it does not work well with concurrency
+#[derive(Clone)]
 struct InputSizes<'a> {
-    cur_stage: usize,
+    // cur_stage: usize,
     // a map from from stage to vector of costs for each stage,
     // where 'cost' is the largest relation being intersected
-    stage_sizes: &'a mut HashMap<usize, Vec<usize>>,
+    stage_sizes: &'a HashMap<usize, Vec<usize>>,
 }
 
 impl<'a> InputSizes<'a> {
-    fn add_measurement(&mut self, max_size: usize) {
-        self.stage_sizes
-            .entry(self.cur_stage)
-            .or_default()
-            .push(max_size);
+    fn add_measurement(&self, _max_size: usize) {
+        // self.stage_sizes
+        //     .entry(self.cur_stage)
+        //     .or_default()
+        //     .push(max_size);
     }
 
-    fn next(&mut self) -> InputSizes {
-        InputSizes {
-            cur_stage: self.cur_stage + 1,
-            stage_sizes: self.stage_sizes,
-        }
+    fn next(&self) -> InputSizes {
+        self.clone()
+        // InputSizes {
+        //     cur_stage: self.cur_stage + 1,
+        //     stage_sizes: self.stage_sizes,
+        // }
     }
 }
 
@@ -75,6 +79,7 @@ impl<'a> std::fmt::Display for Instr<'a> {
                 trie_accesses,
                 variable_name,
                 info,
+                partition_size: _,
             } => {
                 write!(
                     f,
@@ -110,10 +115,11 @@ impl<'a> std::fmt::Display for Program<'a> {
     }
 }
 
+#[derive(Clone)]
 struct Context<'b> {
     query: &'b CompiledQuery,
-    join_var_ordering: Vec<Symbol>,
-    tuple: Vec<Value>,
+    join_var_ordering: Arc<Vec<Symbol>>,
+    tuple: SyncUnsafeCell<Vec<Value>>,
     matches: usize,
     egraph: &'b EGraph,
 }
@@ -130,8 +136,8 @@ impl<'b> Context<'b> {
 
         let ctx = Context {
             query: cq,
-            tuple: vec![Value::fake(); cq.vars.len()],
-            join_var_ordering,
+            tuple: SyncUnsafeCell::new(vec![Value::fake(); cq.vars.len()]),
+            join_var_ordering: Arc::new(join_var_ordering),
             matches: 0,
             egraph,
         };
@@ -140,19 +146,19 @@ impl<'b> Context<'b> {
     }
 
     fn eval<F>(
-        &mut self,
+        &self,
         tries: &mut [&LazyTrie],
         program: &[Instr],
-        mut stage: InputSizes,
-        f: &mut F,
+        stage: InputSizes,
+        f: &F,
     ) -> Result
     where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         let (instr, program) = match program.split_first() {
             None => {
-                self.matches += 1;
-                return f(&self.tuple);
+                // self.matches += 1;
+                return f(self.tuple.get_ref());
             }
             Some(pair) => pair,
         };
@@ -163,19 +169,27 @@ impl<'b> Context<'b> {
                 val,
                 trie_access,
             } => {
-                if let Some(next) = tries[*index].get(trie_access, *val) {
-                    let old = tries[*index];
-                    tries[*index] = next;
-                    self.eval(tries, program, stage.next(), f)?;
-                    tries[*index] = old;
+                let tries = SyncUnsafeCell::new(tries);
+                unsafe {
+                    let trie = tries.get_mut()[*index].at(trie_access, *val);
+                    if let Some(next) = trie {
+                        let tries = tries.get_mut();
+                        let old = tries[*index];
+                        tries[*index] = &*(next as *const LazyTrie);
+                        self.eval(tries, program, stage.next(), f)?;
+                        tries[*index] = old;
+                    }
+                    Ok(())
                 }
-                Ok(())
             }
             Instr::Intersect {
                 value_idx,
                 trie_accesses,
+                partition_size,
                 ..
             } => {
+                let partition_size = *partition_size;
+
                 if let Some(x) = trie_accesses
                     .iter()
                     .map(|(atom, _)| tries[*atom].len())
@@ -184,56 +198,132 @@ impl<'b> Context<'b> {
                     stage.add_measurement(x);
                 }
 
+                let mut tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 4]> =
+                    SmallVec::with_capacity(partition_size);
+                for _i in 0..partition_size - 1 {
+                    tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
+                }
+                let tries_cell = SyncUnsafeCell::new(tries);
+
+                let get_tries = move |p| -> &mut [&LazyTrie] {
+                    if p == 0 {
+                        unsafe { *tries_cell.get() }
+                    } else {
+                        let t: &SyncUnsafeCell<_> = &tries_workspace[p - 1];
+                        let t: *mut Vec<_> = t.get();
+                        unsafe { &mut (*t)[..] }
+                    }
+                };
+
+                let mut ctx_workspace: SmallVec<[SyncUnsafeCell<Context>; 4]> =
+                    SmallVec::with_capacity(partition_size);
+                for _i in 0..partition_size - 1 {
+                    ctx_workspace.push(SyncUnsafeCell::new(self.clone()));
+                }
+                let this = SyncUnsafeCell::new(self);
+                let get_context = |p: usize| -> &Context {
+                    if p == 0 {
+                        this.get_ref()
+                    } else {
+                        ctx_workspace[p - 1].get_ref()
+                    }
+                };
+
                 match trie_accesses.as_slice() {
-                    [(j, access)] => tries[*j].for_each(access, |value, trie| {
-                        let old_trie = std::mem::replace(&mut tries[*j], trie);
-                        self.tuple[*value_idx] = value;
-                        self.eval(tries, program, stage.next(), f)?;
-                        tries[*j] = old_trie;
-                        Ok(())
-                    }),
+                    [(j, access)] => get_tries(0)[*j].for_each(
+                        access,
+                        |p, value, trie| {
+                            let tries = get_tries(p);
+                            let this = get_context(p);
+
+                            let old_trie = std::mem::replace(&mut tries[*j], unsafe {
+                                // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                &*(trie as *const LazyTrie)
+                            });
+                            this.tuple.get_mut()[*value_idx] = value;
+                            this.eval(tries, program, stage.next(), f)?;
+                            tries[*j] = old_trie;
+                            Ok(())
+                        },
+                        partition_size,
+                    ),
                     [a, b] => {
+                        let tries = get_tries(0);
                         let (a, b) = if tries[a.0].len() <= tries[b.0].len() {
                             (a, b)
                         } else {
                             (b, a)
                         };
-                        tries[a.0].for_each(&a.1, |value, ta| {
-                            if let Some(tb) = tries[b.0].get(&b.1, value) {
-                                let old_ta = std::mem::replace(&mut tries[a.0], ta);
-                                let old_tb = std::mem::replace(&mut tries[b.0], tb);
-                                self.tuple[*value_idx] = value;
-                                self.eval(tries, program, stage.next(), f)?;
-                                tries[a.0] = old_ta;
-                                tries[b.0] = old_tb;
-                            }
-                            Ok(())
-                        })
+                        tries[a.0].for_each(
+                            &a.1,
+                            |p, value, ta| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
+
+                                let trie = tries[b.0].at(&b.1, value);
+                                if let Some(tb) = trie {
+                                    let old_ta = std::mem::replace(&mut tries[a.0], unsafe {
+                                        // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                        &*(ta as *const LazyTrie)
+                                    });
+                                    let old_tb = std::mem::replace(&mut tries[b.0], unsafe {
+                                        &*(tb as *const LazyTrie)
+                                    });
+                                    this.tuple.get_mut()[*value_idx] = value;
+                                    this.eval(tries, program, stage.next(), f)?;
+                                    tries[a.0] = old_ta;
+                                    tries[b.0] = old_tb;
+                                }
+                                Ok(())
+                            },
+                            partition_size,
+                        )
                     }
                     _ => {
+                        let tries = get_tries(0);
                         let (j_min, access_min) = trie_accesses
                             .iter()
                             .min_by_key(|(j, _a)| tries[*j].len())
                             .unwrap();
 
-                        let mut new_tries = tries.to_vec();
+                        let mut new_tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 4]> =
+                            SmallVec::with_capacity(partition_size);
+                        for _i in 0..partition_size {
+                            new_tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
+                        }
+                        let get_new_tries = |p: usize| {
+                            let t: &SyncUnsafeCell<_> = &new_tries_workspace[p];
+                            unsafe { &mut (*t.get()) }
+                        };
+                        tries[*j_min].for_each(
+                            access_min,
+                            |p, value, min_trie| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
+                                let new_tries = SyncUnsafeCell::new(get_new_tries(p));
 
-                        tries[*j_min].for_each(access_min, |value, min_trie| {
-                            new_tries[*j_min] = min_trie;
-                            for (j, access) in trie_accesses {
-                                if j != j_min {
-                                    if let Some(t) = tries[*j].get(access, value) {
-                                        new_tries[*j] = t;
-                                    } else {
-                                        return Ok(());
-                                    }
-                                }
-                            }
+                                // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                let nt = new_tries.get_mut();
+                                nt[*j_min] = unsafe { &*(min_trie as *const LazyTrie) };
+                                for (j, access)  in trie_accesses
+                                    .iter()
+                                    .filter(|(j, _)| j != j_min) {
+                                        let trie = tries[*j].at(access, value);
+                                        if let Some(trie) = trie {
+                                            let new_tries = new_tries.get_mut();
+                                            new_tries[*j] =
+                                                unsafe { &*(trie as *const LazyTrie) };
+                                        } else {
+                                            return Ok(());
+                                        }
+                                    };
 
-                            // at this point, new_tries is ready to go
-                            self.tuple[*value_idx] = value;
-                            self.eval(&mut new_tries, program, stage.next(), f)
-                        })
+                                // at this point, new_tries is ready to go
+                                this.tuple.get_mut()[*value_idx] = value;
+                                this.eval(unsafe { *new_tries.get() }, program, stage.next(), f)
+                            },
+                            partition_size,
+                        )
                     }
                 }
             }
@@ -244,7 +334,7 @@ impl<'b> Context<'b> {
                     values.push(match arg {
                         AtomTerm::Var(_ann, v) => {
                             let i = self.query.vars.get_index_of(v).unwrap();
-                            self.tuple[i]
+                            self.tuple.get_ref()[i]
                         }
                         AtomTerm::Literal(_ann, lit) => self.egraph.eval_lit(lit),
                         AtomTerm::Global(_ann, _g) => panic!("Globals should have been desugared"),
@@ -260,13 +350,13 @@ impl<'b> Context<'b> {
                             let i = self.query.vars.get_index_of(v).unwrap();
 
                             if *check {
-                                assert_ne!(self.tuple[i], Value::fake());
-                                if self.tuple[i] != res {
+                                assert_ne!(self.tuple.get_ref()[i], Value::fake());
+                                if self.tuple.get_ref()[i] != res {
                                     return Ok(());
                                 }
                             }
 
-                            self.tuple[i] = res;
+                            self.tuple.get_mut()[i] = res;
                         }
                         AtomTerm::Literal(_ann, lit) => {
                             assert!(check);
@@ -542,6 +632,17 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
+        let total_threads = 1;
+        let intersected_var_len =
+            usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
+
+        let partition_size = usize::max(
+            1,
+            (total_threads as f64)
+                .powf((intersected_var_len as f64).recip())
+                .round() as usize,
+        );
+
         let var_instrs = vars.iter().map(|(&v, info)| {
             let value_idx = query.vars.get_index_of(&v).unwrap_or_else(|| {
                 panic!("variable {} not found in query", v);
@@ -550,6 +651,7 @@ impl EGraph {
                 value_idx,
                 variable_name: v,
                 info: info.clone(),
+                partition_size,
                 trie_accesses: info
                     .occurences
                     .iter()
@@ -664,7 +766,7 @@ impl EGraph {
         include_subsumed: bool,
         mut f: F,
     ) where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         // do the gj
         if let Some((mut ctx, program, cols)) =
@@ -680,7 +782,7 @@ impl EGraph {
             log::debug!(
                 "Query:\n{q}\n{atom_info}\nTuple: {tuple}\nJoin order: {order}\nProgram\n{program}",
                 q = cq.query,
-                order = ListDisplay(&ctx.join_var_ordering, " "),
+                order = ListDisplay(ctx.join_var_ordering.iter(), " "),
                 tuple = ListDisplay(cq.vars.keys(), " "),
             );
             let mut tries = Vec::with_capacity(cq.query.funcs().collect::<Vec<_>>().len());
@@ -690,22 +792,22 @@ impl EGraph {
                 .zip(timestamp_ranges.iter())
                 .zip(cols.iter())
             {
-                // tries.push(LazyTrie::default());
-                if let Some(target) = col {
-                    if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
-                        tries.push(LazyTrie::from_column_index(col))
-                    } else {
-                        tries.push(LazyTrie::default());
-                    }
-                } else {
-                    tries.push(LazyTrie::default());
-                }
+                tries.push(LazyTrie::default());
+                // if let Some(target) = col {
+                //     if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
+                //         tries.push(LazyTrie::from_column_index(col))
+                //     } else {
+                //         tries.push(LazyTrie::default());
+                //     }
+                // } else {
+                //     tries.push(LazyTrie::default());
+                // }
             }
             let mut trie_refs = tries.iter().collect::<Vec<_>>();
             let mut meausrements = HashMap::<usize, Vec<usize>>::default();
             let stages = InputSizes {
                 stage_sizes: &mut meausrements,
-                cur_stage: 0,
+                // cur_stage: 0,
             };
             ctx.eval(&mut trie_refs, &program.0, stages, &mut f)
                 .unwrap_or(());
@@ -735,7 +837,7 @@ impl EGraph {
         include_subsumed: bool,
         mut f: F,
     ) where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         let has_atoms = !cq.query.funcs().collect::<Vec<_>>().is_empty();
 
@@ -756,45 +858,47 @@ impl EGraph {
                 for (atom_i, _atom) in cq.query.funcs().enumerate() {
                     timestamp_ranges[atom_i] = timestamp..u32::MAX;
 
-                    self.gj_for_atom(
-                        Some(atom_i),
-                        &timestamp_ranges,
-                        cq,
-                        include_subsumed,
-                        &mut f,
-                    );
+                    self.gj_for_atom(Some(atom_i), &timestamp_ranges, cq, include_subsumed, &f);
                     // now we can fix this atom to be "old stuff" only
                     // range is half-open; timestamp is excluded
                     timestamp_ranges[atom_i] = 0..timestamp;
                 }
             } else {
-                self.gj_for_atom(None, &timestamp_ranges, cq, include_subsumed, &mut f);
+                self.gj_for_atom(None, &timestamp_ranges, cq, include_subsumed, f);
             }
         } else if let Some((mut ctx, program, _)) = Context::new(self, cq, &[], include_subsumed) {
             let mut meausrements = HashMap::<usize, Vec<usize>>::default();
             let stages = InputSizes {
                 stage_sizes: &mut meausrements,
-                cur_stage: 0,
+                // cur_stage: 0,
             };
             let tries = LazyTrie::make_initial_vec(cq.query.funcs().collect::<Vec<_>>().len()); // TODO: bad use of collect here
             let mut trie_refs = tries.iter().collect::<Vec<_>>();
-            ctx.eval(&mut trie_refs, &program.0, stages, &mut f)
+            ctx.eval(&mut trie_refs, &program.0, stages, &f)
                 .unwrap_or(());
         }
     }
 }
 
-struct LazyTrie(UnsafeCell<LazyTrieInner>);
+struct LazyTrie(RwLock<LazyTrieInner>);
+
+impl Clone for LazyTrie {
+    fn clone(&self) -> Self {
+        Self(RwLock::new(self.0.read().unwrap().clone()))
+    }
+}
+
+unsafe impl Sync for LazyTrie {}
 
 impl Debug for LazyTrie {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Debug::fmt(unsafe { &*self.0.get() }, f)
+        Debug::fmt(&self.0.read().unwrap(), f)
     }
 }
 
 type RowIdx = u32;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum LazyTrieInner {
     Borrowed {
         index: Arc<ColumnIndex>,
@@ -806,7 +910,7 @@ enum LazyTrieInner {
 
 impl Default for LazyTrie {
     fn default() -> Self {
-        LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(Default::default())))
+        LazyTrie(RwLock::new(LazyTrieInner::Delayed(Default::default())))
     }
 }
 
@@ -816,14 +920,14 @@ impl LazyTrie {
     }
 
     fn len(&self) -> usize {
-        match unsafe { &*self.0.get() } {
+        match &self.0.read().unwrap() as &LazyTrieInner {
             LazyTrieInner::Delayed(v) => v.len(),
             LazyTrieInner::Sparse(m) => m.len(),
             LazyTrieInner::Borrowed { index, .. } => index.len(),
         }
     }
     fn from_column_index(index: Arc<ColumnIndex>) -> LazyTrie {
-        LazyTrie(UnsafeCell::new(LazyTrieInner::Borrowed {
+        LazyTrie(RwLock::new(LazyTrieInner::Borrowed {
             index,
             map: Default::default(),
         }))
@@ -834,67 +938,168 @@ impl LazyTrie {
             return None;
         }
 
-        Some(LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(data))))
+        Some(LazyTrie(RwLock::new(LazyTrieInner::Delayed(data))))
     }
 
-    unsafe fn force_mut(&self, access: &TrieAccess) -> *mut LazyTrieInner {
-        let this = &mut *self.0.get();
-        if let LazyTrieInner::Delayed(idxs) = this {
-            *this = access.make_trie_inner(idxs);
-        }
-        self.0.get()
-    }
-
-    fn force_borrowed(&self, access: &TrieAccess) -> &LazyTrieInner {
-        let this = unsafe { &mut *self.0.get() };
-        match this {
-            LazyTrieInner::Borrowed { index, .. } => {
-                let mut map = HashMap::with_capacity_and_hasher(index.len(), Default::default());
-                map.extend(index.iter().filter_map(|(v, ixs)| {
-                    LazyTrie::from_indexes(access.filter_live(ixs)).map(|trie| (v, trie))
-                }));
-                *this = LazyTrieInner::Sparse(map);
-            }
-            LazyTrieInner::Delayed(idxs) => {
-                *this = access.make_trie_inner(idxs);
-            }
-            LazyTrieInner::Sparse(_) => {}
-        }
-        unsafe { &*self.0.get() }
-    }
-
-    fn for_each<'a>(
-        &'a self,
+    fn for_each(
+        &self,
         access: &TrieAccess,
-        mut f: impl FnMut(Value, &'a LazyTrie) -> Result,
+        f: impl Fn(usize, Value, &LazyTrie) -> Result + Send + Sync,
+        partition_size: usize,
     ) -> Result {
+        let read_lock = self.0.read().unwrap();
+        let lazy_trie = match &read_lock as &LazyTrieInner {
+            LazyTrieInner::Delayed(..) => {
+                drop(read_lock);
+
+                // Try to acquire a write lock instead;
+                // There might be multiple concurrent write requests,
+                // so if we fail this means some winner thread has already forced it and no write is needed.
+                let mut write_lock = self.0.write().unwrap();
+                let this: &mut LazyTrieInner = &mut write_lock;
+
+                match this {
+                    LazyTrieInner::Delayed(idxs) => {
+                        *this = access.make_trie_inner(idxs);
+                    }
+                    LazyTrieInner::Sparse(..) => {}
+                    LazyTrieInner::Borrowed { .. } => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                };
+
+                drop(write_lock);
+
+                // Reacquire again
+                self.0.read().unwrap()
+            }
+            LazyTrieInner::Borrowed { .. } => {
+                drop(read_lock);
+
+                // Try to acquire a write lock instead
+                let mut write_lock = self.0.write().unwrap();
+                match &mut write_lock as &mut LazyTrieInner {
+                    LazyTrieInner::Borrowed { index, map: _ } => {
+                        let mut map =
+                            HashMap::with_capacity_and_hasher(index.len(), Default::default());
+                        map.extend(index.iter().filter_map(|(v, ixs)| {
+                            LazyTrie::from_indexes(access.filter_live(ixs)).map(|trie| (v, trie))
+                        }));
+                        *write_lock = LazyTrieInner::Sparse(map);
+                    }
+                    LazyTrieInner::Sparse(_) => {}
+                    LazyTrieInner::Delayed(..) => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                }
+
+                drop(write_lock);
+                self.0.read().unwrap()
+            }
+            LazyTrieInner::Sparse(..) => read_lock,
+        };
+
         // There is probably something cleaner to do here compared with the
         // `force_borrowed` construct.
-        match self.force_borrowed(access) {
-            LazyTrieInner::Sparse(m) => {
-                for (k, v) in m {
-                    f(*k, v)?;
-                }
-                Ok(())
+        let should_stop = SyncUnsafeCell::new(false);
+
+        let LazyTrieInner::Sparse(m) = &lazy_trie as &LazyTrieInner else {
+            if matches!(&lazy_trie as &LazyTrieInner, LazyTrieInner::Delayed(..)) {
+                println!("Delayed");
             }
-            LazyTrieInner::Borrowed { .. } | LazyTrieInner::Delayed(_) => unreachable!(),
+            if matches!(&lazy_trie as &LazyTrieInner, LazyTrieInner::Borrowed { .. }) {
+                println!("Borrowed");
+            }
+            std::process::exit(-1);
+        };
+        let len = m.len();
+        if len == 0 {
+            return Ok(());
+        }
+        let chunk = (len - 1) / partition_size + 1;
+        (0..partition_size).into_par_iter().for_each(|p| {
+            let lo = p * chunk;
+            let hi = usize::min((p + 1) * chunk, len);
+            for i in lo..hi {
+                let (k, v) = m.get_index(i).unwrap();
+                if f(p, *k, v).is_err() {
+                    unsafe {
+                        *should_stop.get() = true;
+                    }
+                    return;
+                }
+            }
+        });
+        // drop(lazy_trie);
+        if unsafe { *should_stop.get() } {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
-    fn get(&self, access: &TrieAccess, value: Value) -> Option<&LazyTrie> {
-        match unsafe { &mut *self.force_mut(access) } {
-            LazyTrieInner::Sparse(m) => m.get(&value),
-            LazyTrieInner::Borrowed { index, map } => {
-                let ixs = index.get(&value)?;
-                match map.entry(value) {
-                    HEntry::Occupied(o) => Some(o.into_mut()),
-                    HEntry::Vacant(v) => {
-                        Some(v.insert(LazyTrie::from_indexes(access.filter_live(ixs))?))
+    fn at<'a>(
+        &self,
+        access: &TrieAccess,
+        value: Value,
+    ) -> Option<*const LazyTrie> {
+        let this = self.0.read().unwrap();
+        let trie = match &this as &LazyTrieInner {
+            LazyTrieInner::Delayed(..) => {
+                drop(this);
+
+                // Try to acquire a write lock instead;
+                // There might be multiple concurrent write requests,
+                // so if we fail this means some winner thread has already forced it and no write is needed.
+                let mut write_lock = self.0.write().unwrap();
+                let this: &mut LazyTrieInner = &mut write_lock;
+
+                match this {
+                    LazyTrieInner::Delayed(idxs) => {
+                        *this = access.make_trie_inner(idxs);
                     }
-                }
+                    LazyTrieInner::Sparse(..) => {}
+                    LazyTrieInner::Borrowed { .. } => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                };
+
+                drop(write_lock);
+
+                // Reacquire again
+                let this = self.0.read().unwrap();
+                let LazyTrieInner::Sparse(m) = &this as &LazyTrieInner else {
+                    {eprintln!("UNREACHABLE");std::process::exit(-1);};
+                };
+                
+                m.get(&value).map(|t| t as *const LazyTrie)
             }
-            LazyTrieInner::Delayed(_) => unreachable!(),
-        }
+
+            LazyTrieInner::Sparse(m) => m.get(&value).map(|t| t as *const LazyTrie),
+            LazyTrieInner::Borrowed { .. } => {
+                drop(this);
+
+                let mut this = self.0.write().unwrap();
+                match &mut this as &mut LazyTrieInner  {
+                    LazyTrieInner::Borrowed { index, map } => {
+                        match map.entry(value) {
+                            HEntry::Occupied(o) => Some(o.get()).map(|t| t as *const LazyTrie),
+                            HEntry::Vacant(v) => match index.get(&value) {
+                                Some(ixs) => match LazyTrie::from_indexes(access.filter_live(ixs)) {
+                                    Some(lazy_trie) => {
+                                        // It's fine to forget about lifetime here,
+                                        // because this entry, once forced, will never be changed
+                                        // (i.e., there won't be another instantiation that is used in this entry)
+                                        Some(v.insert(lazy_trie)).map(|t| t as *const LazyTrie)
+                                    },
+                                    None => return None,
+                                },
+                                None => return None,
+                            },
+                        }
+                    }
+                    LazyTrieInner::Sparse(m) => m.get(&value).map(|t| t as *const LazyTrie),
+                    LazyTrieInner::Delayed(..) => {eprintln!("UNREACHABLE");std::process::exit(-1);},
+                }
+                
+            }
+        };
+        trie
+        // trie.map(|t| unsafe { &*(t as *const LazyTrie) })
     }
 }
 
@@ -934,23 +1139,22 @@ impl<'a> TrieAccess<'a> {
     #[cold]
     fn make_trie_inner(&self, idxs: &[RowIdx]) -> LazyTrieInner {
         let arity = self.function.schema.input.len();
-        let mut map: HashMap<Value, LazyTrie> = HashMap::default();
+        let mut map: HashMap<Value, SmallVec<[RowIdx; 4]>> = HashMap::default();
         let mut insert = |i: usize, tup: &[Value], out: &TupleOutput, val: Value| {
             if self.timestamp_range.contains(&out.timestamp)
                 && self.constraints.iter().all(|c| c.check(tup, out))
             {
                 match map.entry(val) {
                     HEntry::Occupied(mut e) => {
-                        if let LazyTrieInner::Delayed(ref mut v) = e.get_mut().0.get_mut() {
-                            v.push(i as RowIdx)
-                        } else {
-                            unreachable!()
-                        }
+                        e.get_mut().push(i as RowIdx)
+                        // if let LazyTrieInner::Delayed(ref mut v) = e.get_mut().0.get_mut() {
+                        //     v.push(i as RowIdx)
+                        // } else {
+                        //     {eprintln!("UNREACHABLE");std::process::exit(-1);}
+                        // }
                     }
                     HEntry::Vacant(e) => {
-                        e.insert(LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(
-                            smallvec::smallvec![i as RowIdx,],
-                        ))));
+                        e.insert(smallvec::smallvec![i as RowIdx]);
                     }
                 }
             }
@@ -959,7 +1163,7 @@ impl<'a> TrieAccess<'a> {
         if idxs.is_empty() {
             let rows = self
                 .function
-                .iter_timestamp_range(&self.timestamp_range, true);
+                .iter_timestamp_range(&self.timestamp_range, self.include_subsumed);
             if self.column < arity {
                 for (i, tup, out) in rows {
                     insert(i, tup, out, tup[self.column])
@@ -999,6 +1203,10 @@ impl<'a> TrieAccess<'a> {
         //     }
         // }
 
+        let map: HashMap<Value, LazyTrie> = map
+            .into_iter()
+            .map(|(k, v)| (k, LazyTrie(RwLock::new(LazyTrieInner::Delayed(v)))))
+            .collect();
         LazyTrieInner::Sparse(map)
     }
 }

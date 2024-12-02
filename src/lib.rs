@@ -52,8 +52,9 @@ use std::iter::once;
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::AtomicBool;
 use std::{fmt::Debug, sync::Arc};
-use std::sync::RwLock;
+use std::sync::{Mutex, RwLock};
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::TypeInfo;
@@ -912,17 +913,18 @@ impl EGraph {
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
                 let _ = copy_rules.par_iter().for_each(|(rule_name, rule)| {
-                    let mut all_matches = vec![];
+                    let all_matches = Mutex::new(vec![]);
                     let rule_search_start = Instant::now();
-                    let mut did_match = false;
+                    let did_match = AtomicBool::new(false);
                     let timestamp = self.rule_last_run_timestamp.get(rule_name).unwrap_or(&0);
                     self.run_query(&rule.query, *timestamp, false, |values| {
-                        did_match = true;
+                        did_match.store(true, std::sync::atomic::Ordering::SeqCst);
                         assert_eq!(values.len(), rule.query.vars.len());
-                        all_matches.extend_from_slice(values);
+                        all_matches.lock().unwrap().extend_from_slice(values);
                         Ok(())
                     });
                     let rule_search_time = rule_search_start.elapsed();
+                    let all_matches: Vec<_> = std::mem::take(all_matches.lock().unwrap().as_mut());
                     log::trace!(
                         "Searched for {rule_name} in {:.3}s ({} results)",
                         rule_search_time.as_secs_f64(),
@@ -933,7 +935,7 @@ impl EGraph {
                         *rule_name,
                         SearchResult {
                             all_matches,
-                            did_match,
+                            did_match: did_match.load(std::sync::atomic::Ordering::SeqCst),
                         },
                     );
                 });
@@ -1165,13 +1167,15 @@ impl EGraph {
         let ordering = &query.get_vars();
         let query = self.compile_gj_query(query, ordering);
 
-        let mut matched = false;
+        // TODO: switch back to SyncUnsafeCell
+        // let matched = SyncUnsafeCell::new(false);
+        let matched = AtomicBool::new(false);
         self.run_query(&query, 0, true, |values| {
             assert_eq!(values.len(), query.vars.len());
-            matched = true;
+            matched.store(true, std::sync::atomic::Ordering::SeqCst);
             Err(())
         });
-        if !matched {
+        if !matched.load(std::sync::atomic::Ordering::SeqCst) {
             Err(Error::CheckError(
                 facts.iter().map(|f| f.clone().make_unresolved()).collect(),
                 span.clone(),
