@@ -13,7 +13,7 @@ use crate::{
     pool::{with_pool_set, PoolSet, Pooled},
     primitives::PrimitiveFunctionId,
     table_spec::{ColumnId, MutationBuffer},
-    ExternalFunctionId, Primitives, WrappedTable,
+    ExternalFunctionId, Primitives, Table, WrappedTable,
 };
 
 use self::mask::{Mask, MaskIter, ValueSource};
@@ -169,6 +169,23 @@ impl<T: TableInfoMap> ExecutionState<'_, T> {
         self.buffers
             .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
             .stage_remove(vals);
+    }
+
+    pub fn inc_counter(&self, ctr: CounterId) -> usize {
+        self.db.inc_counter(ctr)
+    }
+
+    /// Get an immutable reference to the table with id `table`, at the specified type.
+    ///
+    /// # Panics
+    /// This method will panic if the dynamic type of the table does not match the given type.
+    pub fn get_table_as<TABLE: Table>(&self, table: TableId) -> &TABLE {
+        self.db
+            .table_info
+            .get_table(table)
+            .as_any()
+            .downcast_ref::<TABLE>()
+            .unwrap()
     }
 
     /// Get the _current_ value for a given key in `table`, or otherwise insert

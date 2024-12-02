@@ -272,8 +272,12 @@ impl Table for DisplacedTable {
 
     fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
         assert_eq!(key.len(), 1, "attempt to lookup a row with the wrong key");
-        let row_id = *self.lookup_table.get(&key[0])?;
-        Some(self.expand(row_id)[col.index()])
+        if col == ColumnId::new(1) {
+            Some(self.uf.find(key[0]))
+        } else {
+            let row_id = *self.lookup_table.get(&key[0])?;
+            Some(self.expand(row_id)[col.index()])
+        }
     }
 
     fn new_buffer(&self) -> Box<dyn MutationBuffer> {
@@ -294,6 +298,9 @@ impl Table for DisplacedTable {
 }
 
 impl DisplacedTable {
+    pub fn underlying_uf(&self) -> &UnionFind {
+        &self.uf
+    }
     fn expand(&self, row: RowId) -> [Value; 3] {
         let (child, ts) = self.displaced[row.index()];
         [child, self.uf.find(child), ts]

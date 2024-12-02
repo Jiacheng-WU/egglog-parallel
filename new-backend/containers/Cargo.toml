@@ -1,0 +1,13 @@
+[package]
+name = "containers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+core-relations = {path = "../core-relations"}
+numeric-id = {path = "../numeric-id"}
+dashmap = "6.1.0"
+hashbrown = "0.15"
+indexmap = "2.6.0"
+rustc-hash = "2.0"
+
