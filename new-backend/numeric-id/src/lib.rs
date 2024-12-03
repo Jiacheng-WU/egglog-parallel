@@ -220,7 +220,6 @@ impl<K: NumericId, V: Default> DenseIdMap<K, V> {
     }
 }
 
-#[cfg(not(feature = "debug-val-trace"))]
 mod context {
     #[derive(Copy, Clone, Debug)]
     pub struct ContextHandle;
@@ -234,69 +233,6 @@ mod context {
         pub const fn empty() -> ContextHandle {
             ContextHandle
         }
-    }
-}
-
-#[cfg(feature = "debug-val-trace")]
-mod context {
-    use std::{backtrace::Backtrace, fmt, sync::Mutex};
-
-    use lazy_static::lazy_static;
-    use std::collections::HashMap;
-
-    #[derive(Copy, Clone, PartialEq, Eq, Hash)]
-    pub struct ContextHandle(usize);
-
-    impl ContextHandle {
-        pub fn new(message: impl Into<String>) -> ContextHandle {
-            let mut map = CONTEXT_MAP.contents.lock().unwrap();
-            let handle = ContextHandle(map.len());
-            map.insert(handle, Context::new(message));
-            handle
-        }
-        pub const fn empty() -> ContextHandle {
-            ContextHandle(!0)
-        }
-    }
-
-    impl fmt::Debug for ContextHandle {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            let map = CONTEXT_MAP.contents.lock().unwrap();
-            write!(f, "{:?}", map.get(self).unwrap())
-        }
-    }
-
-    pub(crate) struct Context {
-        pub(crate) backtrace: Backtrace,
-        pub(crate) extra: String,
-    }
-
-    impl Context {
-        pub(crate) fn new(message: impl Into<String>) -> Context {
-            Context {
-                extra: message.into(),
-                backtrace: Backtrace::force_capture(),
-            }
-        }
-    }
-
-    impl fmt::Debug for Context {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            if self.extra.is_empty() {
-                write!(f, "{}", self.backtrace)
-            } else {
-                write!(f, "{}:\n{}", self.extra, self.backtrace)
-            }
-        }
-    }
-
-    #[derive(Default)]
-    pub(crate) struct ContextMap {
-        contents: Mutex<HashMap<ContextHandle, Context>>,
-    }
-
-    lazy_static! {
-        pub(crate) static ref CONTEXT_MAP: ContextMap = ContextMap::default();
     }
 }
 
@@ -410,14 +346,7 @@ macro_rules! define_id {
 
         impl std::fmt::Debug for $name {
             fn fmt(&self, fmt: &mut std::fmt::Formatter) -> std::fmt::Result {
-                #[cfg(not(feature = "debug-val-trace"))]
-                {
-                    write!(fmt, "{}({:?})", stringify!($name), self.rep)
-                }
-                #[cfg(feature = "debug-val-trace")]
-                {
-                    write!(fmt, "{}({:?}){{\n{:?}\n}}", stringify!($name), self.rep, self.context)
-                }
+                write!(fmt, "{}({:?})", stringify!($name), self.rep)
             }
         }
     };

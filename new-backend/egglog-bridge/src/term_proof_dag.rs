@@ -150,7 +150,7 @@ impl Printer {
     /// The second value in the tuple is `true` if a new id was created.
     fn get_id<T>(&mut self, node: &T) -> (usize, bool) {
         let len = self.ids.len();
-        match self.ids.entry(node as *const T as usize) {
+        match self.ids.entry(node as *const T as *const () as usize) {
             Entry::Occupied(o) => (*o.get(), false),
             Entry::Vacant(v) => (*v.insert(len), true),
         }
@@ -418,7 +418,7 @@ impl TermEnv {
     }
 
     fn finish_check<T>(&mut self, elt: &T) {
-        let num = elt as *const T as usize;
+        let num = elt as *const T as *const () as usize;
         self.check_cache.insert(num, CacheState::Checked);
     }
 }

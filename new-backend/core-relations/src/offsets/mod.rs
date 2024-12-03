@@ -64,7 +64,7 @@ impl SortedOffsetVector {
     }
 
     pub(crate) fn push(&mut self, offset: RowId) {
-        assert!(self.0.last().map_or(true, |last| last <= &offset));
+        assert!(self.0.last().is_none_or(|last| last <= &offset));
         // SAFETY: we just checked the invariant
         unsafe { self.push_unchecked(offset) }
     }
