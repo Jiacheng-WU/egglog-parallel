@@ -20,7 +20,7 @@ pub(crate) trait Offsets {
     // A half-open range enclosing the offsets in this sequence.
     fn bounds(&self) -> Option<(RowId, RowId)>;
     fn is_empty(&self) -> bool {
-        self.bounds().map_or(true, |(lo, hi)| lo == hi)
+        self.bounds().is_none_or(|(lo, hi)| lo == hi)
     }
     fn offsets(&self, f: impl FnMut(RowId));
 }
