@@ -29,7 +29,6 @@ mod value;
 use crate::constraint::Problem;
 use crate::core::{AtomTerm, ResolvedCall};
 use crate::typechecking::TypeError;
-use rayon::prelude::*;
 use actions::Program;
 use ast::remove_globals::remove_globals;
 use ast::*;
@@ -42,6 +41,7 @@ use gj::*;
 use index::ColumnIndex;
 use indexmap::map::Entry;
 use instant::{Duration, Instant};
+use rayon::{current_num_threads, prelude::*};
 pub use serialize::{SerializeConfig, SerializedNode};
 use sort::*;
 use std::fmt::{Display, Formatter};
@@ -52,9 +52,9 @@ use std::iter::once;
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::sync::atomic::AtomicBool;
-use std::{fmt::Debug, sync::Arc};
+use std::sync::atomic::{AtomicBool, AtomicU16};
 use std::sync::{Mutex, RwLock};
+use std::{fmt::Debug, sync::Arc};
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::TypeInfo;
@@ -62,13 +62,11 @@ use unionfind::*;
 use util::*;
 pub use value::*;
 
-
-
 pub type ArcSort = Arc<dyn Sort>;
 
 pub type Subst = IndexMap<Symbol, Value>;
 
-pub trait PrimitiveLike : Send + Sync {
+pub trait PrimitiveLike: Send + Sync {
     fn name(&self) -> Symbol;
     /// Constructs a type constraint for the primitive that uses the span information
     /// for error localization.
@@ -913,24 +911,41 @@ impl EGraph {
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
                 let _ = copy_rules.par_iter().for_each(|(rule_name, rule)| {
-                    let all_matches = Mutex::new(vec![]);
+                    let mut all_matches = Vec::with_capacity(32);
+                    for i in 0..32 {
+                        all_matches.push(Mutex::new(vec![]))
+                    }
+                    let mut counter = SyncUnsafeCell::new(0usize);
                     let rule_search_start = Instant::now();
                     let did_match = AtomicBool::new(false);
                     let timestamp = self.rule_last_run_timestamp.get(rule_name).unwrap_or(&0);
                     self.run_query(&rule.query, *timestamp, false, |values| {
+                        // println!("{}", current_num_threads());
                         did_match.store(true, std::sync::atomic::Ordering::SeqCst);
                         assert_eq!(values.len(), rule.query.vars.len());
-                        all_matches.lock().unwrap().extend_from_slice(values);
+
+                        all_matches[counter.get_ref() % 32]
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(values);
+
+                        *counter.get_mut() += 1;
                         Ok(())
                     });
                     let rule_search_time = rule_search_start.elapsed();
-                    let all_matches: Vec<_> = std::mem::take(all_matches.lock().unwrap().as_mut());
+                    let all_matches: Vec<_> = all_matches
+                        .into_iter()
+                        .flat_map(|all_matches| {
+                            std::mem::take::<Vec<_>>(all_matches.lock().unwrap().as_mut()).into_iter()
+                        })
+                        .collect();
                     log::trace!(
                         "Searched for {rule_name} in {:.3}s ({} results)",
                         rule_search_time.as_secs_f64(),
                         all_matches.len()
                     );
-                    (*run_report_arc.write().unwrap()).add_rule_search_time(*rule_name, rule_search_time);
+                    (*run_report_arc.write().unwrap())
+                        .add_rule_search_time(*rule_name, rule_search_time);
                     (*search_results_arc.write().unwrap()).insert(
                         *rule_name,
                         SearchResult {
@@ -1522,7 +1537,6 @@ impl EGraph {
         std::mem::take(&mut self.msgs)
     }
 }
-
 
 // Currently, only the following errors can thrown without location information:
 // * PrimitiveError
