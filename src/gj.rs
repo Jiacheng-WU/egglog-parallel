@@ -690,16 +690,16 @@ impl EGraph {
                 .zip(timestamp_ranges.iter())
                 .zip(cols.iter())
             {
-                // tries.push(LazyTrie::default());
-                if let Some(target) = col {
-                    if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
-                        tries.push(LazyTrie::from_column_index(col))
-                    } else {
-                        tries.push(LazyTrie::default());
-                    }
-                } else {
-                    tries.push(LazyTrie::default());
-                }
+                tries.push(LazyTrie::default());
+                // if let Some(target) = col {
+                //     if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
+                //         tries.push(LazyTrie::from_column_index(col))
+                //     } else {
+                //         tries.push(LazyTrie::default());
+                //     }
+                // } else {
+                //     tries.push(LazyTrie::default());
+                // }
             }
             let mut trie_refs = tries.iter().collect::<Vec<_>>();
             let mut meausrements = HashMap::<usize, Vec<usize>>::default();
