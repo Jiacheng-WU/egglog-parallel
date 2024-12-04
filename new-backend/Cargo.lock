@@ -164,6 +164,8 @@ dependencies = [
  "hashbrown 0.15.1",
  "indexmap",
  "numeric-id",
+ "rand",
+ "rayon",
  "rustc-hash",
 ]
 

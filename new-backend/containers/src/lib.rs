@@ -49,14 +49,25 @@ pub trait Container: Hash + Eq + Send + Sync {
 }
 
 // TODOs:
-//  * Rename IdGenerator_ to EGraphHandle
-//  * Rename IdGenerator to UnionFindView
-//  * Implement UnionFindView for either DisplacedTable or DisplacedTableWithProvenance
-//  * Hashmap => Dashmap [probably]
-//  * We still don't have the e2e flow mapped out but we're getting closer.
-//    - External func should have all but state, then get state added.
-//    - Maybe needs to take `state` as an arg to all methods.
-//    - ... remember, everything needs to end up in the external func and the table evenetually.
+// * Hashmap => Dashmap, immutable methods everywhere for container_env
+// * Wrap container_env in a struct containing non-state portions of IdGenerator_ Call that ContainerTable
+// * Implement IdGenerator for DisplacedTable and DisplacedTableWithProvenance. Use that to implement merge.
+// * Now to box primitives:
+//   - We want a function that takes a &mut Database, + the contents of
+//   IdGenerator then returns (TableId , Map<String, ExternalFunctionId>)
+// * Timestamps:
+//   - Wrapper should record the "next timestamp it expects", starting at 0.
+//   - Can read since timestamp column in displaced table. Pick the biggest one
+//   you see and increment for the next one.
+
+/// EGraph-relevant information needed to wire up a container implementation to
+/// an egglog databse.
+#[derive(Copy, Clone)]
+pub struct EGraphInfo {
+    pub uf_table: TableId,
+    pub id_counter: CounterId,
+    pub proofs: bool,
+}
 
 pub struct IdGenerator_<'a, 'outer> {
     state: &'a mut ExecutionState<'outer>,
@@ -74,10 +85,48 @@ impl IdGenerator_<'_, '_> {
 
 /// The subset of the egglog database needed to support containers. Operations are immutable to
 /// make it easier to parallelize container management.
-pub trait IdGenerator: Send + Sync {
+pub trait UnionFindHandle: Send {
+    fn new_handle(&self) -> Self;
     fn generate_id(&self) -> Value;
     fn union(&self, id1: Value, id2: Value) -> Value;
     fn find(&self, id: Value) -> Value;
+}
+
+/// A UnionFindHandle that resolves new ids by looking them up in a table, via
+/// dynamic dispatch.
+///
+/// This is a fairly straightforward handle that is used in implementing
+/// external functions. It does no batching to avoid the overhead of virtual
+/// method dispatch.
+pub struct DynamicUnionFindHandle<'outer> {
+    info: EGraphInfo,
+    state: ExecutionState<'outer>,
+    next_ts: Value,
+}
+
+// TODO/question: how do we get the next timestamp?
+// Probably need to pass it into the dynamicUF.
+
+impl UnionFindHandle for DynamicUnionFindHandle<'_> {
+    fn new_handle(&self) -> Self {
+        Self {
+            info: self.info,
+            next_ts: self.next_ts,
+            state: self.state.new_handle(),
+        }
+    }
+
+    fn generate_id(&self) -> Value {
+        Value::from_usize(self.state.inc_counter(self.info.id_counter))
+    }
+
+    fn union(&self, id1: Value, id2: Value) -> Value {
+        todo!()
+    }
+
+    fn find(&self, id: Value) -> Value {
+        todo!()
+    }
 }
 
 /// A primitive operation on a container type.
@@ -86,9 +135,8 @@ pub struct PrimitiveOperation<C> {
     pub name: String,
     /// The operation itself, run with respect to a ContainerEnv.
     #[allow(clippy::type_complexity)]
-    pub operation: Box<
-        dyn Fn(&mut ContainerEnv<C>, &mut ExecutionState, &[Value]) -> Option<Value> + Send + Sync,
-    >,
+    pub operation:
+        Box<dyn Fn(&ContainerEnv<C>, &mut ExecutionState, &[Value]) -> Option<Value> + Send + Sync>,
 }
 
 impl Container for WithHash<Vec<Value>> {
@@ -117,19 +165,23 @@ impl Container for WithHash<Vec<Value>> {
     }
 
     fn primitive_ops() -> Vec<PrimitiveOperation<Self>> {
-        todo!()
-        // vec![
-        //     PrimitiveOperation {
-        //         name: "push".to_string(),
-        //         operation: Box::new(|env, args| {
-        //             let id = args[0];
-        //             let val = args[1];
-        //             let container = env.get_container(id)?;
-        //             let mut container = container.clone();
-        //             container.push(val);
-        //             Some(env.get_id(container, env))
-        //         }),
-        //     },
+        vec![PrimitiveOperation {
+            name: "push".to_string(),
+            operation: Box::new(
+                // To solve this problem: We probably want an IdGenerator
+                // implementation backed by an ExecutionState that can query the
+                // UF? Or perhaps we just want to resolve it dynamically?
+                |env: &ContainerEnv<Self>, state: &mut ExecutionState, args: &[Value]| {
+                    let id = args[0];
+                    let val = args[1];
+                    let container = env.get_container(id)?;
+                    let mut container = container.clone();
+                    container.push(val);
+                    todo!()
+                    // Some(env.get_id(container))
+                },
+            ),
+        }]
         //     PrimitiveOperation {
         //         name: "pop".to_string(),
         //         operation: Box::new(|env, args| {
