@@ -3,9 +3,10 @@
 use std::{
     hash::{Hash, Hasher},
     iter, mem,
-    rc::Rc,
+    sync::Arc,
 };
 
+use crossbeam_queue::SegQueue;
 use numeric_id::{DenseIdMap, NumericId};
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
@@ -40,7 +41,7 @@ enum DynamicIndex {
         table: HashColumnIndex,
     },
     Dynamic(TupleIndex),
-    DynamicColumn(Rc<ColumnIndex>),
+    DynamicColumn(Arc<ColumnIndex>),
 }
 
 struct Prober {
@@ -140,46 +141,74 @@ impl Prober {
 
 impl Database {
     pub fn run_rule_set(&mut self, rule_set: &RuleSet) -> bool {
-        let preds = PredictedVals::default();
-        let mut join_state = JoinState {
-            db: self,
-            preds: &preds,
-            subsets: Default::default(),
-            bindings: Default::default(),
-            var_batches: Default::default(),
-            index_cache: Default::default(),
-        };
-        for (plan, desc) in &rule_set.plans {
-            with_pool_set(|ps| {
-                let start = Instant::now();
-                for (id, info) in plan.atoms.iter() {
-                    let table = join_state.db.get_table(info.table);
-                    join_state.subsets.insert(id, table.all());
-                }
-                join_state.run_plan(plan, rule_set, 0, ps);
-                join_state.subsets.clear();
-                join_state.bindings.clear();
-                let elapsed = start.elapsed();
-                if elapsed > Duration::from_secs(1) {
-                    log::debug!("Rule {desc} took {elapsed:?}");
-                    log::debug!("Plan for {desc}: {plan:#?}");
-                } else {
-                    log::trace!("Rule {desc} took {elapsed:?}");
-                }
-            });
+        fn do_parallel(_n: usize) -> bool {
+            #[cfg(test)]
+            {
+                use rand::Rng;
+                rand::thread_rng().gen_bool(0.5)
+            }
+
+            #[cfg(not(test))]
+            {
+                _n > 1 && rayon::current_num_threads() > 1
+            }
         }
-        let mut batches = join_state.var_batches;
+        let preds = PredictedVals::default();
+        let mut join_state = JoinState::new(self, &preds);
+        let join_states = SegQueue::<JoinState>::new();
+        rayon::in_place_scope(|scope| {
+            let do_parallel = do_parallel(rule_set.plans.len());
+            for (plan, desc) in &rule_set.plans {
+                let work = move |join_state: &mut JoinState| {
+                    with_pool_set(|ps| {
+                        let start = Instant::now();
+                        for (id, info) in plan.atoms.iter() {
+                            let table = join_state.db.get_table(info.table);
+                            join_state.subsets.insert(id, table.all());
+                        }
+                        join_state.run_plan(plan, rule_set, 0, ps);
+                        join_state.subsets.clear();
+                        join_state.bindings.clear();
+                        let elapsed = start.elapsed();
+                        if elapsed > Duration::from_secs(1) {
+                            log::debug!("Rule {desc} took {elapsed:?}");
+                            log::debug!("Plan for {desc}: {plan:#?}");
+                        } else {
+                            log::trace!("Rule {desc} took {elapsed:?}");
+                        }
+                    })
+                };
+                if do_parallel {
+                    let mut join_state = JoinState::new(self, &preds);
+                    let states_ref = &join_states;
+                    scope.spawn(move |_| {
+                        work(&mut join_state);
+                        states_ref.push(join_state);
+                    });
+                } else {
+                    work(&mut join_state);
+                }
+            }
+            if !do_parallel {
+                join_states.push(join_state);
+            }
+        });
         let mut exec_state = ExecutionState {
             db: self.read_only_view(),
             predicted: &preds,
             buffers: Default::default(),
         };
-        // Run any remaining batches.
-        for (action, ActionState { bindings, .. }) in batches.iter_mut() {
-            exec_state.run_instrs(&rule_set.actions[action], bindings);
+        while let Some(join_state) = join_states.pop() {
+            let mut batches = join_state.var_batches;
+            // Run any remaining batches.
+            for (action, ActionState { bindings, .. }) in batches.iter_mut() {
+                exec_state.run_instrs(&rule_set.actions[action], bindings);
+            }
         }
         // flush any pending mutations in 'exec_state', then merge.
         mem::drop(exec_state);
+        // needed to make the borrow checker happy.
+        mem::drop(join_states);
         self.merge_all()
     }
 }
@@ -196,10 +225,22 @@ struct JoinState<'a> {
     subsets: DenseIdMap<AtomId, Subset>,
     bindings: DenseIdMap<Variable, Value>,
     var_batches: DenseIdMap<ActionId, ActionState>,
-    index_cache: HashMap<(ColumnId, Subset), Rc<ColumnIndex>>,
+    // TODO: consider making this a shared hashmap?
+    index_cache: HashMap<(ColumnId, Subset), Arc<ColumnIndex>>,
 }
 
-impl JoinState<'_> {
+impl<'a> JoinState<'a> {
+    fn new(db: &'a Database, preds: &'a PredictedVals) -> Self {
+        Self {
+            db,
+            preds,
+            subsets: Default::default(),
+            bindings: Default::default(),
+            var_batches: Default::default(),
+            index_cache: Default::default(),
+        }
+    }
+
     fn get_index(
         &mut self,
         plan: &Plan,
@@ -255,12 +296,12 @@ impl JoinState<'_> {
                         .or_insert_with(|| {
                             (
                                 (cols[0], subset.clone()),
-                                Rc::new(info.table.group_by_col(subset.as_ref(), cols[0])),
+                                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0])),
                             )
                         });
                     res.clone()
                 } else {
-                    Rc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
+                    Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
                 })
             };
         Prober {
