@@ -952,6 +952,18 @@ impl LazyTrie {
         f: impl Fn(usize, Value, &LazyTrie) -> Result + Send + Sync,
         partition_size: usize,
     ) -> Result {
+        // Now assume all threads first simultaneously get the read locks
+        // T1 <- R
+        // T2 <- R
+        // T3 <- R
+        // Then T1, T2, T3 all detect to delayed and try to get a write lock
+        // Support now T1 gets the write lock and changes the trie to sparse
+        // Then T1 releases the write lock, but then T1 get the read lock
+        // T2 and T3 now need to get the write lock but stuck because T1 has the read lock
+        // Also, when T1 finished, the T2 release write lock and get the read lock,
+        // and then T3 get the write lock it then is stucked also
+        // Solution: Before get the write lock, check if the trie is already sparse or borrowed.
+
         let read_lock = self.0.read().unwrap();
         let lazy_trie = match &read_lock as &LazyTrieInner {
             LazyTrieInner::Delayed(..) => {
