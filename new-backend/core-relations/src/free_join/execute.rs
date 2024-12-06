@@ -1,20 +1,15 @@
 //! Core free join execution.
 
-use std::{
-    hash::{Hash, Hasher},
-    iter, mem,
-    sync::Arc,
-};
+use std::{iter, mem, sync::Arc};
 
 use crossbeam_queue::SegQueue;
 use numeric_id::{DenseIdMap, NumericId};
-use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use web_time::{Duration, Instant};
 
 use crate::{
     action::{Bindings, ExecutionState, PredictedVals},
-    common::{HashMap, Value},
+    common::{DashMap, Value},
     free_join::get_index_from_tableinfo,
     hash_index::{ColumnIndex, IndexBase, TupleIndex},
     offsets::{Offsets, SortedOffsetVector, Subset},
@@ -154,43 +149,54 @@ impl Database {
             }
         }
         let preds = PredictedVals::default();
-        let mut join_state = JoinState::new(self, &preds);
-        let join_states = SegQueue::<JoinState>::new();
+        let index_cache = IndexCache::default();
+        let mut join_state = JoinState::new(self, &preds, &index_cache);
+        let mut action_buf = InPlaceActionBuffer {
+            rule_set,
+            batches: Default::default(),
+        };
+        let join_states = SegQueue::<InPlaceActionBuffer>::new();
         rayon::in_place_scope(|scope| {
             let do_parallel = do_parallel(rule_set.plans.len());
             for (plan, desc) in &rule_set.plans {
-                let work = move |join_state: &mut JoinState| {
-                    with_pool_set(|ps| {
-                        let start = Instant::now();
-                        for (id, info) in plan.atoms.iter() {
-                            let table = join_state.db.get_table(info.table);
-                            join_state.subsets.insert(id, table.all());
-                        }
-                        join_state.run_plan(plan, rule_set, 0, ps);
-                        join_state.subsets.clear();
-                        join_state.bindings.clear();
-                        let elapsed = start.elapsed();
-                        if elapsed > Duration::from_secs(1) {
-                            log::debug!("Rule {desc} took {elapsed:?}");
-                            log::debug!("Plan for {desc}: {plan:#?}");
-                        } else {
-                            log::trace!("Rule {desc} took {elapsed:?}");
-                        }
-                    })
+                // Getting around not being able to name the lifetimes for
+                // `join_state` and `action_buf`: we need them to be the same.
+                type WorkArg<'a, 'b> = (&'a mut JoinState<'b>, &'a mut InPlaceActionBuffer<'b>);
+                let work = move |(join_state, action_buf): WorkArg| {
+                    let start = Instant::now();
+                    for (id, info) in plan.atoms.iter() {
+                        let table = join_state.db.get_table(info.table);
+                        join_state.subsets.insert(id, table.all());
+                    }
+                    join_state.run_plan(plan, 0, action_buf);
+                    join_state.subsets.clear();
+                    join_state.bindings.clear();
+                    let elapsed = start.elapsed();
+                    if elapsed > Duration::from_secs(1) {
+                        log::debug!("Rule {desc} took {elapsed:?}");
+                        log::debug!("Plan for {desc}: {plan:#?}");
+                    } else {
+                        log::trace!("Rule {desc} took {elapsed:?}");
+                    }
                 };
                 if do_parallel {
-                    let mut join_state = JoinState::new(self, &preds);
+                    let mut join_state = JoinState::new(self, &preds, &index_cache);
+
                     let states_ref = &join_states;
                     scope.spawn(move |_| {
-                        work(&mut join_state);
-                        states_ref.push(join_state);
+                        let mut buf = InPlaceActionBuffer {
+                            rule_set,
+                            batches: Default::default(),
+                        };
+                        work((&mut join_state, &mut buf));
+                        states_ref.push(buf);
                     });
                 } else {
-                    work(&mut join_state);
+                    work((&mut join_state, &mut action_buf));
                 }
             }
             if !do_parallel {
-                join_states.push(join_state);
+                join_states.push(action_buf);
             }
         });
         let mut exec_state = ExecutionState {
@@ -198,12 +204,8 @@ impl Database {
             predicted: &preds,
             buffers: Default::default(),
         };
-        while let Some(join_state) = join_states.pop() {
-            let mut batches = join_state.var_batches;
-            // Run any remaining batches.
-            for (action, ActionState { bindings, .. }) in batches.iter_mut() {
-                exec_state.run_instrs(&rule_set.actions[action], bindings);
-            }
+        while let Some(mut batches) = join_states.pop() {
+            batches.flush(&mut exec_state);
         }
         // flush any pending mutations in 'exec_state', then merge.
         mem::drop(exec_state);
@@ -216,28 +218,58 @@ impl Database {
 #[derive(Default)]
 struct ActionState {
     n_runs: usize,
+    len: usize,
     bindings: Bindings,
 }
+
+type IndexCache = DashMap<(ColumnId, Subset), Arc<ColumnIndex>>;
 
 struct JoinState<'a> {
     db: &'a Database,
     preds: &'a PredictedVals,
+    index_cache: &'a IndexCache,
     subsets: DenseIdMap<AtomId, Subset>,
     bindings: DenseIdMap<Variable, Value>,
-    var_batches: DenseIdMap<ActionId, ActionState>,
-    // TODO: consider making this a shared hashmap?
-    index_cache: HashMap<(ColumnId, Subset), Arc<ColumnIndex>>,
+}
+
+struct BindingInfo {
+    bindings: DenseIdMap<Variable, Value>,
+    subsets: DenseIdMap<AtomId, Subset>,
+}
+
+/// A trait used to abstract over different ways of buffering actions together
+/// before running them.
+///
+/// This trait exists as a fairly ad-hoc wrapper over its two implementations.
+/// It allows us to avoid duplicating the (somewhat monstrous) `run_plan` method
+/// for serial and parallel modes.
+trait ActionBuffer<'state>: Send {
+    /// Push the given bindings to be executed for the specified action. If this
+    /// buffer has built up a sufficient batch size, it may execute
+    /// `to_exec_state` and then execute the action.
+    fn push_bindings(
+        &mut self,
+        action: ActionId,
+        bindings: &DenseIdMap<Variable, Value>,
+        to_exec_state: impl FnMut() -> ExecutionState<'state>,
+    );
+
+    /// Execute any remaining actions associated with this buffer.
+    fn flush(&mut self, exec_state: &mut ExecutionState);
+
+    /// Return a closure that can be sent to a different thread and then used to
+    /// reconstruct another buffer for the same set of actions.
+    fn make_new_handle(&self) -> impl FnOnce(&'state rayon::Scope<'state>) -> Self + Send + 'state;
 }
 
 impl<'a> JoinState<'a> {
-    fn new(db: &'a Database, preds: &'a PredictedVals) -> Self {
+    fn new(db: &'a Database, preds: &'a PredictedVals, index_cache: &'a IndexCache) -> Self {
         Self {
             db,
             preds,
+            index_cache,
             subsets: Default::default(),
             bindings: Default::default(),
-            var_batches: Default::default(),
-            index_cache: Default::default(),
         }
     }
 
@@ -260,50 +292,43 @@ impl<'a> JoinState<'a> {
                 .unwrap_or(false)
         });
         let whole_table = info.table.all();
-        let dyn_index =
-            if all_cacheable && subset.is_dense() && whole_table.size() / 2 < subset.size() {
-                // Skip intersecting with the subset if we are just looking at the
-                // whole table.
-                let intersect_outer =
-                    !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
-                // heuristic: if the subset we are scanning is somewhat
-                // large _or_ it is most of the table, or we already have a cached
-                // index for it, then return it.
-                if cols.len() != 1 {
-                    DynamicIndex::Cached {
-                        intersect_outer,
-                        table: get_index_from_tableinfo(info, &cols).clone(),
-                    }
-                } else {
-                    DynamicIndex::CachedColumn {
-                        intersect_outer,
-                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
-                    }
+        let dyn_index = if all_cacheable
+            && subset.is_dense()
+            && whole_table.size() / 2 < subset.size()
+        {
+            // Skip intersecting with the subset if we are just looking at the
+            // whole table.
+            let intersect_outer =
+                !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
+            // heuristic: if the subset we are scanning is somewhat
+            // large _or_ it is most of the table, or we already have a cached
+            // index for it, then return it.
+            if cols.len() != 1 {
+                DynamicIndex::Cached {
+                    intersect_outer,
+                    table: get_index_from_tableinfo(info, &cols).clone(),
                 }
-            } else if cols.len() != 1 {
-                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
             } else {
-                DynamicIndex::DynamicColumn(if subset.size() > 16 {
-                    let mut hasher = FxHasher::default();
-                    (&cols[0], &subset).hash(&mut hasher);
-                    let hc = hasher.finish();
-
-                    let subset = &subset;
-                    let (_, res) = self
-                        .index_cache
-                        .raw_entry_mut()
-                        .from_hash(hc, |(col, sub)| *col == cols[0] && *sub == *subset)
-                        .or_insert_with(|| {
-                            (
-                                (cols[0], subset.clone()),
-                                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0])),
-                            )
-                        });
-                    res.clone()
-                } else {
-                    Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
-                })
-            };
+                DynamicIndex::CachedColumn {
+                    intersect_outer,
+                    table: get_column_index_from_tableinfo(info, cols[0]).clone(),
+                }
+            }
+        } else if cols.len() != 1 {
+            DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
+        } else {
+            DynamicIndex::DynamicColumn(if subset.size() > 16 {
+                // NB: we could use the raw api here to avoid cloning the subset
+                // on a cache hit.
+                let res = self
+                    .index_cache
+                    .entry((cols[0], subset.clone()))
+                    .or_insert_with(|| Arc::new(info.table.group_by_col(subset.as_ref(), cols[0])));
+                res.value().clone()
+            } else {
+                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
+            })
+        };
         Prober {
             subset,
             pool: with_pool_set(|ps| ps.get_pool().clone()),
@@ -313,7 +338,7 @@ impl<'a> JoinState<'a> {
     fn get_column_index(&mut self, plan: &Plan, atom: AtomId, col: ColumnId) -> Prober {
         self.get_index(plan, atom, iter::once(col))
     }
-    fn run_plan(&mut self, plan: &Plan, rule_set: &RuleSet, cur: usize, ps: &PoolSet) {
+    fn run_plan(&mut self, plan: &Plan, cur: usize, action_buf: &mut impl ActionBuffer<'a>) {
         if cur >= plan.stages.len() {
             return;
         }
@@ -327,7 +352,7 @@ impl<'a> JoinState<'a> {
                     for (atom, subset) in update.refinements.drain(..) {
                         self.subsets.insert(atom, subset);
                     }
-                    self.run_plan(plan, rule_set, cur + 1, ps);
+                    self.run_plan(plan, cur + 1, action_buf);
                 }
             };
         }
@@ -338,7 +363,7 @@ impl<'a> JoinState<'a> {
                 }
                 let prev = self.subsets.unwrap_val(*atom);
                 self.subsets.insert(*atom, subset.clone());
-                self.run_plan(plan, rule_set, cur + 1, ps);
+                self.run_plan(plan, cur + 1, action_buf);
                 self.subsets.insert(*atom, prev);
             }
             JoinStage::Intersect { var, scans } => match scans.as_slice() {
@@ -348,17 +373,20 @@ impl<'a> JoinState<'a> {
                         return;
                     }
 
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let prober = self.get_column_index(plan, a.atom, a.column);
-                    prober.for_each(|val, x| {
-                        let mut update: Pooled<FrameUpdate> = ps.get();
-                        update.push_binding(*var, val[0]);
-                        let sub = x.to_owned(&ps.get_pool());
-                        update.refine_atom(a.atom, sub);
-                        updates.push(update);
-                        if updates.len() >= CHUNK_SIZE {
-                            drain_updates!(updates);
-                        }
+                    let mut updates = with_pool_set(|ps| {
+                        let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                        prober.for_each(|val, x| {
+                            let mut update: Pooled<FrameUpdate> = ps.get();
+                            update.push_binding(*var, val[0]);
+                            let sub = x.to_owned(&ps.get_pool());
+                            update.refine_atom(a.atom, sub);
+                            updates.push(update);
+                            if updates.len() >= CHUNK_SIZE {
+                                drain_updates!(updates);
+                            }
+                        });
+                        updates
                     });
                     drain_updates!(updates);
                     self.subsets.insert(a.atom, prober.subset);
@@ -367,28 +395,31 @@ impl<'a> JoinState<'a> {
                     if self.subsets[a.atom].is_empty() {
                         return;
                     }
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
                     let prober = self.get_column_index(plan, a.atom, a.column);
-                    prober.for_each(|val, x| {
-                        let mut update: Pooled<FrameUpdate> = ps.get();
-                        update.push_binding(*var, val[0]);
-                        let sub = self.db.tables[plan.atoms[a.atom].table]
-                            .table
-                            .refine(x.to_owned(&ps.get_pool()), &a.cs);
-                        if sub.is_empty() {
-                            return;
-                        }
-                        update.refine_atom(a.atom, sub);
-                        updates.push(update);
-                        if updates.len() >= CHUNK_SIZE {
-                            drain_updates!(updates);
-                        }
+                    let mut updates = with_pool_set(|ps| {
+                        let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                        prober.for_each(|val, x| {
+                            let mut update: Pooled<FrameUpdate> = ps.get();
+                            update.push_binding(*var, val[0]);
+                            let sub = self.db.tables[plan.atoms[a.atom].table]
+                                .table
+                                .refine(x.to_owned(&ps.get_pool()), &a.cs);
+                            if sub.is_empty() {
+                                return;
+                            }
+                            update.refine_atom(a.atom, sub);
+                            updates.push(update);
+                            if updates.len() >= CHUNK_SIZE {
+                                drain_updates!(updates);
+                            }
+                        });
+                        updates
                     });
                     drain_updates!(updates);
                     self.subsets.insert(a.atom, prober.subset);
                 }
                 [a, b] => {
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = with_pool_set(PoolSet::get);
                     let a_prober = self.get_column_index(plan, a.atom, a.column);
                     let b_prober = self.get_column_index(plan, b.atom, b.column);
 
@@ -401,36 +432,41 @@ impl<'a> JoinState<'a> {
 
                     let smaller_atom = smaller_scan.atom;
                     let larger_atom = larger_scan.atom;
-                    smaller.for_each(|val, small_sub| {
-                        if let Some(mut large_sub) = larger.get_subset(val) {
-                            if !larger_scan.cs.is_empty() {
-                                large_sub = self.db.tables[plan.atoms[larger_atom].table]
-                                    .table
-                                    .refine(large_sub, &larger_scan.cs);
-                                if large_sub.is_empty() {
-                                    return;
+                    with_pool_set(|ps| {
+                        smaller.for_each(|val, small_sub| {
+                            if let Some(mut large_sub) = larger.get_subset(val) {
+                                if !larger_scan.cs.is_empty() {
+                                    large_sub = self.db.tables[plan.atoms[larger_atom].table]
+                                        .table
+                                        .refine(large_sub, &larger_scan.cs);
+                                    if large_sub.is_empty() {
+                                        return;
+                                    }
+                                }
+                                let small_sub = if smaller_scan.cs.is_empty() {
+                                    small_sub.to_owned(&ps.get_pool())
+                                } else {
+                                    let sub = self.db.tables[plan.atoms[smaller_atom].table]
+                                        .table
+                                        .refine(
+                                            small_sub.to_owned(&ps.get_pool()),
+                                            &smaller_scan.cs,
+                                        );
+                                    if sub.is_empty() {
+                                        return;
+                                    }
+                                    sub
+                                };
+                                let mut update: Pooled<FrameUpdate> = ps.get();
+                                update.push_binding(*var, val[0]);
+                                update.refine_atom(smaller_atom, small_sub);
+                                update.refine_atom(larger_atom, large_sub);
+                                updates.push(update);
+                                if updates.len() >= CHUNK_SIZE {
+                                    drain_updates!(updates);
                                 }
                             }
-                            let small_sub = if smaller_scan.cs.is_empty() {
-                                small_sub.to_owned(&ps.get_pool())
-                            } else {
-                                let sub = self.db.tables[plan.atoms[smaller_atom].table]
-                                    .table
-                                    .refine(small_sub.to_owned(&ps.get_pool()), &smaller_scan.cs);
-                                if sub.is_empty() {
-                                    return;
-                                }
-                                sub
-                            };
-                            let mut update: Pooled<FrameUpdate> = ps.get();
-                            update.push_binding(*var, val[0]);
-                            update.refine_atom(smaller_atom, small_sub);
-                            update.refine_atom(larger_atom, large_sub);
-                            updates.push(update);
-                            if updates.len() >= CHUNK_SIZE {
-                                drain_updates!(updates);
-                            }
-                        }
+                        });
                     });
                     drain_updates!(updates);
 
@@ -438,7 +474,7 @@ impl<'a> JoinState<'a> {
                     self.subsets.insert(b.atom, b_prober.subset);
                 }
                 rest => {
-                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                    let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = with_pool_set(PoolSet::get);
                     let mut smallest = 0;
                     let mut smallest_size = usize::MAX;
                     let mut probers = Vec::with_capacity(rest.len());
@@ -458,42 +494,44 @@ impl<'a> JoinState<'a> {
 
                     // Smallest leads the scan
                     probers[smallest].for_each(|key, sub| {
-                        let mut update: Pooled<FrameUpdate> = ps.get();
-                        update.push_binding(*var, key[0]);
-                        for (i, scan) in rest.iter().enumerate() {
-                            if i == smallest {
-                                continue;
-                            }
-                            if let Some(mut sub) = probers[i].get_subset(key) {
-                                if !rest[i].cs.is_empty() {
-                                    sub = self.db.tables[plan.atoms[rest[i].atom].table]
-                                        .table
-                                        .refine(sub, &rest[i].cs);
-                                    if sub.is_empty() {
-                                        return;
-                                    }
+                        with_pool_set(|ps| {
+                            let mut update: Pooled<FrameUpdate> = ps.get();
+                            update.push_binding(*var, key[0]);
+                            for (i, scan) in rest.iter().enumerate() {
+                                if i == smallest {
+                                    continue;
                                 }
-                                update.refine_atom(scan.atom, sub)
-                            } else {
-                                // Empty intersection.
-                                return;
+                                if let Some(mut sub) = probers[i].get_subset(key) {
+                                    if !rest[i].cs.is_empty() {
+                                        sub = self.db.tables[plan.atoms[rest[i].atom].table]
+                                            .table
+                                            .refine(sub, &rest[i].cs);
+                                        if sub.is_empty() {
+                                            return;
+                                        }
+                                    }
+                                    update.refine_atom(scan.atom, sub)
+                                } else {
+                                    // Empty intersection.
+                                    return;
+                                }
                             }
-                        }
-                        let main_spec = &rest[smallest];
-                        let mut sub = sub.to_owned(&ps.get_pool());
-                        if !main_spec.cs.is_empty() {
-                            sub = self.db.tables[plan.atoms[main_spec.atom].table]
-                                .table
-                                .refine(sub, &main_spec.cs);
-                            if sub.is_empty() {
-                                return;
+                            let main_spec = &rest[smallest];
+                            let mut sub = sub.to_owned(&ps.get_pool());
+                            if !main_spec.cs.is_empty() {
+                                sub = self.db.tables[plan.atoms[main_spec.atom].table]
+                                    .table
+                                    .refine(sub, &main_spec.cs);
+                                if sub.is_empty() {
+                                    return;
+                                }
                             }
-                        }
-                        update.refine_atom(main_spec.atom, sub);
-                        updates.push(update);
-                        if updates.len() >= CHUNK_SIZE {
-                            drain_updates!(updates);
-                        }
+                            update.refine_atom(main_spec.atom, sub);
+                            updates.push(update);
+                            if updates.len() >= CHUNK_SIZE {
+                                drain_updates!(updates);
+                            }
+                        })
                     });
                     drain_updates!(updates);
                     for (spec, prober) in rest.iter().zip(probers.into_iter()) {
@@ -510,7 +548,7 @@ impl<'a> JoinState<'a> {
                 if self.subsets[cover_atom].is_empty() {
                     return;
                 }
-                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = with_pool_set(PoolSet::get);
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
                 let cover_subset = self.subsets.unwrap_val(cover_atom);
                 let mut cur = Offset::new(0);
@@ -527,7 +565,7 @@ impl<'a> JoinState<'a> {
                         &mut buffer,
                     );
                     for (row, key) in buffer.iter_non_stale() {
-                        let mut update: Pooled<FrameUpdate> = ps.get();
+                        let mut update: Pooled<FrameUpdate> = with_pool_set(PoolSet::get);
                         update.refine_atom(
                             cover_atom,
                             Subset::Dense(OffsetRange::new(row, row.inc())),
@@ -575,7 +613,7 @@ impl<'a> JoinState<'a> {
                         )
                     })
                     .collect::<SmallVec<[(usize, AtomId, Prober); 4]>>();
-                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = ps.get();
+                let mut updates: Pooled<Vec<Pooled<FrameUpdate>>> = with_pool_set(PoolSet::get);
                 let proj = SmallVec::<[ColumnId; 4]>::from_iter(bind.iter().map(|(col, _)| *col));
                 let cover_subset = self.subsets.unwrap_val(cover_atom);
                 let mut cur = Offset::new(0);
@@ -591,8 +629,9 @@ impl<'a> JoinState<'a> {
                         &cover.constraints,
                         &mut buffer,
                     );
+                    let pool: Pool<FrameUpdate> = with_pool_set(PoolSet::get_pool);
                     'mid: for (row, key) in buffer.iter_non_stale() {
-                        let mut update: Pooled<FrameUpdate> = ps.get();
+                        let mut update: Pooled<FrameUpdate> = pool.get();
                         update.refine_atom(
                             cover_atom,
                             Subset::Dense(OffsetRange::new(row, row.inc())),
@@ -648,23 +687,11 @@ impl<'a> JoinState<'a> {
                 }
             }
             JoinStage::RunInstrs { actions } => {
-                let action_state = self.var_batches.get_or_default(*actions);
-                let mut len = 0;
-                action_state.n_runs += 1;
-                for (var, val) in self.bindings.iter() {
-                    let vals = action_state.bindings.get_or_insert(var, || ps.get());
-                    vals.push(*val);
-                    len = vals.len();
-                }
-                if len > VAR_BATCH_SIZE {
-                    let mut state = ExecutionState {
-                        db: self.db.read_only_view(),
-                        predicted: self.preds,
-                        buffers: Default::default(),
-                    };
-                    state.run_instrs(&rule_set.actions[*actions], &mut action_state.bindings);
-                    action_state.bindings.clear();
-                }
+                action_buf.push_bindings(*actions, &self.bindings, || ExecutionState {
+                    db: self.db.read_only_view(),
+                    predicted: self.preds,
+                    buffers: Default::default(),
+                });
             }
         }
     }
@@ -698,3 +725,125 @@ impl Clear for FrameUpdate {
 
 const CHUNK_SIZE: usize = 256;
 const VAR_BATCH_SIZE: usize = 1024;
+
+// TODOS:
+// * Build a SharedActionBufferState type with a background thread that builds
+// batches and shunts them off to a rayon::Scope. When all receivers go out of
+// scope it should  finish the flush and exit. (Maybe no background thread
+// needed now that we are batching in a handle-local way?) [done]
+// * Then factor out the bindings.
+//   - optional: .
+// * Move index cache to dashmap (and share it among threads? try both...).
+// * Wire it in and measure!
+// * possible optimizations:
+//   - we may find that we need to store Arcs inside of Subset now, as
+//   of now we will be cloning all subsets and bindings every time we create a
+//   new morsel.
+//   - run_inline for the drain case
+//   - increase morsel size as you go down.
+type RemoveTodos = ();
+
+/// The action buffer we use if we are executing in a single-threaded
+/// environment. It builds up local batches and then flushes them inline.
+struct InPlaceActionBuffer<'a> {
+    rule_set: &'a RuleSet,
+    batches: DenseIdMap<ActionId, ActionState>,
+}
+
+impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
+    fn push_bindings(
+        &mut self,
+        action: ActionId,
+        bindings: &DenseIdMap<Variable, Value>,
+        mut to_exec_state: impl FnMut() -> ExecutionState<'a>,
+    ) {
+        let action_state = self.batches.get_or_default(action);
+        action_state.n_runs += 1;
+        action_state.len += 1;
+        with_pool_set(|ps| {
+            for (var, val) in bindings.iter() {
+                let vals = action_state.bindings.get_or_insert(var, || ps.get());
+                vals.push(*val);
+            }
+        });
+        if action_state.len > VAR_BATCH_SIZE {
+            let mut state = to_exec_state();
+            state.run_instrs(&self.rule_set.actions[action], &mut action_state.bindings);
+            action_state.bindings.clear();
+            action_state.len = 0;
+        }
+    }
+
+    fn flush(&mut self, exec_state: &mut ExecutionState) {
+        flush_action_states(exec_state, &mut self.batches, self.rule_set);
+    }
+
+    fn make_new_handle(&self) -> impl FnOnce(&'a rayon::Scope<'a>) -> Self + Send + 'a {
+        let rule_set = self.rule_set;
+        move |_| Self {
+            rule_set,
+            batches: Default::default(),
+        }
+    }
+}
+
+/// An Action buffer that hands off batches to of actions to rayon to execute.
+struct ScopedActionBuffer<'scope> {
+    scope: &'scope rayon::Scope<'scope>,
+    rule_set: &'scope RuleSet,
+    batches: DenseIdMap<ActionId, ActionState>,
+}
+
+impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'scope> {
+    fn push_bindings(
+        &mut self,
+        action: ActionId,
+        bindings: &DenseIdMap<Variable, Value>,
+        mut to_exec_state: impl FnMut() -> ExecutionState<'scope>,
+    ) {
+        let action_state = self.batches.get_or_default(action);
+        action_state.n_runs += 1;
+        action_state.len += 1;
+        with_pool_set(|ps| {
+            for (var, val) in bindings.iter() {
+                let vals = action_state.bindings.get_or_insert(var, || ps.get());
+                vals.push(*val);
+            }
+        });
+        if action_state.len > VAR_BATCH_SIZE {
+            let mut state = to_exec_state();
+            let mut bindings = mem::take(&mut action_state.bindings);
+            action_state.len = 0;
+            let rule_set = self.rule_set;
+            self.scope.spawn(move |_| {
+                state.run_instrs(&rule_set.actions[action], &mut bindings);
+            });
+        }
+    }
+
+    fn flush(&mut self, exec_state: &mut ExecutionState) {
+        flush_action_states(exec_state, &mut self.batches, self.rule_set);
+    }
+    fn make_new_handle(&self) -> impl FnOnce(&'scope rayon::Scope<'scope>) -> Self + Send + 'scope {
+        let rule_set = self.rule_set;
+        move |scope: &'scope rayon::Scope<'scope>| Self {
+            scope,
+            rule_set,
+            batches: Default::default(),
+        }
+    }
+}
+
+fn flush_action_states(
+    exec_state: &mut ExecutionState,
+    actions: &mut DenseIdMap<ActionId, ActionState>,
+    rule_set: &RuleSet,
+) {
+    for (action, ActionState { bindings, len, .. }) in actions.iter_mut() {
+        if *len > 0 {
+            exec_state.run_instrs(&rule_set.actions[action], bindings);
+            bindings.clear();
+            *len = 0;
+        }
+    }
+}

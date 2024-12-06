@@ -402,7 +402,7 @@ impl TermEnv {
     }
 
     fn start_check<T>(&mut self, elt: &T) -> Result<bool> {
-        let num = elt as *const T as usize;
+        let num = elt as *const T as *const () as usize;
         match self.check_cache.entry(num) {
             Entry::Occupied(o) => {
                 if let CacheState::Marked = o.get() {
