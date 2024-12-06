@@ -969,6 +969,13 @@ impl LazyTrie {
             LazyTrieInner::Delayed(..) => {
                 drop(read_lock);
 
+                // I didn't a feasible solution based on the RWLock with if condition
+                // I find it may be not possible to tackle this problem with RWLock equipped with if condition
+                // Maybe better we need condvar and then check the condvar once the write thread is awakened
+                // and before it is going to re-sleep due to the read lock.
+                // But I guess we may a better way?
+
+
                 let mut write_lock = self.0.write().unwrap();
                 let this: &mut LazyTrieInner = &mut write_lock;
 
