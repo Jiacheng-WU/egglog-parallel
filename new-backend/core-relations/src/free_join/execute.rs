@@ -242,6 +242,7 @@ struct BindingInfo {
 /// It allows us to avoid duplicating the (somewhat monstrous) `run_plan` method
 /// for serial and parallel modes.
 trait ActionBuffer<'state>: Send {
+    const PARALLEL: bool;
     /// Push the given bindings to be executed for the specified action. If this
     /// buffer has built up a sufficient batch size, it may execute
     /// `to_exec_state` and then execute the action.
@@ -341,12 +342,12 @@ impl<'a> JoinState<'a> {
     ) -> Prober {
         self.get_index(plan, atom, binding_info, iter::once(col))
     }
-    fn run_plan(
+    fn run_plan<BUF: ActionBuffer<'a>>(
         &mut self,
         plan: &Plan,
         cur: usize,
         binding_info: &mut BindingInfo,
-        action_buf: &mut impl ActionBuffer<'a>,
+        action_buf: &mut BUF,
     ) {
         if cur >= plan.stages.len() {
             return;
@@ -364,6 +365,22 @@ impl<'a> JoinState<'a> {
                     self.run_plan(plan, cur + 1, binding_info, action_buf);
                 }
             };
+        }
+        macro_rules! drain_updates_parallel {
+            ($updates:expr) => {{
+                let updates = mem::take(&mut $updates);
+                rayon::in_place_scope(|scope| {
+                    for mut update in $updates.drain(..) {
+                        for (var, val) in update.bindings.drain(..) {
+                            binding_info.bindings.insert(var, val);
+                        }
+                        for (atom, subset) in update.refinements.drain(..) {
+                            binding_info.subsets.insert(atom, subset);
+                        }
+                        self.run_plan(plan, cur + 1, binding_info, action_buf);
+                    }
+                });
+            }};
         }
         match &plan.stages[cur] {
             JoinStage::EvalConstraints { atom, subset, .. } => {
@@ -762,6 +779,7 @@ struct InPlaceActionBuffer<'a> {
 }
 
 impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
+    const PARALLEL: bool = false;
     fn push_bindings(
         &mut self,
         action: ActionId,
@@ -806,6 +824,7 @@ struct ScopedActionBuffer<'scope> {
 }
 
 impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'scope> {
+    const PARALLEL: bool = true;
     fn push_bindings(
         &mut self,
         action: ActionId,
