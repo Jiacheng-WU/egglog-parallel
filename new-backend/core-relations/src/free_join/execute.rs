@@ -2,10 +2,8 @@
 
 use std::{iter, mem, sync::Arc};
 
-use crossbeam_queue::SegQueue;
 use numeric_id::{DenseIdMap, NumericId};
 use smallvec::SmallVec;
-use web_time::{Duration, Instant};
 
 use crate::{
     action::{Bindings, ExecutionState, PredictedVals},
@@ -136,7 +134,7 @@ impl Prober {
 
 impl Database {
     pub fn run_rule_set(&mut self, rule_set: &RuleSet) -> bool {
-        fn do_parallel(_n: usize) -> bool {
+        fn do_parallel() -> bool {
             #[cfg(test)]
             {
                 use rand::Rng;
@@ -145,71 +143,56 @@ impl Database {
 
             #[cfg(not(test))]
             {
-                _n > 1 && rayon::current_num_threads() > 1
+                rayon::current_num_threads() > 1
             }
         }
         let preds = PredictedVals::default();
         let index_cache = IndexCache::default();
-        let mut join_state = JoinState::new(self, &preds, &index_cache);
-        let mut action_buf = InPlaceActionBuffer {
-            rule_set,
-            batches: Default::default(),
-        };
-        let join_states = SegQueue::<InPlaceActionBuffer>::new();
-        rayon::in_place_scope(|scope| {
-            let do_parallel = do_parallel(rule_set.plans.len());
-            for (plan, desc) in &rule_set.plans {
-                // Getting around not being able to name the lifetimes for
-                // `join_state` and `action_buf`: we need them to be the same.
-                type WorkArg<'a, 'b> = (&'a mut JoinState<'b>, &'a mut InPlaceActionBuffer<'b>);
-                let work = move |(join_state, action_buf): WorkArg| {
-                    let start = Instant::now();
-                    let mut binding_info = BindingInfo::default();
-                    for (id, info) in plan.atoms.iter() {
-                        let table = join_state.db.get_table(info.table);
-                        binding_info.subsets.insert(id, table.all());
-                    }
-                    join_state.run_plan(plan, 0, &mut binding_info, action_buf);
-                    let elapsed = start.elapsed();
-                    if elapsed > Duration::from_secs(1) {
-                        log::debug!("Rule {desc} took {elapsed:?}");
-                        log::debug!("Plan for {desc}: {plan:#?}");
-                    } else {
-                        log::trace!("Rule {desc} took {elapsed:?}");
-                    }
-                };
-                if do_parallel {
-                    let mut join_state = JoinState::new(self, &preds, &index_cache);
 
-                    let states_ref = &join_states;
-                    scope.spawn(move |_| {
-                        let mut buf = InPlaceActionBuffer {
-                            rule_set,
-                            batches: Default::default(),
-                        };
-                        work((&mut join_state, &mut buf));
-                        states_ref.push(buf);
+        if do_parallel() {
+            rayon::in_place_scope(|scope| {
+                for (plan, _) in &rule_set.plans {
+                    scope.spawn(|scope| {
+                        let join_state = JoinState::new(self, &preds, &index_cache);
+                        let mut action_buf = ScopedActionBuffer::new(scope, rule_set);
+                        let mut binding_info = BindingInfo::default();
+                        for (id, info) in plan.atoms.iter() {
+                            let table = join_state.db.get_table(info.table);
+                            binding_info.subsets.insert(id, table.all());
+                        }
+                        join_state.run_plan(plan, 0, &mut binding_info, &mut action_buf);
+                        if action_buf.needs_flush {
+                            action_buf.flush(&mut ExecutionState {
+                                db: self.read_only_view(),
+                                predicted: &preds,
+                                buffers: Default::default(),
+                            });
+                        }
                     });
-                } else {
-                    work((&mut join_state, &mut action_buf));
                 }
+            })
+        } else {
+            let join_state = JoinState::new(self, &preds, &index_cache);
+            // Just run all of the plans in order with a single in-place action
+            // buffer.
+            let mut action_buf = InPlaceActionBuffer {
+                rule_set,
+                batches: Default::default(),
+            };
+            for (plan, _) in &rule_set.plans {
+                let mut binding_info = BindingInfo::default();
+                for (id, info) in plan.atoms.iter() {
+                    let table = join_state.db.get_table(info.table);
+                    binding_info.subsets.insert(id, table.all());
+                }
+                join_state.run_plan(plan, 0, &mut binding_info, &mut action_buf);
             }
-            if !do_parallel {
-                join_states.push(action_buf);
-            }
-        });
-        let mut exec_state = ExecutionState {
-            db: self.read_only_view(),
-            predicted: &preds,
-            buffers: Default::default(),
-        };
-        while let Some(mut batches) = join_states.pop() {
-            batches.flush(&mut exec_state);
+            action_buf.flush(&mut ExecutionState {
+                db: self.read_only_view(),
+                predicted: &preds,
+                buffers: Default::default(),
+            });
         }
-        // flush any pending mutations in 'exec_state', then merge.
-        mem::drop(exec_state);
-        // needed to make the borrow checker happy.
-        mem::drop(join_states);
         self.merge_all()
     }
 }
@@ -329,6 +312,7 @@ impl<'a> JoinState<'a> {
         if cur >= plan.stages.len() {
             return;
         }
+        let chunk_size = BUF::morsel_size(cur);
         // Helper macro (not its own method to appease the borrow checker).
         macro_rules! drain_updates {
             ($updates:expr) => {
@@ -401,7 +385,7 @@ impl<'a> JoinState<'a> {
                             let sub = x.to_owned(&ps.get_pool());
                             update.refine_atom(a.atom, sub);
                             updates.push(update);
-                            if updates.len() >= CHUNK_SIZE {
+                            if updates.len() >= chunk_size {
                                 drain_updates_parallel!(updates);
                             }
                         });
@@ -428,7 +412,7 @@ impl<'a> JoinState<'a> {
                             }
                             update.refine_atom(a.atom, sub);
                             updates.push(update);
-                            if updates.len() >= CHUNK_SIZE {
+                            if updates.len() >= chunk_size {
                                 drain_updates_parallel!(updates);
                             }
                         });
@@ -481,7 +465,7 @@ impl<'a> JoinState<'a> {
                                 update.refine_atom(smaller_atom, small_sub);
                                 update.refine_atom(larger_atom, large_sub);
                                 updates.push(update);
-                                if updates.len() >= CHUNK_SIZE {
+                                if updates.len() >= chunk_size {
                                     drain_updates_parallel!(updates);
                                 }
                             }
@@ -548,7 +532,7 @@ impl<'a> JoinState<'a> {
                             }
                             update.refine_atom(main_spec.atom, sub);
                             updates.push(update);
-                            if updates.len() >= CHUNK_SIZE {
+                            if updates.len() >= chunk_size {
                                 drain_updates_parallel!(updates);
                             }
                         })
@@ -580,7 +564,7 @@ impl<'a> JoinState<'a> {
                         cover_subset.as_ref(),
                         &proj,
                         cur,
-                        CHUNK_SIZE,
+                        chunk_size,
                         &cover.constraints,
                         &mut buffer,
                     );
@@ -595,7 +579,7 @@ impl<'a> JoinState<'a> {
                             update.push_binding(*var, key[i]);
                         }
                         updates.push(update);
-                        if updates.len() >= CHUNK_SIZE {
+                        if updates.len() >= chunk_size {
                             drain_updates_parallel!(updates);
                         }
                     }
@@ -646,7 +630,7 @@ impl<'a> JoinState<'a> {
                         cover_subset.as_ref(),
                         &proj,
                         cur,
-                        CHUNK_SIZE,
+                        chunk_size,
                         &cover.constraints,
                         &mut buffer,
                     );
@@ -686,7 +670,7 @@ impl<'a> JoinState<'a> {
                             update.refine_atom(*atom, subset);
                         }
                         updates.push(update);
-                        if updates.len() >= CHUNK_SIZE {
+                        if updates.len() >= chunk_size {
                             drain_updates_parallel!(updates);
                         }
                     }
@@ -744,25 +728,7 @@ impl Clear for FrameUpdate {
     }
 }
 
-const CHUNK_SIZE: usize = 256;
 const VAR_BATCH_SIZE: usize = 1024;
-
-// TODOS:
-// * Build a SharedActionBufferState type with a background thread that builds
-// batches and shunts them off to a rayon::Scope. When all receivers go out of
-// scope it should  finish the flush and exit. (Maybe no background thread
-// needed now that we are batching in a handle-local way?) [done]
-// * Then factor out the bindings.
-//   - optional: .
-// * Move index cache to dashmap (and share it among threads? try both...).
-// * Wire it in and measure!
-// * possible optimizations:
-//   - we may find that we need to store Arcs inside of Subset now, as
-//   of now we will be cloning all subsets and bindings every time we create a
-//   new morsel.
-//   - run_inline for the drain case
-//   - increase morsel size as you go down.
-type RemoveTodos = ();
 
 /// A trait used to abstract over different ways of buffering actions together
 /// before running them.
@@ -799,6 +765,15 @@ trait ActionBuffer<'state>: Send {
         to_exec_state: impl FnMut() -> ExecutionState<'state> + Send + 'state,
         work: impl for<'a> FnOnce(&mut Local, &mut Self::AsLocal<'a>) + Send + 'state,
     );
+
+    /// The unit at which you should batch updates passed to calls to `recur`,
+    /// potentially depending on the current level of recursion.
+    ///
+    /// As of right now this is just a hard-coded value. We may change it in the
+    /// future to fan out more at higher levels though.
+    fn morsel_size(_level: usize) -> usize {
+        256
+    }
 }
 
 /// The action buffer we use if we are executing in a single-threaded
@@ -856,6 +831,17 @@ struct ScopedActionBuffer<'inner, 'scope> {
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
     needs_flush: bool,
+}
+
+impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
+    fn new(scope: &'inner rayon::Scope<'scope>, rule_set: &'scope RuleSet) -> Self {
+        Self {
+            scope,
+            rule_set,
+            batches: Default::default(),
+            needs_flush: false,
+        }
+    }
 }
 
 impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
