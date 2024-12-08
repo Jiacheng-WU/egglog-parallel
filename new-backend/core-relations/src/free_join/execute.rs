@@ -229,36 +229,10 @@ struct JoinState<'a> {
     index_cache: &'a IndexCache,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BindingInfo {
     bindings: DenseIdMap<Variable, Value>,
     subsets: DenseIdMap<AtomId, Subset>,
-}
-
-/// A trait used to abstract over different ways of buffering actions together
-/// before running them.
-///
-/// This trait exists as a fairly ad-hoc wrapper over its two implementations.
-/// It allows us to avoid duplicating the (somewhat monstrous) `run_plan` method
-/// for serial and parallel modes.
-trait ActionBuffer<'state>: Send {
-    const PARALLEL: bool;
-    /// Push the given bindings to be executed for the specified action. If this
-    /// buffer has built up a sufficient batch size, it may execute
-    /// `to_exec_state` and then execute the action.
-    fn push_bindings(
-        &mut self,
-        action: ActionId,
-        bindings: &DenseIdMap<Variable, Value>,
-        to_exec_state: impl FnMut() -> ExecutionState<'state>,
-    );
-
-    /// Execute any remaining actions associated with this buffer.
-    fn flush(&mut self, exec_state: &mut ExecutionState);
-
-    /// Return a closure that can be sent to a different thread and then used to
-    /// reconstruct another buffer for the same set of actions.
-    fn make_new_handle(&self) -> impl FnOnce(&'state rayon::Scope<'state>) -> Self + Send + 'state;
 }
 
 impl<'a> JoinState<'a> {
@@ -271,7 +245,7 @@ impl<'a> JoinState<'a> {
     }
 
     fn get_index(
-        &mut self,
+        &self,
         plan: &Plan,
         atom: AtomId,
         binding_info: &mut BindingInfo,
@@ -334,7 +308,7 @@ impl<'a> JoinState<'a> {
         }
     }
     fn get_column_index(
-        &mut self,
+        &self,
         plan: &Plan,
         binding_info: &mut BindingInfo,
         atom: AtomId,
@@ -342,13 +316,16 @@ impl<'a> JoinState<'a> {
     ) -> Prober {
         self.get_index(plan, atom, binding_info, iter::once(col))
     }
-    fn run_plan<BUF: ActionBuffer<'a>>(
-        &mut self,
-        plan: &Plan,
+
+    fn run_plan<'buf, BUF: ActionBuffer<'buf>>(
+        &self,
+        plan: &'a Plan,
         cur: usize,
         binding_info: &mut BindingInfo,
         action_buf: &mut BUF,
-    ) {
+    ) where
+        'a: 'buf,
+    {
         if cur >= plan.stages.len() {
             return;
         }
@@ -368,18 +345,34 @@ impl<'a> JoinState<'a> {
         }
         macro_rules! drain_updates_parallel {
             ($updates:expr) => {{
-                let updates = mem::take(&mut $updates);
-                rayon::in_place_scope(|scope| {
-                    for mut update in $updates.drain(..) {
-                        for (var, val) in update.bindings.drain(..) {
-                            binding_info.bindings.insert(var, val);
+                let mut updates = mem::take(&mut $updates);
+                let predicted = self.preds;
+                let index_cache = self.index_cache;
+                let db = self.db;
+                action_buf.recur(
+                    binding_info,
+                    move || ExecutionState {
+                        db: db.read_only_view(),
+                        predicted,
+                        buffers: Default::default(),
+                    },
+                    move |binding_info, buf| {
+                        for mut update in updates.drain(..) {
+                            for (var, val) in update.bindings.drain(..) {
+                                binding_info.bindings.insert(var, val);
+                            }
+                            for (atom, subset) in update.refinements.drain(..) {
+                                binding_info.subsets.insert(atom, subset);
+                            }
+                            JoinState {
+                                db,
+                                preds: predicted,
+                                index_cache,
+                            }
+                            .run_plan(plan, cur + 1, binding_info, buf);
                         }
-                        for (atom, subset) in update.refinements.drain(..) {
-                            binding_info.subsets.insert(atom, subset);
-                        }
-                        self.run_plan(plan, cur + 1, binding_info, action_buf);
-                    }
-                });
+                    },
+                );
             }};
         }
         match &plan.stages[cur] {
@@ -409,7 +402,7 @@ impl<'a> JoinState<'a> {
                             update.refine_atom(a.atom, sub);
                             updates.push(update);
                             if updates.len() >= CHUNK_SIZE {
-                                drain_updates!(updates);
+                                drain_updates_parallel!(updates);
                             }
                         });
                         updates
@@ -436,7 +429,7 @@ impl<'a> JoinState<'a> {
                             update.refine_atom(a.atom, sub);
                             updates.push(update);
                             if updates.len() >= CHUNK_SIZE {
-                                drain_updates!(updates);
+                                drain_updates_parallel!(updates);
                             }
                         });
                         updates
@@ -489,7 +482,7 @@ impl<'a> JoinState<'a> {
                                 update.refine_atom(larger_atom, large_sub);
                                 updates.push(update);
                                 if updates.len() >= CHUNK_SIZE {
-                                    drain_updates!(updates);
+                                    drain_updates_parallel!(updates);
                                 }
                             }
                         });
@@ -556,7 +549,7 @@ impl<'a> JoinState<'a> {
                             update.refine_atom(main_spec.atom, sub);
                             updates.push(update);
                             if updates.len() >= CHUNK_SIZE {
-                                drain_updates!(updates);
+                                drain_updates_parallel!(updates);
                             }
                         })
                     });
@@ -603,7 +596,7 @@ impl<'a> JoinState<'a> {
                         }
                         updates.push(update);
                         if updates.len() >= CHUNK_SIZE {
-                            drain_updates!(updates);
+                            drain_updates_parallel!(updates);
                         }
                     }
                     if let Some(next) = next {
@@ -694,7 +687,7 @@ impl<'a> JoinState<'a> {
                         }
                         updates.push(update);
                         if updates.len() >= CHUNK_SIZE {
-                            drain_updates!(updates);
+                            drain_updates_parallel!(updates);
                         }
                     }
                     if let Some(next) = next {
@@ -771,6 +764,43 @@ const VAR_BATCH_SIZE: usize = 1024;
 //   - increase morsel size as you go down.
 type RemoveTodos = ();
 
+/// A trait used to abstract over different ways of buffering actions together
+/// before running them.
+///
+/// This trait exists as a fairly ad-hoc wrapper over its two implementations.
+/// It allows us to avoid duplicating the (somewhat monstrous) `run_plan` method
+/// for serial and parallel modes.
+trait ActionBuffer<'state>: Send {
+    type AsLocal<'a>: ActionBuffer<'state>
+    where
+        'state: 'a;
+    /// Push the given bindings to be executed for the specified action. If this
+    /// buffer has built up a sufficient batch size, it may execute
+    /// `to_exec_state` and then execute the action.
+    fn push_bindings(
+        &mut self,
+        action: ActionId,
+        bindings: &DenseIdMap<Variable, Value>,
+        to_exec_state: impl FnMut() -> ExecutionState<'state>,
+    );
+
+    /// Execute any remaining actions associated with this buffer.
+    fn flush(&mut self, exec_state: &mut ExecutionState);
+
+    /// Execute `work`, potentially asynchronously, with a mutable reference to
+    /// an action buffer, potentially handed off to a different thread.
+    ///
+    /// Callers pass a clonable `Local` value that may be modified by work, or
+    /// cloned first and then have a separate copy modified by `work`. Callers
+    /// should assume that `local` _is_ modified synchronously.
+    fn recur<Local: Clone + Send + 'state>(
+        &mut self,
+        local: &mut Local,
+        to_exec_state: impl FnMut() -> ExecutionState<'state> + Send + 'state,
+        work: impl for<'a> FnOnce(&mut Local, &mut Self::AsLocal<'a>) + Send + 'state,
+    );
+}
+
 /// The action buffer we use if we are executing in a single-threaded
 /// environment. It builds up local batches and then flushes them inline.
 struct InPlaceActionBuffer<'a> {
@@ -779,7 +809,11 @@ struct InPlaceActionBuffer<'a> {
 }
 
 impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
-    const PARALLEL: bool = false;
+    type AsLocal<'b>
+        = Self
+    where
+        'a: 'b;
+
     fn push_bindings(
         &mut self,
         action: ActionId,
@@ -806,31 +840,36 @@ impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
     fn flush(&mut self, exec_state: &mut ExecutionState) {
         flush_action_states(exec_state, &mut self.batches, self.rule_set);
     }
-
-    fn make_new_handle(&self) -> impl FnOnce(&'a rayon::Scope<'a>) -> Self + Send + 'a {
-        let rule_set = self.rule_set;
-        move |_| Self {
-            rule_set,
-            batches: Default::default(),
-        }
+    fn recur<Local: Clone + Send + 'a>(
+        &mut self,
+        local: &mut Local,
+        _to_exec_state: impl FnMut() -> ExecutionState<'a> + Send + 'a,
+        work: impl for<'b> FnOnce(&mut Local, &mut Self) + Send + 'a,
+    ) {
+        work(local, self);
     }
 }
 
 /// An Action buffer that hands off batches to of actions to rayon to execute.
-struct ScopedActionBuffer<'scope> {
-    scope: &'scope rayon::Scope<'scope>,
+struct ScopedActionBuffer<'inner, 'scope> {
+    scope: &'inner rayon::Scope<'scope>,
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
+    needs_flush: bool,
 }
 
-impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'scope> {
-    const PARALLEL: bool = true;
+impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
+    type AsLocal<'a>
+        = ScopedActionBuffer<'a, 'scope>
+    where
+        'scope: 'a;
     fn push_bindings(
         &mut self,
         action: ActionId,
         bindings: &DenseIdMap<Variable, Value>,
         mut to_exec_state: impl FnMut() -> ExecutionState<'scope>,
     ) {
+        self.needs_flush = true;
         let action_state = self.batches.get_or_default(action);
         action_state.n_runs += 1;
         action_state.len += 1;
@@ -853,14 +892,28 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'scope> {
 
     fn flush(&mut self, exec_state: &mut ExecutionState) {
         flush_action_states(exec_state, &mut self.batches, self.rule_set);
+        self.needs_flush = false;
     }
-    fn make_new_handle(&self) -> impl FnOnce(&'scope rayon::Scope<'scope>) -> Self + Send + 'scope {
+    fn recur<Local: Clone + Send + 'scope>(
+        &mut self,
+        local: &mut Local,
+        mut to_exec_state: impl FnMut() -> ExecutionState<'scope> + Send + 'scope,
+        work: impl for<'a> FnOnce(&mut Local, &mut ScopedActionBuffer<'a, 'scope>) + Send + 'scope,
+    ) {
         let rule_set = self.rule_set;
-        move |scope: &'scope rayon::Scope<'scope>| Self {
-            scope,
-            rule_set,
-            batches: Default::default(),
-        }
+        let mut inner = local.clone();
+        self.scope.spawn(move |scope| {
+            let mut buf: ScopedActionBuffer<'_, 'scope> = ScopedActionBuffer {
+                scope,
+                rule_set,
+                needs_flush: false,
+                batches: Default::default(),
+            };
+            work(&mut inner, &mut buf);
+            if buf.needs_flush {
+                flush_action_states(&mut to_exec_state(), &mut buf.batches, buf.rule_set);
+            }
+        });
     }
 }
 
