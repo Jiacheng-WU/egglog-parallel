@@ -772,7 +772,7 @@ trait ActionBuffer<'state>: Send {
     /// As of right now this is just a hard-coded value. We may change it in the
     /// future to fan out more at higher levels though.
     fn morsel_size(_level: usize) -> usize {
-        256
+        512
     }
 }
 

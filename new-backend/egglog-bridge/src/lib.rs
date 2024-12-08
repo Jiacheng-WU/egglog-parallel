@@ -586,12 +586,23 @@ impl EGraph {
     }
 
     fn rebuild(&mut self) -> Result<()> {
-        let start = Instant::now();
-        fn incremental_rebuild(uf_size: usize, table_size: usize) -> bool {
-            uf_size <= (table_size / 8)
+        fn do_parallel() -> bool {
+            #[cfg(test)]
+            {
+                use rand::Rng;
+                rand::thread_rng().gen_bool(0.5)
+            }
+            #[cfg(not(test))]
+            {
+                rayon::current_num_threads() > 1
+            }
         }
+        if do_parallel() {
+            return self.rebuild_parallel();
+        }
+        let start = Instant::now();
+
         // The database changed. Rebuild. New entries should land after the given rules.
-        self.next_ts = self.next_ts.inc();
         let mut changed = true;
         while changed {
             changed = false;
@@ -640,6 +651,74 @@ impl EGraph {
                         Ok(())
                     })?;
                 }
+            }
+        }
+        log::info!("rebuild took {:?}", start.elapsed());
+        Ok(())
+    }
+
+    /// A variant of `rebuild` that attempts to combine rebuild rules into
+    /// larger rulesets to increase parallelism. This kind of preprocessing can
+    /// slow processing down in a single-threaded setting, so it is only used
+    /// when the number of active threads is greater than 1.
+    fn rebuild_parallel(&mut self) -> Result<()> {
+        let start = Instant::now();
+        #[derive(Default)]
+        struct RebuildState {
+            nonincremental: Vec<FunctionId>,
+            incremental: DenseIdMap<usize, SmallVec<[FunctionId; 2]>>,
+        }
+
+        impl RebuildState {
+            fn clear(&mut self) {
+                self.nonincremental.clear();
+                self.incremental.iter_mut().for_each(|(_, v)| v.clear());
+            }
+        }
+
+        let mut changed = true;
+        let mut state = RebuildState::default();
+        let mut scratch = Vec::new();
+        while changed {
+            changed = false;
+            state.clear();
+            self.next_ts = self.next_ts.inc();
+            // First, figure out which functions will be rebuilt nonincrementally,
+            // vs. incrementally. Group them together.
+            for (func, info) in self.funcs.iter_mut() {
+                let last_rebuilt_at = self.rules[info.nonincremental_rebuild_rule].last_run_at;
+                let table_size = self.db.estimate_size(info.table, None);
+                let uf_size = self.db.estimate_size(
+                    self.uf_table,
+                    Some(Constraint::GeConst {
+                        col: ColumnId::new(2),
+                        val: last_rebuilt_at.to_value(),
+                    }),
+                );
+                if incremental_rebuild(uf_size, table_size) {
+                    for (i, _) in info.incremental_rebuild_rules.iter().enumerate() {
+                        state.incremental.get_or_default(i).push(func);
+                    }
+                } else {
+                    state.nonincremental.push(func);
+                }
+            }
+            for func in state.nonincremental.iter().copied() {
+                scratch.push(self.funcs[func].nonincremental_rebuild_rule);
+                for rule in &self.funcs[func].incremental_rebuild_rules {
+                    self.rules[*rule].last_run_at = self.next_ts;
+                }
+            }
+            changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, self.next_ts)?;
+            scratch.clear();
+            for (i, funcs) in state.incremental.iter() {
+                for func in funcs.iter().copied() {
+                    let info = &mut self.funcs[func];
+                    scratch.push(info.incremental_rebuild_rules[i]);
+                    self.rules[info.nonincremental_rebuild_rule].last_run_at = self.next_ts;
+                }
+                changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, self.next_ts)?;
+                scratch.clear();
             }
         }
         log::info!("rebuild took {:?}", start.elapsed());
@@ -827,4 +906,10 @@ enum ProofReconstructionError {
     TracingNotEnabled,
     #[error("attempting to construct a proof that {term1} = {term2}, but they are not equal")]
     EqualityExplanationOfUnequalTerms { term1: String, term2: String },
+}
+
+/// Heuristic for deciding whether to do an incremental or nonincremental
+/// rebuild for a given table.
+fn incremental_rebuild(uf_size: usize, table_size: usize) -> bool {
+    uf_size <= (table_size / 8)
 }

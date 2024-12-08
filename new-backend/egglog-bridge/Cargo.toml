@@ -16,13 +16,16 @@ log = "0.4"
 indexmap = "2.2"
 petgraph = "0.6"
 web-time = "1.1"
+rayon = "1.10.0"
 
 [features]
 serial_examples = []
 
 [dev-dependencies]
 env_logger = "0.11"
-rayon = "1.10"
+mimalloc = "0.1"
+rand = "0.8.5"
+
 
 [[example]]
 name = "ac"

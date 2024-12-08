@@ -2,6 +2,11 @@ use std::mem;
 
 use egglog_bridge::{define_rule, ColumnTy, DefaultVal, EGraph, MergeFn};
 
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
 fn main() {
     const N: usize = 12;
     env_logger::init();
