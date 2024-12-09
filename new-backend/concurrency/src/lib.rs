@@ -4,12 +4,14 @@ pub(crate) mod bitset;
 pub(crate) mod concurrent_vec;
 pub(crate) mod notification;
 pub(crate) mod parallel_writer;
+pub(crate) mod waitgroup;
 use arc_swap::{ArcSwap, Guard};
 
 pub use bitset::BitSet;
 pub use concurrent_vec::ConcurrentVec;
 pub use notification::Notification;
 pub use parallel_writer::ParallelVecWriter;
+pub use waitgroup::{WaitGroupBuilder, WaitGroupHandle, Waiter};
 
 #[cfg(test)]
 mod tests;

@@ -325,6 +325,7 @@ impl<'a> JoinState<'a> {
                     }
                     self.run_plan(plan, cur + 1, binding_info, action_buf);
                 }
+                rayon::yield_now();
             };
         }
         macro_rules! drain_updates_parallel {
