@@ -387,7 +387,7 @@ impl Table for SortedWritesTable {
         let mut changed = false;
 
         // First: handle the removals.
-        changed |= self.do_delete();
+        changed |= self.do_delete(exec_state);
         changed |= self.do_insert(exec_state);
         self.maybe_rehash();
         changed
@@ -522,9 +522,9 @@ impl SortedWritesTable {
         changed
     }
 
-    fn do_delete(&mut self) -> bool {
+    fn do_delete(&mut self, exec_state: &mut ExecutionState) -> bool {
         let total = self.pending_state.total_removals.swap(0, Ordering::Relaxed);
-        if do_parallel(total) {
+        if exec_state.do_parallel(total, 100_000) {
             self.parallel_delete()
         } else {
             self.serial_delete()
@@ -534,7 +534,7 @@ impl SortedWritesTable {
     fn do_insert(&mut self, exec_state: &mut ExecutionState) -> bool {
         let total = self.pending_state.total_rows.swap(0, Ordering::Relaxed);
         self.data.data.reserve(total);
-        if do_parallel(total) {
+        if exec_state.do_parallel(total, 100_000) {
             if let Some(col) = self.sort_by {
                 self.parallel_insert(
                     exec_state,
@@ -1044,21 +1044,6 @@ impl OrderingChecker for SortChecker {
                 offsets.push((cur, start));
             }
         }
-    }
-}
-
-fn do_parallel(_workload_size: usize) -> bool {
-    #[cfg(test)]
-    {
-        // In tests, run serial and parallel variants half the time,
-        // nondeterministically.
-        use rand::{thread_rng, Rng};
-        thread_rng().gen::<bool>()
-    }
-
-    #[cfg(not(test))]
-    {
-        _workload_size > 100_000 && rayon::current_num_threads() > 1
     }
 }
 

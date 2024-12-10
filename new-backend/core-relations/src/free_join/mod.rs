@@ -9,6 +9,7 @@ use std::{
 
 use concurrency::ReadOptimizedLock;
 use numeric_id::{define_id, DenseIdMap, NumericId};
+use parallelism::ThreadPoolHandle;
 use rayon::iter::ParallelIterator;
 use smallvec::SmallVec;
 
@@ -181,6 +182,7 @@ pub struct Database {
     // because we keep an array per id in the UF.
     pub(crate) counters: DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_functions: DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
+    pub(crate) tp: ThreadPoolHandle,
     // Tracks the relative dependencies between tables during merge operations.
     deps: DependencyGraph,
     primitives: Primitives,
@@ -203,6 +205,17 @@ impl Database {
     /// Create an empty Database.
     pub fn new() -> Database {
         Database::default()
+    }
+
+    /// Create a database with the specified number of background threads.
+    ///
+    /// Having a single background thread is unlikely to be useful, if 1 or 0 is passed for
+    /// `num_threads` then we will avoid running operations in parallel.
+    pub fn with_threads(num_threads: usize) -> Database {
+        Database {
+            tp: ThreadPoolHandle::with_threads(if num_threads <= 1 { 0 } else { num_threads }),
+            ..Database::default()
+        }
     }
 
     /// Store a snapshot of the current database state.
@@ -268,6 +281,7 @@ impl Database {
             counters: &self.counters,
             external_funcs: &self.external_functions,
             prims: &self.primitives,
+            handle: &self.tp,
         }
     }
 

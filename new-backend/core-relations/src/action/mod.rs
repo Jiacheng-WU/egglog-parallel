@@ -5,6 +5,7 @@
 use std::{ops::Deref, sync::atomic::AtomicUsize};
 
 use numeric_id::{DenseIdMap, NumericId};
+use parallelism::ThreadPoolHandle;
 use smallvec::SmallVec;
 
 use crate::{
@@ -130,6 +131,7 @@ pub(crate) struct DbView<'a, Tables> {
     pub(crate) counters: &'a DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_funcs: &'a DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
     pub(crate) prims: &'a Primitives,
+    pub(crate) handle: &'a ThreadPoolHandle,
 }
 
 impl<T> Clone for DbView<'_, T> {
@@ -178,6 +180,27 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
     /// Get an immutable reference to the table with id `table`.
     pub fn get_table(&self, table: TableId) -> &WrappedTable {
         self.db.table_info.get_table(table)
+    }
+
+    pub fn handle(&self) -> &ThreadPoolHandle {
+        &self.db.handle
+    }
+
+    /// Query whether callers should run a particular workload in parallel, based on whether
+    /// workload size (`n`) exceeds a threshold (`useful_at`), and if the environment is configured
+    /// to use multiple threads.
+    pub fn do_parallel(&self, _n: usize, _useful_at: usize) -> bool {
+        #[cfg(test)]
+        {
+            // In tests, try parallel implementations half the time, nondeterministically, to
+            // increase test coverage.
+            use rand::Rng;
+            rand::thread_rng().gen_bool(0.5)
+        }
+        #[cfg(not(test))]
+        {
+            self.db.handle.num_threads() > 1 && _n > _useful_at
+        }
     }
 
     /// Get the _current_ value for a given key in `table`, or otherwise insert

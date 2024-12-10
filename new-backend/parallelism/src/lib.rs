@@ -1,4 +1,4 @@
-//! This crate provides a fairly simple work-stealing thread pool with support for nest fork/join
+//! This crate provides a fairly simple work-stealing thread pool with support for nested fork/join
 //! parallelism.
 //!
 //! It is a lot simpler than rayon, and is not as optimized for some advanced patterns that rayon
@@ -7,12 +7,13 @@
 //! thread waiting for other tasks to complete. Essentially everything else is less optimized than
 //! rayon: in particular there is no `join` primitive for avoiding heap allocations, and there are
 //! many scenarios in which work stealing in rayon will provide better performance than what is
-//! provided here (particuilarly if the amount of work is fine-grained).
+//! provided here (particuilarly if the amount of work per task is smaller).
 use std::{cell::Cell, marker::PhantomData};
 
 use concurrency::WaitGroupBuilder;
 use crossbeam::channel::{Receiver, Sender};
 
+/// A handle on a thread pool that allows for executing work that must complete within `'scope`
 pub struct Scope<'scope> {
     tp: ThreadPoolHandle,
     wg: Option<WaitGroupBuilder>,
@@ -24,6 +25,10 @@ impl<'scope> Scope<'scope> {
         &self.tp
     }
     pub fn spawn(&self, f: impl FnOnce() + Send + 'scope) {
+        if self.tp.num_threads() == 0 {
+            f();
+            return;
+        }
         let guard = self.wg.as_ref().unwrap().add();
         let work: LifetimeWork = Box::new(move || {
             // move `wg` into the closure.
@@ -113,13 +118,6 @@ impl ThreadPoolHandle {
     /// The target number of threads active in this thread pool.
     pub fn num_threads(&self) -> usize {
         self.num_threads
-    }
-
-    /// Submit a closure to be executed in the thread pool.
-    pub fn submit(&self, f: impl FnOnce() + Send + 'static) {
-        self.sender
-            .send(Box::new(f))
-            .expect("unexpected thread pool disconnection");
     }
 
     /// Create a scope for (potentially) nested fork/join parallelism executed on thsi thread pool.
