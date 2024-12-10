@@ -17,7 +17,8 @@ use crossbeam::channel::{Receiver, Sender};
 pub struct Scope<'scope> {
     tp: ThreadPoolHandle,
     wg: Option<WaitGroupBuilder>,
-    _marker: PhantomData<&'scope ()>,
+    // We want this lifetime to be invariant.
+    _marker: PhantomData<Cell<&'scope mut ()>>,
 }
 
 impl<'scope> Scope<'scope> {
@@ -121,7 +122,7 @@ impl ThreadPoolHandle {
     }
 
     /// Create a scope for (potentially) nested fork/join parallelism executed on thsi thread pool.
-    pub fn scope<'a>(&self, f: impl FnOnce(&Scope<'a>) + Send) {
+    pub fn scope<'a>(&'a self, f: impl FnOnce(&Scope<'a>) + Send) {
         let scope = Scope {
             tp: self.clone(),
             wg: Some(WaitGroupBuilder::new()),

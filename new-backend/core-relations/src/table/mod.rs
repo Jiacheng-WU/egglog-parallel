@@ -15,7 +15,7 @@ use std::{
     },
 };
 
-use crossbeam_queue::SegQueue;
+use crossbeam_queue::{ArrayQueue, SegQueue};
 use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
@@ -447,48 +447,51 @@ impl SortedWritesTable {
     }
 
     /// Flush all pending removals, in parallel.
-    fn parallel_delete(&mut self) -> bool {
+    fn parallel_delete(&mut self, state: &mut ExecutionState) -> bool {
         let shard_data = self.hash.shard_data();
-        let stale_delta: usize = self
-            .hash
-            .mut_shards()
-            .par_iter_mut()
-            .enumerate()
-            .filter_map(|(shard_id, shard)| {
+        let results = ArrayQueue::<usize>::new(self.hash.shard_data().n_shards());
+        state.handle().scope(|scope| {
+            let pending_state = &self.pending_state;
+            let results = &results;
+            let n_keys = self.n_keys;
+            let data = &self.data;
+            for (shard_id, shard) in self.hash.mut_shards().iter_mut().enumerate() {
                 let shard_id = ShardId::from_usize(shard_id);
                 if self.pending_state.pending_removals[shard_id].is_empty() {
-                    return None;
+                    return;
                 }
-                Some((shard_id, shard))
-            })
-            .map(|(shard_id, shard)| {
-                let queue = &self.pending_state.pending_removals[shard_id];
-                let mut marked_stale = 0;
-                while let Some(buf) = queue.pop() {
-                    for to_remove in buf.non_stale() {
-                        let (actual_shard, hc) = hash_code(shard_data, to_remove, self.n_keys);
-                        assert_eq!(actual_shard, shard_id);
-                        if let Ok(entry) = shard.find_entry(hc, |entry| {
-                            entry.hashcode == (hc as _)
-                                && &self.data.get_row(entry.row).unwrap()[0..self.n_keys]
-                                    == to_remove
-                        }) {
-                            let (ent, _) = entry.remove();
-                            // SAFETY: The safety requirements of
-                            // `set_stale_shared` are that there are no
-                            // concurrent accesses to `row`. No other threads
-                            // can access this row within this method because
-                            // different `shards` partition the space
-                            // (guaranteed by the assertion above), and we
-                            // launch at most one thread per shard.
-                            marked_stale +=
-                                unsafe { !self.data.data.set_stale_shared(ent.row) } as usize;
+                scope.spawn(move || {
+                    let queue = &pending_state.pending_removals[shard_id];
+                    let mut marked_stale = 0;
+                    while let Some(buf) = queue.pop() {
+                        for to_remove in buf.non_stale() {
+                            let (actual_shard, hc) = hash_code(shard_data, to_remove, n_keys);
+                            assert_eq!(actual_shard, shard_id);
+                            if let Ok(entry) = shard.find_entry(hc, |entry| {
+                                entry.hashcode == (hc as _)
+                                    && &data.get_row(entry.row).unwrap()[0..n_keys] == to_remove
+                            }) {
+                                let (ent, _) = entry.remove();
+                                // SAFETY: The safety requirements of
+                                // `set_stale_shared` are that there are no
+                                // concurrent accesses to `row`. No other threads
+                                // can access this row within this method because
+                                // different `shards` partition the space
+                                // (guaranteed by the assertion above), and we
+                                // launch at most one thread per shard.
+                                marked_stale +=
+                                    unsafe { !data.data.set_stale_shared(ent.row) } as usize;
+                            }
                         }
                     }
-                }
-                marked_stale
-            })
-            .sum();
+                    results.push(marked_stale).unwrap();
+                });
+            }
+        });
+        let mut stale_delta = 0;
+        while let Some(m) = results.pop() {
+            stale_delta += m;
+        }
         // Update the stale count with the total marked stale.
         self.data.stale_rows += stale_delta;
         stale_delta > 0
@@ -525,7 +528,7 @@ impl SortedWritesTable {
     fn do_delete(&mut self, exec_state: &mut ExecutionState) -> bool {
         let total = self.pending_state.total_removals.swap(0, Ordering::Relaxed);
         if exec_state.do_parallel(total, 100_000) {
-            self.parallel_delete()
+            self.parallel_delete(exec_state)
         } else {
             self.serial_delete()
         }
@@ -680,128 +683,122 @@ impl SortedWritesTable {
         let n_cols = self.n_columns;
         let next_offset = RowId::from_usize(self.data.data.len());
         let row_writer = self.data.data.parallel_writer();
-        let pending_adds = self
-            .hash
-            .mut_shards()
-            .par_iter_mut()
-            .enumerate()
-            .map(|(shard_id, shard)| {
+        let results = ArrayQueue::<(C, usize, bool)>::new(self.hash.shard_data().n_shards());
+        exec_state.handle().scope(|scope| {
+            for (shard_id, shard) in self.hash.mut_shards().iter_mut().enumerate() {
                 let shard_id = ShardId::from_usize(shard_id);
                 let mut checker = checker.clone();
                 let mut exec_state = exec_state.new_handle();
-                let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
-                let queue = &self.pending_state.pending_rows[shard_id];
-                let mut marked_stale = 0usize;
-                let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
-                let mut work_done = 0;
-                // Phase 1: process all incoming updates:
-                // * Add new values to `staged`
-                // * Removing entries in `shard` and mark them as stale in
-                // `data` if they will be overwritten.
-                while let Some(buf) = queue.pop() {
-                    work_done += buf.len();
-                    // We create a read_handle once per batch to avoid blocking
-                    // too many threads if someone needs to resize the row
-                    // writer.
-                    let read_handle = row_writer.read_handle();
-                    for row in buf.non_stale() {
-                        checker.check_local(row);
-                        let key = &row[0..n_keys];
-                        let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
-                        assert_eq!(shard_id, _actual_shard);
-                        match shard.find_entry(hash, |ent| {
-                            ent.hashcode == hash as HashCode
-                                && &read_handle.get_row(ent.row)[0..n_keys] == key
-                        }) {
-                            Ok(occ) => {
-                                let cur = read_handle.get_row(occ.get().row);
-                                // Need to run a merge function.
-                                if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
-                                    // SAFETY: The safety requirements of
-                                    // `set_stale_shared` are that there are no
-                                    // concurrent accesses to `row`. We have
-                                    // exclusive access to this shard.
-                                    unsafe {
-                                        let _was_stale =
-                                            read_handle.set_stale_shared(occ.get().row);
-                                        debug_assert!(!_was_stale);
-                                    };
-                                    // We have a new entry. Stage it to be added
-                                    // and then remove this entry.
-                                    staged.insert(&scratch, |cur, new, out| {
-                                        (self.merge)(&mut exec_state, cur, new, out)
-                                    });
-                                    occ.remove();
-                                    marked_stale += 1;
+                let results = &results;
+                let row_writer = &row_writer;
+                let pending_rows = &self.pending_state.pending_rows;
+                let merge = &self.merge;
+                scope.spawn(move || {
+                    let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
+                    let queue = &pending_rows[shard_id];
+                    let mut marked_stale = 0usize;
+                    let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                    // Phase 1: process all incoming updates:
+                    // * Add new values to `staged`
+                    // * Removing entries in `shard` and mark them as stale in
+                    // `data` if they will be overwritten.
+                    while let Some(buf) = queue.pop() {
+                        // We create a read_handle once per batch to avoid blocking
+                        // too many threads if someone needs to resize the row
+                        // writer.
+                        let read_handle = row_writer.read_handle();
+                        for row in buf.non_stale() {
+                            checker.check_local(row);
+                            let key = &row[0..n_keys];
+                            let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
+                            assert_eq!(shard_id, _actual_shard);
+                            match shard.find_entry(hash, |ent| {
+                                ent.hashcode == hash as HashCode
+                                    && &read_handle.get_row(ent.row)[0..n_keys] == key
+                            }) {
+                                Ok(occ) => {
+                                    let cur = read_handle.get_row(occ.get().row);
+                                    // Need to run a merge function.
+                                    if (merge)(&mut exec_state, cur, row, &mut scratch) {
+                                        // SAFETY: The safety requirements of
+                                        // `set_stale_shared` are that there are no
+                                        // concurrent accesses to `row`. We have
+                                        // exclusive access to this shard.
+                                        unsafe {
+                                            let _was_stale =
+                                                read_handle.set_stale_shared(occ.get().row);
+                                            debug_assert!(!_was_stale);
+                                        };
+                                        // We have a new entry. Stage it to be added
+                                        // and then remove this entry.
+                                        staged.insert(&scratch, |cur, new, out| {
+                                            (merge)(&mut exec_state, cur, new, out)
+                                        });
+                                        occ.remove();
+                                        marked_stale += 1;
+                                    }
+                                    scratch.clear()
                                 }
-                                scratch.clear()
-                            }
-                            Err(_) => {
-                                // Stage this row to get inserted later.
-                                staged.insert(row, |cur, new, out| {
-                                    (self.merge)(&mut exec_state, cur, new, out)
-                                });
+                                Err(_) => {
+                                    // Stage this row to get inserted later.
+                                    staged.insert(row, |cur, new, out| {
+                                        (merge)(&mut exec_state, cur, new, out)
+                                    });
+                                }
                             }
                         }
                     }
-                    if work_done > 20_000 {
-                        // In high-scale microbenchmarks we've noticed that rayon can get locked up
-                        // if any given chunk of work takes too long. We use this counter as a
-                        // signal yield work to other workers, which seems to help avoid this.
-                        rayon::yield_now();
-                        work_done = 0;
-                    }
-                }
-                // Phase 2: Write the staged rows to the row writer. This only
-                // works due to the `ParallelRowBufWriter` machinery.
-                let start_row = staged.write_output(&row_writer);
-                // Phase 3: With the values buffered in the row buffer, we can
-                // write them back to the shard, pointed to the correct rows.
+                    // Phase 2: Write the staged rows to the row writer. This only
+                    // works due to the `ParallelRowBufWriter` machinery.
+                    let start_row = staged.write_output(&row_writer);
+                    // Phase 3: With the values buffered in the row buffer, we can
+                    // write them back to the shard, pointed to the correct rows.
 
-                // In the serial implementation, we do phases2 and 3 inline with
-                // processing the incoming mutation, but separating them out
-                // this way allows us to do a single write to the shared row
-                // buffer, rather than one per row, which would cause
-                // contention.
-                let to_add = staged.into_rows();
-                let changed = marked_stale > 0 || to_add.len() > 0;
-                let mut cur_row = start_row;
-                for row in to_add.non_stale() {
-                    let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
-                    debug_assert_eq!(_actual_shard, shard_id);
-                    shard.insert_unique(
-                        hc,
-                        TableEntry {
-                            hashcode: hc as _,
-                            row: cur_row,
-                        },
-                        |entry| entry.hashcode as u64,
-                    );
-                    cur_row = cur_row.inc();
-                }
-                (checker, marked_stale, changed)
-            })
-            .collect_vec_list();
+                    // In the serial implementation, we do phases2 and 3 inline with
+                    // processing the incoming mutation, but separating them out
+                    // this way allows us to do a single write to the shared row
+                    // buffer, rather than one per row, which would cause
+                    // contention.
+                    let to_add = staged.into_rows();
+                    let changed = marked_stale > 0 || to_add.len() > 0;
+                    let mut cur_row = start_row;
+                    for row in to_add.non_stale() {
+                        let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
+                        debug_assert_eq!(_actual_shard, shard_id);
+                        shard.insert_unique(
+                            hc,
+                            TableEntry {
+                                hashcode: hc as _,
+                                row: cur_row,
+                            },
+                            |entry| entry.hashcode as u64,
+                        );
+                        cur_row = cur_row.inc();
+                    }
+                    results.push((checker, marked_stale, changed)).ok().unwrap();
+                });
+            }
+        });
+        let mut pending_adds = Vec::with_capacity(self.hash.shard_data().n_shards());
+        while let Some(res) = results.pop() {
+            pending_adds.push(res);
+        }
         mem::drop(row_writer);
         // Now we just need to reset our invariants.
 
         // Confirm none of the writes violated sort order and update the
         // `offsets` vector.
-        let checker = C::check_global(pending_adds.iter().flatten().map(|(checker, _, _)| checker));
+        let checker = C::check_global(pending_adds.iter().map(|(checker, _, _)| checker));
         checker.update_offsets(next_offset, &mut self.offsets);
 
         // Update the staleness counters.
         self.data.stale_rows += pending_adds
             .iter()
-            .flatten()
             .map(|(_, stale, _)| *stale)
             .sum::<usize>();
 
         // Register any changes.
-        let changed = pending_adds
-            .iter()
-            .flatten()
-            .any(|(_, _, changed)| *changed);
+        let changed = pending_adds.iter().any(|(_, _, changed)| *changed);
         changed
     }
 

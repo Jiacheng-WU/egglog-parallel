@@ -2,10 +2,6 @@ use core_relations::{Database, SortedWritesTable, Table, Value};
 use divan::{counter::ItemsCount, Bencher};
 use numeric_id::NumericId;
 use rand::{thread_rng, Rng};
-use rayon::{
-    iter::{ParallelBridge, ParallelIterator},
-    ThreadPoolBuilder,
-};
 
 fn main() {
     divan::main()
@@ -104,17 +100,13 @@ fn bench_workload<const K: usize, const C: usize>(
     n_merges: usize,
     threads: usize,
 ) {
-    const BATCH_SIZE: usize = 1024;
+    const BATCH_SIZE: usize = 2048;
     let epoch_size = workload.len().next_multiple_of(n_merges) / n_merges;
-    let pool = ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .build()
-        .unwrap();
     let workload_size = workload.len();
     bench
         .with_inputs(|| {
             (
-                Database::default(),
+                Database::with_threads(threads),
                 SortedWritesTable::new(K, C, None, |_, old, new, out| {
                     out.extend_from_slice(new);
                     old != new
@@ -123,19 +115,33 @@ fn bench_workload<const K: usize, const C: usize>(
         })
         .input_counter(move |_| ItemsCount::new(workload_size))
         .bench_values(|(db, mut table)| {
-            pool.install(|| {
-                for outer in workload.chunks(epoch_size) {
-                    outer.chunks(BATCH_SIZE).par_bridge().for_each(|batch| {
-                        let mut buf = table.new_buffer();
-                        for op in batch {
-                            match op {
-                                Operation::Insert(row) => buf.stage_insert(row),
-                                Operation::Remove(key) => buf.stage_remove(key),
-                            }
+            for outer in workload.chunks(epoch_size) {
+                db.with_execution_state(|es| {
+                    es.handle().scope(|scope| {
+                        let table = &table;
+                        for batch in outer.chunks(BATCH_SIZE) {
+                            scope.spawn(move || {
+                                let mut buf = table.new_buffer();
+                                for op in batch {
+                                    match op {
+                                        Operation::Insert(row) => buf.stage_insert(row),
+                                        Operation::Remove(key) => buf.stage_remove(key),
+                                    }
+                                }
+                            });
                         }
                     });
-                    db.with_execution_state(|es| table.merge(es));
-                }
-            })
+                });
+                // outer.chunks(BATCH_SIZE).par_bridge().for_each(|batch| {
+                //     let mut buf = table.new_buffer();
+                //     for op in batch {
+                //         match op {
+                //             Operation::Insert(row) => buf.stage_insert(row),
+                //             Operation::Remove(key) => buf.stage_remove(key),
+                //         }
+                //     }
+                // });
+                db.with_execution_state(|es| table.merge(es));
+            }
         })
 }
