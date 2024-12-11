@@ -911,8 +911,9 @@ impl EGraph {
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
                 let _ = copy_rules.par_iter().for_each(|(rule_name, rule)| {
-                    let mut all_matches = Vec::with_capacity(32);
-                    for i in 0..32 {
+                    let match_pool_size = 1;
+                    let mut all_matches = Vec::with_capacity(match_pool_size);
+                    for i in 0..match_pool_size {
                         all_matches.push(Mutex::new(vec![]))
                     }
                     let mut counter = SyncUnsafeCell::new(0usize);
@@ -924,7 +925,7 @@ impl EGraph {
                         did_match.store(true, std::sync::atomic::Ordering::SeqCst);
                         assert_eq!(values.len(), rule.query.vars.len());
 
-                        all_matches[counter.get_ref() % 32]
+                        all_matches[counter.get_ref() % match_pool_size]
                             .lock()
                             .unwrap()
                             .extend_from_slice(values);

@@ -192,7 +192,20 @@ impl<'b> Context<'b> {
                 partition_size,
                 ..
             } => {
-                let partition_size = *partition_size;
+                let partition_size = {
+                    let min_len = trie_accesses
+                        .iter()
+                        .map(|(j, _a)| tries[*j].len())
+                        .min()
+                        .unwrap();
+                    // if min_len < 10 {
+                    //     1
+                    // } else {
+                    //     *partition_size
+                    // }
+                    *partition_size
+                };
+
                 if let Some(x) = trie_accesses
                     .iter()
                     .map(|(atom, _)| tries[*atom].len())
@@ -633,12 +646,12 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
-        let total_threads = 1024;
+        let total_threads = 128;
         let intersected_var_len =
             usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
 
         let partition_size = usize::max(
-            2,
+            1,
             (total_threads as f64)
                 .powf((intersected_var_len as f64).recip())
                 .round() as usize,
@@ -652,8 +665,19 @@ impl EGraph {
                 value_idx,
                 variable_name: v,
                 info: info.clone(),
-                partition_size: if info.occurences.len() > 1 {
-                    partition_size
+                partition_size: 
+                // 1,
+
+                // partition_size,
+                
+                // if info.occurences.len() > 1 {
+                //     partition_size
+                // } else {
+                //     1
+                // },
+
+                if i == 0 {
+                    total_threads
                 } else {
                     1
                 },
@@ -968,10 +992,12 @@ impl LazyTrie {
                     LazyTrieInner::Borrowed { .. } => unreachable!(),
                 };
 
+                let lazy_trie: &LazyTrieInner = unsafe {
+                    let lazy_trie = (&write_lock as &LazyTrieInner) as *const LazyTrieInner;
+                    lazy_trie.as_ref().unwrap()
+                };
                 drop(write_lock);
-
-                // Reacquire again
-                self.0.read().unwrap()
+                lazy_trie
             }
             LazyTrieInner::Borrowed { .. } => {
                 drop(read_lock);
@@ -991,17 +1017,34 @@ impl LazyTrie {
                     LazyTrieInner::Delayed(..) => unreachable!(),
                 }
 
+                let lazy_trie: &LazyTrieInner = unsafe {
+                    let lazy_trie = (&write_lock as &LazyTrieInner) as *const LazyTrieInner;
+                    lazy_trie.as_ref().unwrap()
+                };
                 drop(write_lock);
-                self.0.read().unwrap()
+                lazy_trie
             }
-            LazyTrieInner::Sparse(..) => read_lock,
+            LazyTrieInner::Sparse(..) => {
+                let lazy_trie: &LazyTrieInner = unsafe {
+                    let lazy_trie = (&read_lock as &LazyTrieInner) as *const LazyTrieInner;
+                    lazy_trie.as_ref().unwrap()
+                };
+                drop(read_lock);
+                lazy_trie
+            },
         };
+
+        // let lazy_trie: &LazyTrieInner = unsafe {
+        //     let lazy_trie = (&lazy_trie_lock as &LazyTrieInner) as *const LazyTrieInner;
+        //     lazy_trie.as_ref().unwrap()
+        // };
+        // drop(lazy_trie_lock);
 
         // There is probably something cleaner to do here compared with the
         // `force_borrowed` construct.
         let should_stop = SyncUnsafeCell::new(false);
 
-        let LazyTrieInner::Sparse(m) = &lazy_trie as &LazyTrieInner else {
+        let LazyTrieInner::Sparse(m) = lazy_trie else {
             std::process::exit(-1);
         };
         let len = m.len();
