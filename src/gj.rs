@@ -656,6 +656,7 @@ impl EGraph {
                 .powf((intersected_var_len as f64).recip())
                 .round() as usize,
         );
+        // dbg!(partition_size);
 
         let var_instrs = vars.iter().enumerate().map(|(i, (&v, info))| {
             let value_idx = query.vars.get_index_of(&v).unwrap_or_else(|| {
@@ -670,17 +671,17 @@ impl EGraph {
 
                 // partition_size,
                 
-                // if info.occurences.len() > 1 {
-                //     partition_size
-                // } else {
-                //     1
-                // },
-
-                if i == 0 {
-                    total_threads
+                if info.occurences.len() > 1 {
+                    partition_size
                 } else {
                     1
                 },
+
+                // if i == 0 {
+                //     total_threads
+                // } else {
+                //     1
+                // },
                 trie_accesses: info
                     .occurences
                     .iter()
@@ -1071,6 +1072,19 @@ impl LazyTrie {
             return Ok(());
         }
 
+        let partition_size = usize::min(partition_size, len);
+
+        if partition_size == 1 {
+            for (k, v) in m.iter() {
+                if f(0, *k, v).is_err() {
+                    return Err(());
+                }
+            }
+            return Ok(());
+        }
+        // dbg!(partition_size);
+        // dbg!(len);
+
         let chunk = (len - 1) / partition_size + 1;
         (0..partition_size)
             .into_par_iter()
@@ -1128,15 +1142,14 @@ impl LazyTrie {
                     LazyTrieInner::Borrowed { .. } => unreachable!(),
                 };
 
-                drop(write_lock);
-
                 // Reacquire again
-                let this = self.0.read().unwrap();
                 let LazyTrieInner::Sparse(m) = &this as &LazyTrieInner else {
                     unreachable!();
                 };
 
-                m.get(&value).map(|t| t as *const LazyTrie)
+                let trie = m.get(&value).map(|t| t as *const LazyTrie);
+                drop(write_lock);
+                trie
             }
 
             LazyTrieInner::Sparse(m) => m.get(&value).map(|t| t as *const LazyTrie),
