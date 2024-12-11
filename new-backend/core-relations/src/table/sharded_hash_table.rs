@@ -19,8 +19,9 @@ impl ShardData {
         1 << self.log2_shard_count
     }
     pub(crate) fn shard_id(&self, hash: u64) -> ShardId {
-        let high_bits =
-            (hash.wrapping_shr(64 - self.log2_shard_count)) & ((1 << self.log2_shard_count) - 1);
+        // Leave the high 7 bits of hash alone, use the next highest to determine the shard.
+        let high_bits = (hash.wrapping_shr((64 - 7) - self.log2_shard_count))
+            & ((1 << self.log2_shard_count) - 1);
         ShardId::from_usize(high_bits as usize)
     }
 }
@@ -49,7 +50,9 @@ impl<T> ShardedHashTable<T> {
         self.shards.iter_mut().for_each(|s| s.clear());
     }
     pub(crate) fn with_shards(shards: usize) -> Self {
-        let log2_shard_count = shards.next_power_of_two().trailing_zeros();
+        // We should avoid having too many shards, otherwise hashing could get quite slow within a
+        // shard.
+        let log2_shard_count = std::cmp::min(shards.next_power_of_two(), 4096).trailing_zeros();
         let shards = (0..(1 << log2_shard_count))
             .map(|_| HashTable::new())
             .collect::<Vec<_>>();

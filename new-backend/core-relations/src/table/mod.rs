@@ -7,7 +7,7 @@
 use std::{
     any::Any,
     cmp,
-    hash::Hasher,
+    hash::{BuildHasherDefault, Hasher},
     mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
@@ -16,11 +16,12 @@ use std::{
 };
 
 use crossbeam_queue::{ArrayQueue, SegQueue};
+use gxhash::GxHasher;
 use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
-use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHasher;
 use sharded_hash_table::{ShardData, ShardId, ShardedHashTable};
+use smallvec::SmallVec;
 
 use crate::{
     action::ExecutionState,
@@ -42,7 +43,7 @@ mod tests;
 // NB: we currently only use 32 bits of hash code. To use 64, we can change
 // `HashCode` here to `u64`.
 
-type HashCode = u32;
+type HashCode = u64;
 
 /// A pointer to a row in the table.
 #[derive(Clone, Debug)]
@@ -546,9 +547,10 @@ impl SortedWritesTable {
                         current: None,
                         baseline: self.offsets.last().map(|(v, _)| *v),
                     },
+                    total,
                 )
             } else {
-                self.parallel_insert(exec_state, ())
+                self.parallel_insert(exec_state, (), total)
             }
         } else {
             self.serial_insert(exec_state)
@@ -673,6 +675,7 @@ impl SortedWritesTable {
         &mut self,
         exec_state: &ExecutionState,
         checker: C,
+        total_rows: usize,
     ) -> bool {
         // Parallel insert uses one giant parallel foreach. We have updates
         // pre-sharded, and one logical thread can process updates for each
@@ -684,6 +687,7 @@ impl SortedWritesTable {
         let next_offset = RowId::from_usize(self.data.data.len());
         let row_writer = self.data.data.parallel_writer();
         let results = ArrayQueue::<(C, usize, bool)>::new(self.hash.shard_data().n_shards());
+        let outer_start = std::time::Instant::now();
         exec_state.handle().scope(|scope| {
             for (shard_id, shard) in self.hash.mut_shards().iter_mut().enumerate() {
                 let shard_id = ShardId::from_usize(shard_id);
@@ -694,10 +698,20 @@ impl SortedWritesTable {
                 let pending_rows = &self.pending_state.pending_rows;
                 let merge = &self.merge;
                 scope.spawn(move || {
+                    let shard_start = std::time::Instant::now();
                     let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
                     let queue = &pending_rows[shard_id];
                     let mut marked_stale = 0usize;
-                    let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                    let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols, total_rows);
+                    let mut work_done = 0;
+                    let mut n_probes = 0usize;
+                    let mut time_in_outbuf = std::time::Duration::default();
+                    fn accum(dur: &mut std::time::Duration, f: impl FnOnce()) {
+                        let todo_remove = 1;
+                        let start = std::time::Instant::now();
+                        f();
+                        *dur += start.elapsed();
+                    }
                     // Phase 1: process all incoming updates:
                     // * Add new values to `staged`
                     // * Removing entries in `shard` and mark them as stale in
@@ -708,11 +722,13 @@ impl SortedWritesTable {
                         // writer.
                         let read_handle = row_writer.read_handle();
                         for row in buf.non_stale() {
+                            work_done += 1;
                             checker.check_local(row);
                             let key = &row[0..n_keys];
                             let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
                             assert_eq!(shard_id, _actual_shard);
                             match shard.find_entry(hash, |ent| {
+                                n_probes += 1;
                                 ent.hashcode == hash as HashCode
                                     && &read_handle.get_row(ent.row)[0..n_keys] == key
                             }) {
@@ -731,8 +747,10 @@ impl SortedWritesTable {
                                         };
                                         // We have a new entry. Stage it to be added
                                         // and then remove this entry.
-                                        staged.insert(&scratch, |cur, new, out| {
-                                            (merge)(&mut exec_state, cur, new, out)
+                                        accum(&mut time_in_outbuf, || {
+                                            staged.insert(&scratch, |cur, new, out| {
+                                                (merge)(&mut exec_state, cur, new, out)
+                                            })
                                         });
                                         occ.remove();
                                         marked_stale += 1;
@@ -741,16 +759,20 @@ impl SortedWritesTable {
                                 }
                                 Err(_) => {
                                     // Stage this row to get inserted later.
-                                    staged.insert(row, |cur, new, out| {
-                                        (merge)(&mut exec_state, cur, new, out)
+                                    accum(&mut time_in_outbuf, || {
+                                        staged.insert(row, |cur, new, out| {
+                                            (merge)(&mut exec_state, cur, new, out)
+                                        })
                                     });
                                 }
                             }
                         }
                     }
+                    let phase1_end = shard_start.elapsed();
                     // Phase 2: Write the staged rows to the row writer. This only
                     // works due to the `ParallelRowBufWriter` machinery.
                     let start_row = staged.write_output(&row_writer);
+                    let phase2_end = shard_start.elapsed();
                     // Phase 3: With the values buffered in the row buffer, we can
                     // write them back to the shard, pointed to the correct rows.
 
@@ -759,10 +781,10 @@ impl SortedWritesTable {
                     // this way allows us to do a single write to the shared row
                     // buffer, rather than one per row, which would cause
                     // contention.
-                    let to_add = staged.into_rows();
-                    let changed = marked_stale > 0 || to_add.len() > 0;
+                    let mut changed = marked_stale > 0;
                     let mut cur_row = start_row;
-                    for row in to_add.non_stale() {
+                    for row in staged.rows() {
+                        changed = true;
                         let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
                         debug_assert_eq!(_actual_shard, shard_id);
                         shard.insert_unique(
@@ -776,6 +798,13 @@ impl SortedWritesTable {
                         cur_row = cur_row.inc();
                     }
                     results.push((checker, marked_stale, changed)).ok().unwrap();
+                    let todo_remove = 1;
+                    // eprintln!(
+                    //     "shard {} took {:?}, total from start = {:?}, phase1={phase1_end:?}, phase2={phase2_end:?} work done = {work_done}, probes={n_probes}, outbuf_time={time_in_outbuf:?}, n_keys={n_keys}",
+                    //     shard_id.index(),
+                    //     shard_start.elapsed(),
+                    //     outer_start.elapsed()
+                    // );
                 });
             }
         });
@@ -904,6 +933,15 @@ fn get_entry_mut<'a>(
         .map(|ent| &mut ent.row)
 }
 
+#[inline(always)]
+fn hash_slice_with_seed(slice: &[Value], seed: usize) -> u64 {
+    let mut hasher = FxHasher::with_seed(seed);
+    for val in slice {
+        hasher.write_usize(val.index());
+    }
+    hasher.finish()
+}
+
 fn hash_code(shard_data: ShardData, row: &[Value], n_keys: usize) -> (ShardId, u64) {
     let mut hasher = FxHasher::default();
     for val in &row[0..n_keys] {
@@ -911,6 +949,14 @@ fn hash_code(shard_data: ShardData, row: &[Value], n_keys: usize) -> (ShardId, u
     }
     let full_code = hasher.finish();
     (shard_data.shard_id(full_code), full_code as HashCode as u64)
+}
+
+fn hash_code_with_seed(row: &[Value], n_keys: usize, seed: usize) -> u64 {
+    let mut hasher = FxHasher::with_seed(seed);
+    for val in &row[0..n_keys] {
+        hasher.write_usize(val.index());
+    }
+    hasher.finish() as HashCode as u64
 }
 
 /// A simple struct for packaging up pending mutations to a `SortedWritesTable`.
@@ -1055,20 +1101,28 @@ struct StagedOutputs {
     rows: RowBuffer,
     n_stale: usize,
     scratch: Pooled<Vec<Value>>,
+    other_hash: std::collections::HashMap<
+        SmallVec<[Value; 4]>,
+        Pooled<Vec<Value>>,
+        BuildHasherDefault<FxHasher>,
+    >,
 }
 
 impl StagedOutputs {
-    fn into_rows(self) -> RowBuffer {
-        self.rows
+    fn rows(&self) -> impl Iterator<Item = &[Value]> {
+        let todo_cleanup = 1;
+        // self.rows.non_stale()
+        self.other_hash.values().map(|x| x.as_slice())
     }
-    fn new(shard_data: ShardData, n_keys: usize, n_cols: usize) -> Self {
+    fn new(shard_data: ShardData, n_keys: usize, n_cols: usize, cap: usize) -> Self {
         StagedOutputs {
             shard_data,
             n_keys,
             n_stale: 0,
-            hash: HashTable::default(),
+            hash: HashTable::with_capacity(cap),
             rows: RowBuffer::new(n_cols),
             scratch: with_pool_set(|ps| ps.get::<Vec<Value>>()),
+            other_hash: Default::default(),
         }
     }
 
@@ -1077,49 +1131,97 @@ impl StagedOutputs {
         row: &[Value],
         mut merge_fn: impl FnMut(&[Value], &[Value], &mut Vec<Value>) -> bool,
     ) {
-        use hashbrown::hash_table::Entry;
-        let (_, hc) = hash_code(self.shard_data, row, self.n_keys);
-        let entry = self.hash.entry(
-            hc,
-            |te| {
-                te.hashcode() == hc
-                    && self.rows.get_row(te.row)[0..self.n_keys] == row[0..self.n_keys]
-            },
-            TableEntry::hashcode,
-        );
-        match entry {
-            Entry::Occupied(mut occupied_entry) => {
-                let cur = self.rows.get_row(occupied_entry.get().row);
+        let todo_clean_up = 1;
+        let key: SmallVec<[Value; 4]> = row[0..self.n_keys].into();
+        match self.other_hash.entry(key) {
+            std::collections::hash_map::Entry::Occupied(occ) => {
+                let cur = occ.get();
                 if merge_fn(cur, row, &mut self.scratch) {
-                    let new = self.rows.add_row(&self.scratch);
-                    self.rows.set_stale(occupied_entry.get().row);
-                    self.n_stale += 1;
-                    occupied_entry.get_mut().row = new;
+                    mem::swap(&mut self.scratch, occ.into_mut());
                 }
                 self.scratch.clear();
             }
-            Entry::Vacant(vacant_entry) => {
-                let next = self.rows.add_row(row);
-                vacant_entry.insert(TableEntry {
-                    hashcode: hc as _,
-                    row: next,
-                });
+            std::collections::hash_map::Entry::Vacant(v) => {
+                let mut res: Pooled<Vec<Value>> = with_pool_set(|ps| ps.get());
+                res.extend_from_slice(row);
+                v.insert(res);
             }
         }
+        // use hashbrown::hash_table::Entry;
+        // let hc = hash_code_with_seed(row, self.n_keys, 0xFF);
+        // // let entry = self.hash.entry(
+        // //     hc,
+        // //     |te| {
+        // //         te.hashcode() == hc
+        // //             && self.rows.get_row(te.row)[0..self.n_keys] == row[0..self.n_keys]
+        // //     },
+        // //     TableEntry::hashcode,
+        // // );
+        // if let Some(cur_entry) = self.hash.find_mut(hc, |ent| {
+        //     ent.hashcode == hc as HashCode
+        //         && self.rows.get_row(ent.row)[0..self.n_keys] == row[0..self.n_keys]
+        // }) {
+        //     let cur = self.rows.get_row(cur_entry.row);
+        //     if merge_fn(cur, row, &mut self.scratch) {
+        //         cur_entry.row = self.rows.add_row(&self.scratch);
+        //         self.rows.set_stale(cur_entry.row);
+        //         self.n_stale += 1;
+        //     }
+        //     self.scratch.clear();
+        // } else {
+        //     let next = self.rows.add_row(row);
+        //     self.hash.insert_unique(
+        //         hc,
+        //         TableEntry {
+        //             hashcode: hc as _,
+        //             row: next,
+        //         },
+        //         |entry| entry.hashcode,
+        //     );
+        // }
+        // match entry {
+        //     Entry::Occupied(mut occupied_entry) => {
+        //         let cur = self.rows.get_row(occupied_entry.get().row);
+        //         if merge_fn(cur, row, &mut self.scratch) {
+        //             let new = self.rows.add_row(&self.scratch);
+        //             self.rows.set_stale(occupied_entry.get().row);
+        //             self.n_stale += 1;
+        //             occupied_entry.get_mut().row = new;
+        //         }
+        //         self.scratch.clear();
+        //     }
+        //     Entry::Vacant(vacant_entry) => {
+        //         let next = self.rows.add_row(row);
+        //         vacant_entry.insert(TableEntry {
+        //             hashcode: hc as _,
+        //             row: next,
+        //         });
+        //     }
+        // }
     }
 
     /// Write the contents of the staged outputs to the given writer, returning
     /// the initial RowId of the new output.
     fn write_output(&self, output: &ParallelRowBufWriter) -> RowId {
-        let n_rows = self.rows.len() - self.n_stale;
+        let todo_clean_up = 1;
+        let n_rows = self.other_hash.len();
         let n_vals = n_rows * self.rows.arity();
         output.write_raw_values(
             WithExactSize {
-                iter: self.rows.non_stale().flatten().copied(),
+                iter: self.other_hash.values().flat_map(|x| x.iter().copied()),
                 size: n_vals,
             },
             n_rows,
         )
+        // let n_rows = self.rows.len() - self.n_stale;
+        // let n_vals = n_rows * self.rows.arity();
+        // output.write_raw_values(
+        //     WithExactSize {
+        //         iter: self.rows.non_stale().flatten().copied(),
+        //         size: n_vals,
+        //     },
+        //     n_rows,
+        // )
     }
 }
 

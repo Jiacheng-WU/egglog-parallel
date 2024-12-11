@@ -8,10 +8,17 @@
 //! rayon: in particular there is no `join` primitive for avoiding heap allocations, and there are
 //! many scenarios in which work stealing in rayon will provide better performance than what is
 //! provided here (particuilarly if the amount of work per task is smaller).
-use std::{cell::Cell, marker::PhantomData};
+use std::{
+    cell::Cell,
+    marker::PhantomData,
+    sync::{atomic::AtomicUsize, Arc},
+};
 
 use concurrency::WaitGroupBuilder;
 use crossbeam::channel::{Receiver, Sender};
+
+#[cfg(test)]
+mod tests;
 
 /// A handle on a thread pool that allows for executing work that must complete within `'scope`
 pub struct Scope<'scope> {
@@ -41,10 +48,16 @@ impl<'scope> Scope<'scope> {
         unsafe {
             self.tp
                 .sender
-                .send(ignore_lifetime(work))
+                .send(WorkData {
+                    f: ignore_lifetime(work),
+                })
                 .expect("unexpected thread pool disconnection");
         }
     }
+}
+
+struct WorkData {
+    f: Work,
 }
 
 impl Drop for Scope<'_> {
@@ -60,11 +73,11 @@ impl Drop for Scope<'_> {
                 // We area already waiting. We want to detach this thead from the thread pool and
                 // spawn a new one to handle the rest of the work in our stead.
                 BAIL_OUT.with(|bail_out| bail_out.set(true));
-                spawn_worker_thread(self.tp.receiver.clone());
+                self.tp.spawn_worker_thread();
             } else {
                 // Pull some more work off of the thread pool while we are waiting.
                 while let Ok(work) = self.tp.receiver.try_recv() {
-                    work();
+                    (work.f)();
                     if BAIL_OUT.with(|bail_out| bail_out.get()) {
                         // this thread has been detached. No need to keep pulling off the queue.
                         break;
@@ -94,8 +107,9 @@ type Work = Box<dyn FnOnce() + Send>;
 #[derive(Clone)]
 pub struct ThreadPoolHandle {
     num_threads: usize,
-    sender: Sender<Work>,
-    receiver: Receiver<Work>,
+    total_spawned: Arc<AtomicUsize>,
+    sender: Sender<WorkData>,
+    receiver: Receiver<WorkData>,
 }
 
 impl Default for ThreadPoolHandle {
@@ -106,19 +120,36 @@ impl Default for ThreadPoolHandle {
 
 impl ThreadPoolHandle {
     pub fn with_threads(num_threads: usize) -> Self {
-        let (sender, receiver) = crossbeam::channel::unbounded::<Work>();
-        for _ in 0..num_threads {
-            spawn_worker_thread(receiver.clone());
-        }
-        Self {
+        let (sender, receiver) = crossbeam::channel::unbounded::<WorkData>();
+        let res = Self {
+            total_spawned: Arc::new(AtomicUsize::new(0)),
             num_threads,
             sender,
             receiver,
+        };
+        for _ in 0..num_threads {
+            res.spawn_worker_thread();
         }
+        res
     }
     /// The target number of threads active in this thread pool.
     pub fn num_threads(&self) -> usize {
         self.num_threads
+    }
+
+    fn spawn_worker_thread(&self) {
+        self.total_spawned
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let recv = self.receiver.clone();
+        std::thread::spawn(move || {
+            IN_THREAD.with(|in_thread| in_thread.set(true));
+            while let Ok(work) = recv.recv() {
+                (work.f)();
+                if BAIL_OUT.with(|bail_out| bail_out.get()) {
+                    break;
+                }
+            }
+        });
     }
 
     /// Create a scope for (potentially) nested fork/join parallelism executed on thsi thread pool.
@@ -136,16 +167,4 @@ thread_local! {
     static IN_THREAD: Cell<bool> = const { Cell::new(false) };
     static WAITING: Cell<bool> = const { Cell::new(false) };
     static BAIL_OUT: Cell<bool> = const { Cell::new(false) };
-}
-
-fn spawn_worker_thread(recv: Receiver<Work>) {
-    std::thread::spawn(move || {
-        IN_THREAD.with(|in_thread| in_thread.set(true));
-        while let Ok(work) = recv.recv() {
-            work();
-            if BAIL_OUT.with(|bail_out| bail_out.get()) {
-                break;
-            }
-        }
-    });
 }

@@ -131,17 +131,8 @@ fn bench_workload<const K: usize, const C: usize>(
                             });
                         }
                     });
+                    table.merge(es)
                 });
-                // outer.chunks(BATCH_SIZE).par_bridge().for_each(|batch| {
-                //     let mut buf = table.new_buffer();
-                //     for op in batch {
-                //         match op {
-                //             Operation::Insert(row) => buf.stage_insert(row),
-                //             Operation::Remove(key) => buf.stage_remove(key),
-                //         }
-                //     }
-                // });
-                db.with_execution_state(|es| table.merge(es));
             }
         })
 }
