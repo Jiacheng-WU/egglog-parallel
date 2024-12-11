@@ -70,6 +70,20 @@ impl RowBuffer {
         }
     }
 
+    pub(crate) fn with_capacity(n_columns: usize, cap: usize) -> RowBuffer {
+        assert_ne!(
+            n_columns, 0,
+            "attempting to create a row batch with no columns"
+        );
+        let mut res = RowBuffer {
+            n_columns,
+            total_rows: 0,
+            data: with_pool_set(|ps| ps.get()),
+        };
+        res.data.reserve(cap * n_columns);
+        res
+    }
+
     pub(crate) fn parallel_writer(&mut self) -> ParallelRowBufWriter<'_> {
         let data = mem::take(&mut self.data);
         ParallelRowBufWriter {
@@ -197,9 +211,6 @@ impl RowBuffer {
             self.n_columns,
             "attempting to add a row with mismatched arity to table"
         );
-        if self.total_rows == 0 {
-            Pooled::refresh(&mut self.data);
-        }
         let res = RowId::from_usize(self.total_rows);
         self.data.extend(row.iter().copied().map(Cell::new));
         self.total_rows += 1;

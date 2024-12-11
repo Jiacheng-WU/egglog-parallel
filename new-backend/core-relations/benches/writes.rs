@@ -1,7 +1,11 @@
 use core_relations::{Database, SortedWritesTable, Table, Value};
 use divan::{counter::ItemsCount, Bencher};
+use mimalloc::MiMalloc;
 use numeric_id::NumericId;
 use rand::{thread_rng, Rng};
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
     divan::main()
@@ -63,7 +67,7 @@ fn generate_workload<const K: usize, const C: usize>(
 
 #[divan::bench(consts = [1, 2, 4, 8, 16], sample_count=25)]
 fn parallel_insert<const N: usize>(bench: Bencher) {
-    const WORKLOAD_SIZE: usize = 4 << 20;
+    const WORKLOAD_SIZE: usize = 1 << 20;
     bench_workload(
         bench,
         generate_workload::<3, 5>(WORKLOAD_SIZE, 1.0, 0.05),
@@ -74,7 +78,7 @@ fn parallel_insert<const N: usize>(bench: Bencher) {
 
 #[divan::bench(consts = [1, 2, 4, 8, 16], sample_count=25)]
 fn parallel_insert_merge2<const N: usize>(bench: Bencher) {
-    const WORKLOAD_SIZE: usize = 4 << 20;
+    const WORKLOAD_SIZE: usize = 1 << 20;
     bench_workload(
         bench,
         generate_workload::<3, 5>(WORKLOAD_SIZE, 1.0, 0.05),
@@ -83,7 +87,7 @@ fn parallel_insert_merge2<const N: usize>(bench: Bencher) {
     )
 }
 
-#[divan::bench(consts = [1, 2, 4, 8, 16])]
+#[divan::bench(consts = [1, 2, 4, 8, 16], sample_count=25)]
 fn parallel_insert_remove_with_collisions<const N: usize>(bench: Bencher) {
     const WORKLOAD_SIZE: usize = 1 << 20;
     bench_workload(
@@ -107,10 +111,16 @@ fn bench_workload<const K: usize, const C: usize>(
         .with_inputs(|| {
             (
                 Database::with_threads(threads),
-                SortedWritesTable::new(K, C, None, |_, old, new, out| {
-                    out.extend_from_slice(new);
-                    old != new
-                }),
+                SortedWritesTable::with_shards(
+                    K,
+                    C,
+                    None,
+                    |_, old, new, out| {
+                        out.extend_from_slice(new);
+                        old != new
+                    },
+                    if threads == 1 { 1 } else { threads * 2 },
+                ),
             )
         })
         .input_counter(move |_| ItemsCount::new(workload_size))
