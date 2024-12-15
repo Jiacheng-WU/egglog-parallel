@@ -8,7 +8,7 @@ use mimalloc::MiMalloc;
 static GLOBAL: MiMalloc = MiMalloc;
 
 fn main() {
-    const N: usize = 12;
+    const N: usize = 13;
     env_logger::init();
     #[cfg(feature = "serial_examples")]
     {

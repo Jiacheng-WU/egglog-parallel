@@ -133,6 +133,36 @@ impl Prober {
 }
 
 impl Database {
+    /// Update any cached indexes eagerly in parallel before the start of a rule set.
+    ///
+    /// This can improve the parallelism of index rebuilding when running in
+    /// parallel, though for serial execution there isn't really a point.
+    fn update_cached_indexes(&mut self) {
+        rayon::in_place_scope(|scope| {
+            for (_, info) in self.tables.iter_mut() {
+                let table = &info.table;
+                for ci in info.column_indexes.iter_mut() {
+                    let (_, v) = ci.pair();
+                    if v.read().needs_refresh(table) {
+                        let v = v.clone();
+                        scope.spawn(move |_| {
+                            v.lock().refresh(table);
+                        });
+                    }
+                }
+
+                for ix in info.indexes.iter_mut() {
+                    let (_, v) = ix.pair();
+                    if v.read().needs_refresh(table) {
+                        let v = v.clone();
+                        scope.spawn(move |_| {
+                            v.lock().refresh(table);
+                        });
+                    }
+                }
+            }
+        });
+    }
     pub fn run_rule_set(&mut self, rule_set: &RuleSet) -> bool {
         fn do_parallel() -> bool {
             #[cfg(test)]
@@ -150,6 +180,7 @@ impl Database {
         let index_cache = IndexCache::default();
 
         if do_parallel() {
+            self.update_cached_indexes();
             rayon::in_place_scope(|scope| {
                 for (plan, _) in &rule_set.plans {
                     scope.spawn(|scope| {

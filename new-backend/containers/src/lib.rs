@@ -18,6 +18,7 @@
 //!
 //! In this crate, we specify an interface for different containers and also provide
 //! implementations for them for common data-structures used in egglog.
+#![allow(unused, dead_code)] // TODO: remove these when we get back to developing containers
 
 use core_relations::{CounterId, ExecutionState, TableId, Value};
 use numeric_id::NumericId;

@@ -8,7 +8,7 @@ use std::{
     time::Duration,
 };
 
-use crate::{ConcurrentVec, Notification, ParallelVecWriter, ReadOptimizedLock, WaitGroupBuilder};
+use crate::{ConcurrentVec, Notification, ParallelVecWriter, ReadOptimizedLock};
 
 #[test]
 fn notification_single_threaded() {
@@ -173,51 +173,4 @@ fn basic_parallel_vec_write() {
     let mut v = Arc::try_unwrap(v).ok().unwrap().finish();
     v.sort();
     assert_eq!(v, (0..200).collect::<Vec<usize>>());
-}
-
-#[test]
-fn waitgroup_noop() {
-    let wgb = WaitGroupBuilder::new();
-    let wg = wgb.build();
-    assert!(wg.ready());
-    wg.wait();
-}
-
-#[test]
-fn waitgroup_serial() {
-    let wgb = WaitGroupBuilder::new();
-    let h1 = wgb.add();
-    let h2 = wgb.add();
-    let wg = wgb.build();
-    assert!(!wg.ready());
-    mem::drop(h1);
-    assert!(!wg.ready());
-    mem::drop(h2);
-    assert!(wg.ready());
-    wg.wait();
-}
-
-#[test]
-fn waitgroup_parallel() {
-    let start = Arc::new(Notification::new());
-    let wgb = WaitGroupBuilder::new();
-    let threads: Vec<_> = (0..20)
-        .map(|_| {
-            let h = wgb.add();
-            let n = start.clone();
-            thread::spawn(move || {
-                n.wait();
-                mem::drop(h);
-            })
-        })
-        .collect();
-    let wg = wgb.build();
-    thread::sleep(Duration::from_millis(100));
-    assert!(!wg.ready());
-    start.notify();
-    wg.wait();
-    assert!(wg.ready());
-    for t in threads {
-        t.join().unwrap();
-    }
 }
