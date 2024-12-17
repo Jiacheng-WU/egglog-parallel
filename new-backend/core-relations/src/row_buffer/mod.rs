@@ -75,7 +75,6 @@ impl RowBuffer {
         ParallelRowBufWriter {
             buf: self,
             vec: Some(ParallelVecWriter::new(Pooled::into_inner(data))),
-            new_rows: AtomicUsize::new(0),
         }
     }
 
@@ -342,7 +341,6 @@ pub(crate) struct ParallelRowBufWriter<'a> {
     // This is only an option so we can move out of it in `drop`. It is always
     // populated.
     vec: Option<ParallelVecWriter<Cell<Value>>>,
-    new_rows: AtomicUsize,
 }
 
 impl ParallelRowBufWriter<'_> {
@@ -364,7 +362,7 @@ impl ParallelRowBufWriter<'_> {
             .as_ref()
             .unwrap()
             .write_contents(vals.map(Cell::new));
-        self.new_rows.fetch_add(new_rows, Ordering::Release);
+        debug_assert_eq!(start_off % self.buf.n_columns, 0);
         RowId::from_usize(start_off / self.buf.n_columns)
     }
 }
@@ -372,7 +370,7 @@ impl ParallelRowBufWriter<'_> {
 impl Drop for ParallelRowBufWriter<'_> {
     fn drop(&mut self) {
         self.buf.data = Pooled::new(self.vec.take().unwrap().finish());
-        self.buf.total_rows += self.new_rows.load(Ordering::Acquire);
+        self.buf.total_rows = self.buf.data.len() / self.buf.n_columns;
     }
 }
 
@@ -387,6 +385,13 @@ impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
         // SAFETY: ParallelVecWriter guarantees that data within bounds is not
         // being modified concurrently.
         unsafe { get_row(&self.data, self.buf.n_columns, row) }
+    }
+
+    /// Get a raw pointer to the start of the buffer.
+    ///
+    /// Used for debug assertions only
+    pub(crate) fn _data_offset_for_testing(&self) -> *const Value {
+        self.data.as_ptr() as *const Value
     }
 
     /// See the documentation for [`RowBuffer::set_stale_shared`].

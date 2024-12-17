@@ -15,12 +15,17 @@ pub(crate) struct ShardData {
 }
 
 impl ShardData {
+    pub(crate) fn new(n_shards: usize) -> Self {
+        Self {
+            log2_shard_count: n_shards.next_power_of_two().trailing_zeros(),
+        }
+    }
     pub(crate) fn n_shards(&self) -> usize {
         1 << self.log2_shard_count
     }
     pub(crate) fn shard_id(&self, hash: u64) -> ShardId {
-        let high_bits =
-            (hash.wrapping_shr(64 - self.log2_shard_count)) & ((1 << self.log2_shard_count) - 1);
+        let high_bits = (hash.wrapping_shr(64 - (self.log2_shard_count + 7)))
+            & ((1 << self.log2_shard_count) - 1);
         ShardId::from_usize(high_bits as usize)
     }
 }

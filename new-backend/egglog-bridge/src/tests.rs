@@ -1,3 +1,5 @@
+use std::thread;
+
 use log::debug;
 use num_rational::Rational64;
 
@@ -228,7 +230,8 @@ fn ac_fail() {
 
 #[test]
 fn math() {
-    math_test(EGraph::default())
+    let handles = Vec::from_iter((0..15).map(|_| thread::spawn(|| math_test(EGraph::default()))));
+    handles.into_iter().for_each(|h| h.join().unwrap());
 }
 
 #[test]

@@ -42,7 +42,7 @@ mod tests;
 // NB: we currently only use 32 bits of hash code. To use 64, we can change
 // `HashCode` here to `u64`.
 
-type HashCode = u32;
+type HashCode = u64;
 
 /// A pointer to a row in the table.
 #[derive(Clone, Debug)]
@@ -543,9 +543,10 @@ impl SortedWritesTable {
                         current: None,
                         baseline: self.offsets.last().map(|(v, _)| *v),
                     },
+                    total,
                 )
             } else {
-                self.parallel_insert(exec_state, ())
+                self.parallel_insert(exec_state, (), total)
             }
         } else {
             self.serial_insert(exec_state)
@@ -670,6 +671,7 @@ impl SortedWritesTable {
         &mut self,
         exec_state: &ExecutionState,
         checker: C,
+        n_rows: usize,
     ) -> bool {
         // Parallel insert uses one giant parallel foreach. We have updates
         // pre-sharded, and one logical thread can process updates for each
@@ -692,7 +694,7 @@ impl SortedWritesTable {
                 let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
                 let queue = &self.pending_state.pending_rows[shard_id];
                 let mut marked_stale = 0usize;
-                let mut staged = StagedOutputs::new(shard_data, n_keys, n_cols);
+                let mut staged = StagedOutputs::new(n_keys, n_cols, n_rows);
                 let mut work_done = 0;
                 // Phase 1: process all incoming updates:
                 // * Add new values to `staged`
@@ -758,24 +760,45 @@ impl SortedWritesTable {
                 // Phase 3: With the values buffered in the row buffer, we can
                 // write them back to the shard, pointed to the correct rows.
 
-                // In the serial implementation, we do phases2 and 3 inline with
+                // In the serial implementation, we do phases 2 and 3 inline with
                 // processing the incoming mutation, but separating them out
                 // this way allows us to do a single write to the shared row
                 // buffer, rather than one per row, which would cause
                 // contention.
-                let to_add = staged.into_rows();
-                let changed = marked_stale > 0 || to_add.len() > 0;
+                let mut changed = marked_stale > 0;
                 let mut cur_row = start_row;
-                for row in to_add.non_stale() {
+                for row in staged.rows() {
+                    changed = true;
                     let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
                     debug_assert_eq!(_actual_shard, shard_id);
+                    #[cfg(debug_assertions)]
+                    {
+                        let read_handle = row_writer.read_handle();
+                        assert!(shard
+                            .find(hc, |ent| {
+                                ent.hashcode == hc as HashCode
+                                    && &read_handle.get_row(ent.row)[0..n_keys] == row
+                            })
+                            .is_none());
+                        unsafe {
+                            // (hackily) read the value we wrote at this row and
+                            // check that it matches.
+                            let data_raw = read_handle._data_offset_for_testing();
+                            let actual_row = std::slice::from_raw_parts(
+                                data_raw.add(cur_row.index() * self.n_columns),
+                                self.n_columns,
+                            );
+                            assert_eq!(actual_row, row);
+                        }
+                    }
+
                     shard.insert_unique(
                         hc,
                         TableEntry {
                             hashcode: hc as _,
                             row: cur_row,
                         },
-                        |entry| entry.hashcode as u64,
+                        TableEntry::hashcode,
                     );
                     cur_row = cur_row.inc();
                 }
@@ -1048,18 +1071,20 @@ impl OrderingChecker for SortChecker {
 }
 
 fn do_parallel(_workload_size: usize) -> bool {
-    #[cfg(test)]
-    {
-        // In tests, run serial and parallel variants half the time,
-        // nondeterministically.
-        use rand::{thread_rng, Rng};
-        thread_rng().gen::<bool>()
-    }
+    let todo_revert = 1;
+    true
+    // #[cfg(test)]
+    // {
+    //     // In tests, run serial and parallel variants half the time,
+    //     // nondeterministically.
+    //     use rand::{thread_rng, Rng};
+    //     thread_rng().gen::<bool>()
+    // }
 
-    #[cfg(not(test))]
-    {
-        _workload_size > 100_000 && rayon::current_num_threads() > 1
-    }
+    // #[cfg(not(test))]
+    // {
+    //     _workload_size > 50_000 && rayon::current_num_threads() > 1
+    // }
 }
 
 /// A type similar to a SortedWritesTable used to buffer outputs. The main thing
@@ -1076,18 +1101,21 @@ struct StagedOutputs {
 }
 
 impl StagedOutputs {
-    fn into_rows(self) -> RowBuffer {
-        self.rows
+    fn rows(&self) -> impl Iterator<Item = &[Value]> {
+        self.rows.non_stale()
     }
-    fn new(shard_data: ShardData, n_keys: usize, n_cols: usize) -> Self {
-        StagedOutputs {
-            shard_data,
+    fn new(n_keys: usize, n_cols: usize, capacity: usize) -> Self {
+        let mut res = StagedOutputs {
+            shard_data: ShardData::new(1),
             n_keys,
             n_stale: 0,
-            hash: HashTable::default(),
+            hash: HashTable::with_capacity(capacity),
             rows: RowBuffer::new(n_cols),
             scratch: with_pool_set(|ps| ps.get::<Vec<Value>>()),
-        }
+        };
+
+        res.rows.reserve(capacity);
+        res
     }
 
     fn insert(

@@ -86,6 +86,10 @@ impl<T> ParallelVecWriter<T> {
 
     /// Write the contents of `items` to a contiguous chunk of the vector,
     /// returning the index of the first element in `items`.
+    ///
+    /// *Panics* It is very important that `items` does not lie about its
+    /// length. This method panics if the actual length does not match the
+    /// length method.
     pub fn write_contents(&self, items: impl ExactSizeIterator<Item = T>) -> usize {
         let start = self.end_len.fetch_add(items.len(), Ordering::AcqRel);
         let end = start + items.len();
@@ -120,12 +124,19 @@ impl<T> ParallelVecWriter<T> {
     }
 
     unsafe fn write_contents_at(&self, items: impl ExactSizeIterator<Item = T>, start: usize) {
+        let mut written = 0;
+        let expected = items.len();
         let reader = self.data.read();
         debug_assert!(reader.capacity() >= start + items.len());
         let mut mut_ptr = (reader.as_ptr() as *mut T).add(start);
         for item in items {
+            written += 1;
             std::ptr::write(mut_ptr, item);
             mut_ptr = mut_ptr.offset(1);
         }
+        assert_eq!(
+            written, expected,
+            "passed ExactSizeIterator with incorrect number of items"
+        );
     }
 }
