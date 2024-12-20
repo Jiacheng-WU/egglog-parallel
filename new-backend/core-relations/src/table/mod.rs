@@ -388,7 +388,8 @@ impl Table for SortedWritesTable {
 
         // First: handle the removals.
         changed |= self.do_delete();
-        changed |= self.do_insert(exec_state);
+        let todo_revert_doublecheck = 1;
+        changed |= self.do_insert(exec_state, true);
         self.maybe_rehash();
         changed
     }
@@ -531,12 +532,22 @@ impl SortedWritesTable {
         }
     }
 
-    fn do_insert(&mut self, exec_state: &mut ExecutionState) -> bool {
+    fn do_insert(&mut self, exec_state: &mut ExecutionState, double_check: bool) -> bool {
         let total = self.pending_state.total_rows.swap(0, Ordering::Relaxed);
         self.data.data.reserve(total);
         if do_parallel(total) {
+            let todo_remove = eprintln!("insert start!!!");
             if let Some(col) = self.sort_by {
-                self.parallel_insert(
+                let expected_table = if double_check {
+                    let mut x = self.clone();
+                    x.pending_state = Arc::new(self.pending_state._deep_copy());
+                    let start_row = RowId::from_usize(x.data.data.len());
+                    x.serial_insert(exec_state);
+                    Some((x, start_row))
+                } else {
+                    None
+                };
+                let res = self.parallel_insert(
                     exec_state,
                     SortChecker {
                         col,
@@ -544,9 +555,68 @@ impl SortedWritesTable {
                         baseline: self.offsets.last().map(|(v, _)| *v),
                     },
                     total,
-                )
+                );
+                if let Some((expected_table, start_row)) = expected_table {
+                    let expected_len =
+                        expected_table.data.data.len() - expected_table.data.stale_rows;
+                    let actual_len = self.data.data.len() - self.data.stale_rows;
+                    assert_eq!(actual_len, expected_len, "uh oh!");
+                    assert_eq!(self.offsets, expected_table.offsets, "uh oh!!");
+                    let mut new_rows_expected = Vec::new();
+                    let shard_data = self.hash.shard_data();
+                    let n_keys = self.n_keys;
+                    expected_table.scan_generic(
+                        SubsetRef::Dense(OffsetRange {
+                            start: start_row,
+                            end: RowId::from_usize(expected_table.data.data.len()),
+                        }),
+                        |_, row| {
+                            let (shard, _) = hash_code(shard_data, row, n_keys);
+                            new_rows_expected.push((row.to_vec(), shard));
+                        },
+                    );
+
+                    let mut new_rows_actual = Vec::new();
+                    self.scan_generic(
+                        SubsetRef::Dense(OffsetRange {
+                            start: start_row,
+                            end: RowId::from_usize(self.data.data.len()),
+                        }),
+                        |_, row| {
+                            let (shard, _) = hash_code(shard_data, row, n_keys);
+                            new_rows_actual.push((row.to_vec(), shard));
+                        },
+                    );
+                    let sorted = |x: &Vec<_>| {
+                        let mut x = x.clone();
+                        x.sort();
+                        x
+                    };
+                    assert_eq!(
+                        sorted(&new_rows_actual),
+                        sorted(&new_rows_expected),
+                        "uh oh!!! (scanned from {start_row:?} to {actual_len}) unsorted actual={new_rows_actual:?} expected={new_rows_expected:?}"
+                    );
+                }
+                res
             } else {
-                self.parallel_insert(exec_state, (), total)
+                let expected_table = if double_check {
+                    let mut x = self.clone();
+                    x.pending_state = Arc::new(self.pending_state._deep_copy());
+                    x.do_insert(exec_state, false);
+                    Some(x)
+                } else {
+                    None
+                };
+                let res = self.parallel_insert(exec_state, (), total);
+                if let Some(expected_table) = expected_table {
+                    let expected_len =
+                        expected_table.data.data.len() - expected_table.data.stale_rows;
+                    let actual_len = self.data.data.len() - self.data.stale_rows;
+                    assert_eq!(actual_len, expected_len, "uh oh!");
+                    assert_eq!(self.offsets, expected_table.offsets, "uh oh!!");
+                }
+                res
             }
         } else {
             self.serial_insert(exec_state)
@@ -570,9 +640,10 @@ impl SortedWritesTable {
                         });
 
                         let sort_val = query[sort_by.index()];
+
                         if let Some(row) = entry {
                             // First case: overwriting an existing value. Apply merge
-                            // function. Insert new row  and update hash table if merge
+                            // function. Insert new row and update hash table if merge
                             // changes anything.
                             let cur = self
                                 .data
@@ -707,7 +778,6 @@ impl SortedWritesTable {
                     // writer.
                     let read_handle = row_writer.read_handle();
                     for row in buf.non_stale() {
-                        checker.check_local(row);
                         let key = &row[0..n_keys];
                         let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
                         assert_eq!(shard_id, _actual_shard);
@@ -719,6 +789,9 @@ impl SortedWritesTable {
                                 let cur = read_handle.get_row(occ.get().row);
                                 // Need to run a merge function.
                                 if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
+                                    checker.check_local(row);
+                                    let todo_remove = 1;
+                                    debug_assert!(false, "got here");
                                     // SAFETY: The safety requirements of
                                     // `set_stale_shared` are that there are no
                                     // concurrent accesses to `row`. We have
@@ -735,10 +808,13 @@ impl SortedWritesTable {
                                     });
                                     occ.remove();
                                     marked_stale += 1;
+                                } else {
+                                    let todo_remove = eprintln!("skipping {shard_id:?} / {row:?}");
                                 }
                                 scratch.clear()
                             }
                             Err(_) => {
+                                checker.check_local(row);
                                 // Stage this row to get inserted later.
                                 staged.insert(row, |cur, new, out| {
                                     (self.merge)(&mut exec_state, cur, new, out)
@@ -973,6 +1049,46 @@ impl PendingState {
             while queue.pop().is_some() {}
         }
     }
+
+    /// This is only really used in debugging, but it's annoying enough to write
+    /// that it may help to have around.
+    fn _deep_copy(&self) -> PendingState {
+        let mut pending_rows = DenseIdMap::new();
+        let mut pending_removals = DenseIdMap::new();
+        fn drain_queue<T>(queue: &SegQueue<T>) -> Vec<T> {
+            let mut res = Vec::new();
+            while let Some(x) = queue.pop() {
+                res.push(x);
+            }
+            res
+        }
+        for (shard, queue) in self.pending_rows.iter() {
+            let contents = drain_queue(queue);
+            let new_queue = SegQueue::default();
+            for x in contents {
+                new_queue.push(x.clone());
+                queue.push(x);
+            }
+            pending_rows.insert(shard, new_queue);
+        }
+
+        for (shard, queue) in self.pending_removals.iter() {
+            let contents = drain_queue(queue);
+            let new_queue = SegQueue::default();
+            for x in contents {
+                new_queue.push(x.clone());
+                queue.push(x);
+            }
+            pending_removals.insert(shard, new_queue);
+        }
+
+        PendingState {
+            pending_rows,
+            pending_removals,
+            total_removals: AtomicUsize::new(self.total_removals.load(Ordering::Acquire)),
+            total_rows: AtomicUsize::new(self.total_rows.load(Ordering::Acquire)),
+        }
+    }
 }
 
 /// A trait that encapsulates the logic of potentially checking that written
@@ -1137,10 +1253,14 @@ impl StagedOutputs {
             Entry::Occupied(mut occupied_entry) => {
                 let cur = self.rows.get_row(occupied_entry.get().row);
                 if merge_fn(cur, row, &mut self.scratch) {
+                    let todo_remove = 1;
+                    debug_assert!(false, "got here??");
                     let new = self.rows.add_row(&self.scratch);
                     self.rows.set_stale(occupied_entry.get().row);
                     self.n_stale += 1;
                     occupied_entry.get_mut().row = new;
+                } else {
+                    let todo_remove = eprintln!("skipping {row:?} / within stage buf");
                 }
                 self.scratch.clear();
             }

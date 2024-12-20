@@ -16,7 +16,6 @@ use crate::{MutexReader, ReadOptimizedLock};
 /// ParallelVecWriter will not be dropped unless `finish` is called.
 pub struct ParallelVecWriter<T> {
     data: ReadOptimizedLock<Vec<T>>,
-    start_len: usize,
     end_len: AtomicUsize,
 }
 
@@ -26,7 +25,6 @@ impl<T> ParallelVecWriter<T> {
         let end_len = AtomicUsize::new(start_len);
         Self {
             data: ReadOptimizedLock::new(data),
-            start_len,
             end_len,
         }
     }
@@ -57,14 +55,7 @@ impl<T> ParallelVecWriter<T> {
     /// This method panics if `idx` is greater than or equal to the length of
     /// the vector when the ParallelVecWriter was created.
     pub fn with_index<R>(&self, idx: usize, f: impl FnOnce(&T) -> R) -> R {
-        assert!(
-            idx < self.start_len,
-            "index out of bounds {idx} vs. length {}",
-            self.start_len
-        );
-        // SAFETY: idx < self.start_len, which is less than the actual length of
-        // the vector.
-        unsafe { f(self.data.read().get_unchecked(idx)) }
+        f(&self.read_access()[idx])
     }
 
     /// Runs `f` with access to the slice of elements in the range `slice`.
@@ -73,15 +64,7 @@ impl<T> ParallelVecWriter<T> {
     /// This method panics if `slice.end` is greater than or equal to the length
     /// of the vector when the ParallelVecWriter was created.
     pub fn with_slice<R>(&self, slice: Range<usize>, f: impl FnOnce(&[T]) -> R) -> R {
-        assert!(
-            slice.end <= self.start_len,
-            "index out of bounds {} vs. length {}",
-            slice.end,
-            self.start_len
-        );
-        // SAFETY: slice.end <= self.start_len, which is less than the actual
-        // length of the vector.
-        f(&self.data.read()[slice])
+        f(&self.read_access()[slice])
     }
 
     /// Write the contents of `items` to a contiguous chunk of the vector,

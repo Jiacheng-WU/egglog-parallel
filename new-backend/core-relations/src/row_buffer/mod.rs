@@ -1,12 +1,7 @@
 //! A basic data-structure encapsulating a batch of rows.
 
 use core::slice;
-use std::{
-    cell::Cell,
-    mem,
-    ops::Deref,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use std::{cell::Cell, mem, ops::Deref};
 
 use concurrency::ParallelVecWriter;
 use numeric_id::NumericId;

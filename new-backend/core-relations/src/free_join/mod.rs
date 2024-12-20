@@ -301,6 +301,9 @@ impl Database {
     pub fn merge_all(&mut self) -> bool {
         let mut ever_changed = false;
         loop {
+            // Support merge functions that never update the table but can still
+            // signal a change elsewhere in the db.
+            let todo_better_merge_functions = 1;
             let mut changed = false;
             let predicted = PredictedVals::default();
             let mut tables_merging =
@@ -310,14 +313,18 @@ impl Database {
                     tables_merging.insert(table, self.tables.unwrap_val(table));
                 }
                 let db = self.read_only_view();
+                let todo_revert_parallel = 1;
                 changed |= tables_merging
                     .par_iter_mut()
-                    .map(|(_, info)| {
-                        info.table.merge(&mut ExecutionState {
+                    .map(|(id, info)| {
+                        let todo_remove = eprintln!("merging table {id:?}");
+                        let res = info.table.merge(&mut ExecutionState {
                             predicted: &predicted,
                             db,
                             buffers: Default::default(),
-                        })
+                        });
+                        let todo_remove = eprintln!("done merging table {id:?}");
+                        res
                     })
                     .max()
                     .unwrap_or(false);

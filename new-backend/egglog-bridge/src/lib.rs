@@ -503,8 +503,9 @@ impl EGraph {
                         } else {
                             state.stage_insert(uf_table, &[l, r, next_ts]);
                         }
-                        out.extend_from_slice(new);
-                        true
+                        // out.extend_from_slice(new);
+                        let todo_return_old_and_optimize = 0;
+                        false
                     } else {
                         false
                     }
