@@ -317,13 +317,13 @@ impl Database {
                 changed |= tables_merging
                     .par_iter_mut()
                     .map(|(id, info)| {
-                        let todo_remove = eprintln!("merging table {id:?}");
+                        // let todo_remove = eprintln!("merging table {id:?}");
                         let res = info.table.merge(&mut ExecutionState {
                             predicted: &predicted,
                             db,
                             buffers: Default::default(),
                         });
-                        let todo_remove = eprintln!("done merging table {id:?}");
+                        // let todo_remove = eprintln!("done merging table {id:?}");
                         res
                     })
                     .max()

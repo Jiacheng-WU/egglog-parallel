@@ -536,7 +536,6 @@ impl SortedWritesTable {
         let total = self.pending_state.total_rows.swap(0, Ordering::Relaxed);
         self.data.data.reserve(total);
         if do_parallel(total) {
-            let todo_remove = eprintln!("insert start!!!");
             if let Some(col) = self.sort_by {
                 let expected_table = if double_check {
                     let mut x = self.clone();
