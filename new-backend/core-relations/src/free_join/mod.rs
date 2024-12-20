@@ -313,18 +313,14 @@ impl Database {
                     tables_merging.insert(table, self.tables.unwrap_val(table));
                 }
                 let db = self.read_only_view();
-                let todo_revert_parallel = 1;
                 changed |= tables_merging
                     .par_iter_mut()
-                    .map(|(id, info)| {
-                        // let todo_remove = eprintln!("merging table {id:?}");
-                        let res = info.table.merge(&mut ExecutionState {
+                    .map(|(_, info)| {
+                        info.table.merge(&mut ExecutionState {
                             predicted: &predicted,
                             db,
                             buffers: Default::default(),
-                        });
-                        // let todo_remove = eprintln!("done merging table {id:?}");
-                        res
+                        })
                     })
                     .max()
                     .unwrap_or(false);

@@ -53,7 +53,11 @@ struct TableEntry {
 
 impl TableEntry {
     fn hashcode(&self) -> u64 {
-        self.hashcode as u64
+        // We keep the cast here to make it easy to switch to HashCode=u32.
+        #[allow(clippy::unnecessary_cast)]
+        {
+            self.hashcode as u64
+        }
     }
 }
 
@@ -388,8 +392,17 @@ impl Table for SortedWritesTable {
 
         // First: handle the removals.
         changed |= self.do_delete();
-        let todo_revert_doublecheck = 1;
-        changed |= self.do_insert(exec_state, true);
+        let double_check = {
+            #[cfg(test)]
+            {
+                true
+            }
+            #[cfg(not(test))]
+            {
+                false
+            }
+        };
+        changed |= self.do_insert(exec_state, double_check);
         self.maybe_rehash();
         changed
     }
@@ -789,8 +802,6 @@ impl SortedWritesTable {
                                 // Need to run a merge function.
                                 if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
                                     checker.check_local(row);
-                                    let todo_remove = 1;
-                                    debug_assert!(false, "got here");
                                     // SAFETY: The safety requirements of
                                     // `set_stale_shared` are that there are no
                                     // concurrent accesses to `row`. We have
@@ -807,8 +818,6 @@ impl SortedWritesTable {
                                     });
                                     occ.remove();
                                     marked_stale += 1;
-                                } else {
-                                    let todo_remove = eprintln!("skipping {shard_id:?} / {row:?}");
                                 }
                                 scratch.clear()
                             }
@@ -1011,6 +1020,8 @@ fn hash_code(shard_data: ShardData, row: &[Value], n_keys: usize) -> (ShardId, u
         hasher.write_usize(val.index());
     }
     let full_code = hasher.finish();
+    // We keep this cast here to allow for experimenting with HashCode=u32.
+    #[allow(clippy::unnecessary_cast)]
     (shard_data.shard_id(full_code), full_code as HashCode as u64)
 }
 
@@ -1186,20 +1197,18 @@ impl OrderingChecker for SortChecker {
 }
 
 fn do_parallel(_workload_size: usize) -> bool {
-    let todo_revert = 1;
-    true
-    // #[cfg(test)]
-    // {
-    //     // In tests, run serial and parallel variants half the time,
-    //     // nondeterministically.
-    //     use rand::{thread_rng, Rng};
-    //     thread_rng().gen::<bool>()
-    // }
+    #[cfg(test)]
+    {
+        // In tests, run serial and parallel variants half the time,
+        // nondeterministically.
+        use rand::{thread_rng, Rng};
+        thread_rng().gen::<bool>()
+    }
 
-    // #[cfg(not(test))]
-    // {
-    //     _workload_size > 50_000 && rayon::current_num_threads() > 1
-    // }
+    #[cfg(not(test))]
+    {
+        _workload_size > 50_000 && rayon::current_num_threads() > 1
+    }
 }
 
 /// A type similar to a SortedWritesTable used to buffer outputs. The main thing
@@ -1252,14 +1261,10 @@ impl StagedOutputs {
             Entry::Occupied(mut occupied_entry) => {
                 let cur = self.rows.get_row(occupied_entry.get().row);
                 if merge_fn(cur, row, &mut self.scratch) {
-                    let todo_remove = 1;
-                    debug_assert!(false, "got here??");
                     let new = self.rows.add_row(&self.scratch);
                     self.rows.set_stale(occupied_entry.get().row);
                     self.n_stale += 1;
                     occupied_entry.get_mut().row = new;
-                } else {
-                    let todo_remove = eprintln!("skipping {row:?} / within stage buf");
                 }
                 self.scratch.clear();
             }
