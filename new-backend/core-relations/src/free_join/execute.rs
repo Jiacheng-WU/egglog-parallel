@@ -165,16 +165,18 @@ impl Database {
     }
     pub fn run_rule_set(&mut self, rule_set: &RuleSet) -> bool {
         fn do_parallel() -> bool {
-            #[cfg(test)]
-            {
-                use rand::Rng;
-                rand::thread_rng().gen_bool(0.5)
-            }
+            let todo_revert = 1;
+            false
+            // #[cfg(test)]
+            // {
+            //     use rand::Rng;
+            //     rand::thread_rng().gen_bool(0.5)
+            // }
 
-            #[cfg(not(test))]
-            {
-                rayon::current_num_threads() > 1
-            }
+            // #[cfg(not(test))]
+            // {
+            //     rayon::current_num_threads() > 1
+            // }
         }
         let preds = PredictedVals::default();
         let index_cache = IndexCache::default();

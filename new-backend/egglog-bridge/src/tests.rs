@@ -230,8 +230,22 @@ fn ac_fail() {
 
 #[test]
 fn math() {
-    let handles = Vec::from_iter((0..15).map(|_| thread::spawn(|| math_test(EGraph::default()))));
-    handles.into_iter().for_each(|h| h.join().unwrap());
+    let n = {
+        #[cfg(debug_assertions)]
+        {
+            1
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            // On a release build, run this a few more times
+            10
+        }
+    };
+    for _ in 0..n {
+        let handles =
+            Vec::from_iter((0..15).map(|_| thread::spawn(|| math_test(EGraph::default()))));
+        handles.into_iter().for_each(|h| h.join().unwrap());
+    }
 }
 
 #[test]

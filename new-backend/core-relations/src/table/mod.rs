@@ -445,6 +445,7 @@ impl SortedWritesTable {
             + Send
             + Sync,
     ) -> Self {
+        let todo_remove_clone_req_on_merge = 1;
         let hash = ShardedHashTable::<TableEntry>::default();
         let shard_data = hash.shard_data();
         SortedWritesTable {
@@ -538,6 +539,7 @@ impl SortedWritesTable {
 
     fn do_delete(&mut self) -> bool {
         let total = self.pending_state.total_removals.swap(0, Ordering::Relaxed);
+
         if do_parallel(total) {
             self.parallel_delete()
         } else {
@@ -553,9 +555,9 @@ impl SortedWritesTable {
                 let expected_table = if double_check {
                     let mut x = self.clone();
                     x.pending_state = Arc::new(self.pending_state._deep_copy());
-                    let start_row = RowId::from_usize(x.data.data.len());
-                    x.serial_insert(exec_state);
-                    Some((x, start_row))
+                    let start_row = x.data.next_row();
+                    let changed = x.serial_insert(exec_state);
+                    Some((x, start_row, changed))
                 } else {
                     None
                 };
@@ -568,23 +570,24 @@ impl SortedWritesTable {
                     },
                     total,
                 );
-                if let Some((expected_table, start_row)) = expected_table {
+                if let Some((expected_table, start_row, changed)) = expected_table {
                     let expected_len =
                         expected_table.data.data.len() - expected_table.data.stale_rows;
                     let actual_len = self.data.data.len() - self.data.stale_rows;
-                    assert_eq!(actual_len, expected_len, "uh oh!");
-                    assert_eq!(self.offsets, expected_table.offsets, "uh oh!!");
+                    assert_eq!(actual_len, expected_len);
+                    assert_eq!(self.offsets, expected_table.offsets);
+                    assert_eq!(res, changed);
                     let mut new_rows_expected = Vec::new();
                     let shard_data = self.hash.shard_data();
                     let n_keys = self.n_keys;
                     expected_table.scan_generic(
                         SubsetRef::Dense(OffsetRange {
                             start: start_row,
-                            end: RowId::from_usize(expected_table.data.data.len()),
+                            end: self.data.next_row(),
                         }),
                         |_, row| {
                             let (shard, _) = hash_code(shard_data, row, n_keys);
-                            new_rows_expected.push((row.to_vec(), shard));
+                            new_rows_expected.push((shard, row.to_vec()));
                         },
                     );
 
@@ -592,11 +595,11 @@ impl SortedWritesTable {
                     self.scan_generic(
                         SubsetRef::Dense(OffsetRange {
                             start: start_row,
-                            end: RowId::from_usize(self.data.data.len()),
+                            end: self.data.next_row(),
                         }),
                         |_, row| {
                             let (shard, _) = hash_code(shard_data, row, n_keys);
-                            new_rows_actual.push((row.to_vec(), shard));
+                            new_rows_actual.push((shard, row.to_vec()));
                         },
                     );
                     let sorted = |x: &Vec<_>| {
@@ -609,6 +612,18 @@ impl SortedWritesTable {
                         sorted(&new_rows_expected),
                         "uh oh!!! (scanned from {start_row:?} to {actual_len}) unsorted actual={new_rows_actual:?} expected={new_rows_expected:?}"
                     );
+
+                    let mut all_rows_actual = Vec::new();
+                    let mut all_rows_expected = Vec::new();
+                    self.scan_generic(self.all().as_ref(), |_, row| {
+                        let (shard, _) = hash_code(shard_data, row, n_keys);
+                        all_rows_actual.push((shard, row.to_vec()));
+                    });
+                    self.scan_generic(expected_table.all().as_ref(), |_, row| {
+                        let (shard, _) = hash_code(shard_data, row, n_keys);
+                        all_rows_expected.push((shard, row.to_vec()));
+                    });
+                    assert_eq!(sorted(&all_rows_actual), sorted(&all_rows_expected), "hmmm");
                 }
                 res
             } else {
@@ -779,6 +794,8 @@ impl SortedWritesTable {
                 let mut marked_stale = 0usize;
                 let mut staged = StagedOutputs::new(n_keys, n_cols, n_rows);
                 let mut work_done = 0;
+                let todo_remove = 1;
+                let mut stale_rows = Vec::new();
                 // Phase 1: process all incoming updates:
                 // * Add new values to `staged`
                 // * Removing entries in `shard` and mark them as stale in
@@ -801,7 +818,6 @@ impl SortedWritesTable {
                                 let cur = read_handle.get_row(occ.get().row);
                                 // Need to run a merge function.
                                 if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
-                                    checker.check_local(row);
                                     // SAFETY: The safety requirements of
                                     // `set_stale_shared` are that there are no
                                     // concurrent accesses to `row`. We have
@@ -811,6 +827,7 @@ impl SortedWritesTable {
                                             read_handle.set_stale_shared(occ.get().row);
                                         debug_assert!(!_was_stale);
                                     };
+                                    stale_rows.push(occ.get().row);
                                     // We have a new entry. Stage it to be added
                                     // and then remove this entry.
                                     staged.insert(&scratch, |cur, new, out| {
@@ -822,7 +839,6 @@ impl SortedWritesTable {
                                 scratch.clear()
                             }
                             Err(_) => {
-                                checker.check_local(row);
                                 // Stage this row to get inserted later.
                                 staged.insert(row, |cur, new, out| {
                                     (self.merge)(&mut exec_state, cur, new, out)
@@ -830,7 +846,7 @@ impl SortedWritesTable {
                             }
                         }
                     }
-                    if work_done > 20_000 {
+                    if work_done > 50_000 {
                         // In high-scale microbenchmarks we've noticed that rayon can get locked up
                         // if any given chunk of work takes too long. We use this counter as a
                         // signal yield work to other workers, which seems to help avoid this.
@@ -851,11 +867,18 @@ impl SortedWritesTable {
                 // contention.
                 let mut changed = marked_stale > 0;
                 let mut cur_row = start_row;
+                {
+                    let read_handle = row_writer.read_handle();
+                    for row in stale_rows {
+                        assert!(read_handle.get_row(row)[0].is_stale());
+                    }
+                }
                 for row in staged.rows() {
+                    checker.check_local(row);
                     changed = true;
                     let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
                     debug_assert_eq!(_actual_shard, shard_id);
-                    #[cfg(debug_assertions)]
+                    #[cfg(any(debug_assertions, test))]
                     {
                         let read_handle = row_writer.read_handle();
                         assert!(shard
@@ -959,7 +982,7 @@ impl SortedWritesTable {
     }
 
     fn rehash(&mut self) {
-        self.generation = Generation::from_usize(self.version().major.index() + 1);
+        self.generation = self.generation.inc();
         if let Some(sort_by) = self.sort_by {
             self.offsets.clear();
             self.data.remove_stale(|row, old, new| {
@@ -1197,6 +1220,9 @@ impl OrderingChecker for SortChecker {
 }
 
 fn do_parallel(_workload_size: usize) -> bool {
+    let todo_remove = 1;
+    true
+    /*
     #[cfg(test)]
     {
         // In tests, run serial and parallel variants half the time,
@@ -1209,6 +1235,7 @@ fn do_parallel(_workload_size: usize) -> bool {
     {
         _workload_size > 50_000 && rayon::current_num_threads() > 1
     }
+    */
 }
 
 /// A type similar to a SortedWritesTable used to buffer outputs. The main thing
@@ -1247,6 +1274,9 @@ impl StagedOutputs {
         row: &[Value],
         mut merge_fn: impl FnMut(&[Value], &[Value], &mut Vec<Value>) -> bool,
     ) {
+        if row[0].is_stale() {
+            return;
+        }
         use hashbrown::hash_table::Entry;
         let (_, hc) = hash_code(self.shard_data, row, self.n_keys);
         let entry = self.hash.entry(

@@ -395,6 +395,8 @@ impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
             &self.data[row.index() * self.buf.n_columns..(row.index() + 1) * self.buf.n_columns];
         let was_stale = cells[0].get().is_stale();
         cells[0].set(Value::stale());
+        let todo_remove = 1;
+        assert!(self.get_row(row)[0].is_stale());
         was_stale
     }
 }

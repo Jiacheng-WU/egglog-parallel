@@ -26,6 +26,8 @@ struct TableEntry<T> {
     vals: T,
 }
 
+type TodoBetterClearImpl = ();
+
 pub(crate) struct Index<TI> {
     key: Vec<ColumnId>,
     updated_to: TableVersion,
@@ -163,6 +165,7 @@ impl IndexBase for ColumnIndex {
     fn merge_rows(&mut self, buf: &TaggedRowBuffer) {
         for (src_id, key) in buf.iter() {
             debug_assert_eq!(key.len(), 1);
+            debug_assert!(!key[0].is_stale());
             self.add_row(&key[0], src_id);
         }
     }
