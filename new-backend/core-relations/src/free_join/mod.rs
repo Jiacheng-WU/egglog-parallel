@@ -315,7 +315,7 @@ impl Database {
                 let db = self.read_only_view();
                 let revert_parallel = 1;
                 changed |= tables_merging
-                    .iter_mut()
+                    .par_iter_mut()
                     .map(|(_, info)| {
                         info.table.merge(&mut ExecutionState {
                             predicted: &predicted,

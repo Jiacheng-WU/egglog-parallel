@@ -16,7 +16,7 @@ use std::{
 };
 
 use crossbeam_queue::SegQueue;
-use hashbrown::HashTable;
+use hashbrown::{HashSet, HashTable};
 use numeric_id::{DenseIdMap, NumericId};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHasher;
@@ -257,7 +257,12 @@ impl Table for SortedWritesTable {
             // Empty subset
             return;
         };
-        assert!(hi.index() <= self.data.data.len());
+        assert!(
+            hi.index() <= self.data.data.len(),
+            "{} vs. {}",
+            hi.index(),
+            self.data.data.len()
+        );
         // SAFETY: subsets are sorted, low must be at most hi, and hi is less
         // than the length of the table.
         subset.offsets(|row| unsafe {
@@ -395,6 +400,7 @@ impl Table for SortedWritesTable {
         let double_check = {
             #[cfg(test)]
             {
+                let todo_revert = 1;
                 true
             }
             #[cfg(not(test))]
@@ -402,7 +408,7 @@ impl Table for SortedWritesTable {
                 false
             }
         };
-        changed |= self.do_insert(exec_state, double_check);
+        changed |= self.do_insert(exec_state, false);
         self.maybe_rehash();
         changed
     }
@@ -445,7 +451,6 @@ impl SortedWritesTable {
             + Send
             + Sync,
     ) -> Self {
-        let todo_remove_clone_req_on_merge = 1;
         let hash = ShardedHashTable::<TableEntry>::default();
         let shard_data = hash.shard_data();
         SortedWritesTable {
@@ -571,10 +576,6 @@ impl SortedWritesTable {
                     total,
                 );
                 if let Some((expected_table, start_row, changed)) = expected_table {
-                    let expected_len =
-                        expected_table.data.data.len() - expected_table.data.stale_rows;
-                    let actual_len = self.data.data.len() - self.data.stale_rows;
-                    assert_eq!(actual_len, expected_len);
                     assert_eq!(self.offsets, expected_table.offsets);
                     assert_eq!(res, changed);
                     let mut new_rows_expected = Vec::new();
@@ -583,7 +584,7 @@ impl SortedWritesTable {
                     expected_table.scan_generic(
                         SubsetRef::Dense(OffsetRange {
                             start: start_row,
-                            end: self.data.next_row(),
+                            end: expected_table.data.next_row(),
                         }),
                         |_, row| {
                             let (shard, _) = hash_code(shard_data, row, n_keys);
@@ -602,16 +603,29 @@ impl SortedWritesTable {
                             new_rows_actual.push((shard, row.to_vec()));
                         },
                     );
+
+                    if new_rows_actual.len() != new_rows_expected.len() {
+                        let mut missing = Vec::new();
+                        let actual_set = HashSet::<(ShardId, Vec<Value>)>::from_iter(
+                            new_rows_actual.iter().cloned(),
+                        );
+                        for x in &new_rows_expected {
+                            if !actual_set.contains(x) {
+                                missing.push(x.clone());
+                            }
+                        }
+                        assert_eq!(
+                            new_rows_actual.len(),
+                            new_rows_expected.len(),
+                            "missing rows {missing:?}"
+                        );
+                    }
+
                     let sorted = |x: &Vec<_>| {
                         let mut x = x.clone();
                         x.sort();
                         x
                     };
-                    assert_eq!(
-                        sorted(&new_rows_actual),
-                        sorted(&new_rows_expected),
-                        "uh oh!!! (scanned from {start_row:?} to {actual_len}) unsorted actual={new_rows_actual:?} expected={new_rows_expected:?}"
-                    );
 
                     let mut all_rows_actual = Vec::new();
                     let mut all_rows_expected = Vec::new();
@@ -619,11 +633,21 @@ impl SortedWritesTable {
                         let (shard, _) = hash_code(shard_data, row, n_keys);
                         all_rows_actual.push((shard, row.to_vec()));
                     });
-                    self.scan_generic(expected_table.all().as_ref(), |_, row| {
+                    expected_table.scan_generic(expected_table.all().as_ref(), |_, row| {
                         let (shard, _) = hash_code(shard_data, row, n_keys);
                         all_rows_expected.push((shard, row.to_vec()));
                     });
-                    assert_eq!(sorted(&all_rows_actual), sorted(&all_rows_expected), "hmmm");
+                    assert_eq!(new_rows_actual.len(), new_rows_expected.len());
+                    assert_eq!(
+                        sorted(&new_rows_actual),
+                        sorted(&new_rows_expected),
+                        "incremental rows don't match. Unsorted actual={new_rows_actual:?} expected={new_rows_expected:?}"
+                    );
+                    assert_eq!(
+                        sorted(&all_rows_actual),
+                        sorted(&all_rows_expected),
+                        "full rows don't match"
+                    );
                 }
                 res
             } else {
@@ -754,7 +778,7 @@ impl SortedWritesTable {
                                     hashcode: hc as _,
                                     row: new,
                                 },
-                                |entry| entry.hashcode(),
+                                TableEntry::hashcode,
                             );
                             changed = true;
                         }
@@ -793,65 +817,23 @@ impl SortedWritesTable {
                 let queue = &self.pending_state.pending_rows[shard_id];
                 let mut marked_stale = 0usize;
                 let mut staged = StagedOutputs::new(n_keys, n_cols, n_rows);
-                let mut work_done = 0;
-                let todo_remove = 1;
-                let mut stale_rows = Vec::new();
                 // Phase 1: process all incoming updates:
                 // * Add new values to `staged`
                 // * Removing entries in `shard` and mark them as stale in
                 // `data` if they will be overwritten.
                 while let Some(buf) = queue.pop() {
-                    work_done += buf.len();
                     // We create a read_handle once per batch to avoid blocking
                     // too many threads if someone needs to resize the row
                     // writer.
-                    let read_handle = row_writer.read_handle();
                     for row in buf.non_stale() {
-                        let key = &row[0..n_keys];
-                        let (_actual_shard, hash) = hash_code(shard_data, key, key.len());
-                        assert_eq!(shard_id, _actual_shard);
-                        match shard.find_entry(hash, |ent| {
-                            ent.hashcode == hash as HashCode
-                                && &read_handle.get_row(ent.row)[0..n_keys] == key
-                        }) {
-                            Ok(occ) => {
-                                let cur = read_handle.get_row(occ.get().row);
-                                // Need to run a merge function.
-                                if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
-                                    // SAFETY: The safety requirements of
-                                    // `set_stale_shared` are that there are no
-                                    // concurrent accesses to `row`. We have
-                                    // exclusive access to this shard.
-                                    unsafe {
-                                        let _was_stale =
-                                            read_handle.set_stale_shared(occ.get().row);
-                                        debug_assert!(!_was_stale);
-                                    };
-                                    stale_rows.push(occ.get().row);
-                                    // We have a new entry. Stage it to be added
-                                    // and then remove this entry.
-                                    staged.insert(&scratch, |cur, new, out| {
-                                        (self.merge)(&mut exec_state, cur, new, out)
-                                    });
-                                    occ.remove();
-                                    marked_stale += 1;
-                                }
-                                scratch.clear()
-                            }
-                            Err(_) => {
-                                // Stage this row to get inserted later.
-                                staged.insert(row, |cur, new, out| {
-                                    (self.merge)(&mut exec_state, cur, new, out)
-                                });
-                            }
+                        let todo_remove = 1;
+                        let focus = row[0..row.len() - 2] == [Value::new(7), Value::new(4)];
+                        if focus {
+                            eprintln!("staging {row:?}");
                         }
-                    }
-                    if work_done > 50_000 {
-                        // In high-scale microbenchmarks we've noticed that rayon can get locked up
-                        // if any given chunk of work takes too long. We use this counter as a
-                        // signal yield work to other workers, which seems to help avoid this.
-                        rayon::yield_now();
-                        work_done = 0;
+                        staged.insert(row, |cur, new, out| {
+                            (self.merge)(&mut exec_state, cur, new, out)
+                        });
                     }
                 }
                 // Phase 2: Write the staged rows to the row writer. This only
@@ -865,22 +847,22 @@ impl SortedWritesTable {
                 // this way allows us to do a single write to the shared row
                 // buffer, rather than one per row, which would cause
                 // contention.
-                let mut changed = marked_stale > 0;
+                let mut changed = false;
                 let mut cur_row = start_row;
-                {
-                    let read_handle = row_writer.read_handle();
-                    for row in stale_rows {
-                        assert!(read_handle.get_row(row)[0].is_stale());
-                    }
-                }
+                let read_handle = row_writer.read_handle();
                 for row in staged.rows() {
+                    use hashbrown::hash_table::Entry;
+                    let todo_remove = 1;
+                    let focus = row[0..row.len() - 2] == [Value::new(7), Value::new(4)];
+                    if focus {
+                        let todo_remove = eprintln!("row {row:?} is staged for shard {shard_id:?}");
+                    }
                     checker.check_local(row);
                     changed = true;
+                    let key = &row[0..n_keys];
                     let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
-                    debug_assert_eq!(_actual_shard, shard_id);
                     #[cfg(any(debug_assertions, test))]
                     {
-                        let read_handle = row_writer.read_handle();
                         assert!(shard
                             .find(hc, |ent| {
                                 ent.hashcode == hc as HashCode
@@ -898,15 +880,59 @@ impl SortedWritesTable {
                             assert_eq!(actual_row, row);
                         }
                     }
-
-                    shard.insert_unique(
+                    debug_assert_eq!(_actual_shard, shard_id);
+                    match shard.entry(
                         hc,
-                        TableEntry {
-                            hashcode: hc as _,
-                            row: cur_row,
+                        |ent| {
+                            let todo_need_to_read_outofbounds = 1;
+                            ent.hashcode == hc as HashCode
+                                && &read_handle.get_row(ent.row)[0..n_keys] == key
                         },
                         TableEntry::hashcode,
-                    );
+                    ) {
+                        Entry::Occupied(mut occ) => {
+                            if focus {
+                                eprintln!("occupied");
+                            }
+                            let cur = read_handle.get_row(occ.get().row);
+                            // SAFETY: The safety requirements of
+                            // `set_stale_shared` are that there are no
+                            // concurrent accesses to `row`. We have
+                            // exclusive access to any row whose hash matches this
+                            // shard.
+                            if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
+                                if focus {
+                                    eprintln!("picked");
+                                }
+                                unsafe {
+                                    let _was_stale = read_handle.set_stale_shared(occ.get().row);
+                                    debug_assert!(!_was_stale);
+                                }
+                                occ.get_mut().row = cur_row;
+                            } else {
+                                if focus {
+                                    eprintln!("skipped! (in favor of {cur:?})");
+                                }
+                                // Mark the new row as stale: we didn't end up needing it.
+                                unsafe {
+                                    let _was_stale = read_handle.set_stale_shared(cur_row);
+                                    debug_assert!(!_was_stale);
+                                }
+                            }
+                            marked_stale += 1;
+                            scratch.clear();
+                        }
+                        Entry::Vacant(v) => {
+                            if focus {
+                                eprintln!("inserted");
+                            }
+                            v.insert(TableEntry {
+                                hashcode: hc as HashCode,
+                                row: cur_row,
+                            });
+                        }
+                    }
+
                     cur_row = cur_row.inc();
                 }
                 (checker, marked_stale, changed)

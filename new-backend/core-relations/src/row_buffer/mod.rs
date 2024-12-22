@@ -390,13 +390,16 @@ impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
     }
 
     /// See the documentation for [`RowBuffer::set_stale_shared`].
+    ///
+    /// In addition to the requirements there, `row` is allowed to be out of bounds of the initial
+    /// length of the wrapped vector, but any out-of-bounds row must be in bounds of a (previously
+    /// completed) write.
     pub(crate) unsafe fn set_stale_shared(&self, row: RowId) -> bool {
-        let cells =
-            &self.data[row.index() * self.buf.n_columns..(row.index() + 1) * self.buf.n_columns];
-        let was_stale = cells[0].get().is_stale();
-        cells[0].set(Value::stale());
-        let todo_remove = 1;
-        assert!(self.get_row(row)[0].is_stale());
+        let cells: &[Cell<Value>] = &self.data;
+        let cell_ptr: *const Cell<Value> = cells.as_ptr();
+        let to_set: &Cell<Value> = &*cell_ptr.add(row.index() * self.buf.n_columns);
+        let was_stale = to_set.get().is_stale();
+        to_set.set(Value::stale());
         was_stale
     }
 }
