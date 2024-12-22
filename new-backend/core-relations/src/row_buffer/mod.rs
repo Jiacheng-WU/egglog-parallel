@@ -126,11 +126,10 @@ impl RowBuffer {
     /// `RowBuffer` type. That means that you can call `set_stale_shared(row)`
     /// and `get_row(row)` concurrently, which would be a data race.
     ///
-    /// To safely use this method, you must ensure that there are no concurrent
-    /// reads or writes to `row`. Indeed, that is what this method is for:
-    /// parallel writes to exclusive rows in a shared `RowBuffer`. Any other
-    /// use-case should use the [`set_stale`] method, which requires a mutable
-    /// reference.
+    /// To safely use this method, you must ensure that there are no concurrent reads or writes to
+    /// `row`. Indeed, that is what this method is for: parallel writes to exclusive rows in a
+    /// shared `RowBuffer`. Any other use-case should use the [`RowBuffer::set_stale`] method,
+    /// which requires a mutable reference.
     pub(crate) unsafe fn set_stale_shared(&self, row: RowId) -> bool {
         let cells = &self.data[row.index() * self.n_columns..(row.index() + 1) * self.n_columns];
         let was_stale = cells[0].get().is_stale();

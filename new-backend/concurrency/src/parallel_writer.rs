@@ -19,6 +19,36 @@ pub struct ParallelVecWriter<T> {
     end_len: AtomicUsize,
 }
 
+/// A handle that can be used to read arbitrary locations in a vector wrapped by a
+/// [`ParallelVecWriter`], even if they weren't
+/// initialized when the [`ParallelVecWriter`] was created.
+pub struct UnsafeReadAccess<'a, T> {
+    reader: MutexReader<'a, Vec<T>>,
+}
+
+impl<T> UnsafeReadAccess<'_, T> {
+    /// Get a reference to the given index in the vector.
+    ///
+    /// # Safety
+    /// `idx` must be either less than the length of the vector when the underlying
+    /// [`ParallelVecWriter`] was created, or it must be within bounds of a completed write to
+    /// [`ParallelVecWriter::write_contents`].
+    pub unsafe fn get_unchecked(&self, idx: usize) -> &T {
+        &*self.reader.as_ptr().add(idx)
+    }
+
+    /// Get a subslice of given index in the vector.
+    ///
+    /// # Safety
+    /// `slice`'s contents must be either within the vector when the underlying
+    /// [`ParallelVecWriter`] was created, or they must be within bounds of a completed write to
+    /// [`ParallelVecWriter::write_contents`].
+    pub unsafe fn get_unchecked_slice(&self, slice: Range<usize>) -> &[T] {
+        let start: *const T = self.reader.as_ptr().add(slice.start);
+        std::slice::from_raw_parts(start, slice.end - slice.start)
+    }
+}
+
 impl<T> ParallelVecWriter<T> {
     pub fn new(data: Vec<T>) -> Self {
         let start_len = data.len();
@@ -45,6 +75,17 @@ impl<T> ParallelVecWriter<T> {
             }
         }
         PrefixReader {
+            reader: self.data.read(),
+        }
+    }
+
+    /// Get unsafe read access to the vector.
+    ///
+    /// This handle allows for reads past the end of the wrapped vector. Callers must guarantee
+    /// that any cells read are covered by a corresponding call to
+    /// [`ParallelVecWriter::write_contents`].
+    pub fn unsafe_read_access(&self) -> UnsafeReadAccess<'_, T> {
+        UnsafeReadAccess {
             reader: self.data.read(),
         }
     }

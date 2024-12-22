@@ -525,7 +525,7 @@ impl WrappedTable {
         self.wrapper.group_by_col(&*self.inner, subset, col)
     }
 
-    /// A multi-column vairant of [`WrappedTable::pivot_col`].
+    /// A multi-column vairant of [`WrappedTable::group_by_col`].
     pub(crate) fn group_by_key(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
         self.wrapper.group_by_key(&*self.inner, subset, cols)
     }
