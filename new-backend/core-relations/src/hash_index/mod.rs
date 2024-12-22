@@ -26,8 +26,6 @@ struct TableEntry<T> {
     vals: T,
 }
 
-type TodoBetterClearImpl = ();
-
 pub(crate) struct Index<TI> {
     key: Vec<ColumnId>,
     updated_to: TableVersion,
@@ -151,7 +149,14 @@ pub struct ColumnIndex {
 impl IndexBase for ColumnIndex {
     type Key = Value;
     fn clear(&mut self) {
-        self.table.clear();
+        for (_, subset) in self.table.drain(..) {
+            match subset {
+                BufferedSubset::Dense(_) => {}
+                BufferedSubset::Sparse(buffered_vec) => {
+                    self.subsets.return_vec(buffered_vec);
+                }
+            }
+        }
     }
     fn get_subset(&self, key: &Value) -> Option<SubsetRef> {
         self.table.get(key).map(|x| x.as_ref(&self.subsets))
@@ -215,8 +220,15 @@ impl IndexBase for TupleIndex {
     type Key = [Value];
 
     fn clear(&mut self) {
+        for entry in self.table.0.drain() {
+            match entry.vals {
+                BufferedSubset::Dense(_) => {}
+                BufferedSubset::Sparse(v) => {
+                    self.subsets.return_vec(v);
+                }
+            }
+        }
         self.keys.clear();
-        self.table.clear();
     }
 
     fn get_subset(&self, key: &[Value]) -> Option<SubsetRef> {
@@ -296,6 +308,14 @@ impl SubsetBuffer {
             buf: ps.get(),
             free_list: Vec::new(),
         }
+    }
+
+    fn return_vec(&mut self, vec: BufferedVec) {
+        let size_class = vec.len().next_power_of_two().trailing_zeros() as usize;
+        if self.free_list.len() <= size_class {
+            self.free_list.resize_with(size_class + 1, Vec::new);
+        }
+        self.free_list[size_class].push(vec.0);
     }
 
     fn new_vec(&mut self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {

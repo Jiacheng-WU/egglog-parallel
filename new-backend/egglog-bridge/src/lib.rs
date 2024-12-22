@@ -488,23 +488,18 @@ impl EGraph {
             deps.push(uf_table);
         }
         let table = match merge {
-            MergeFn::UnionId => SortedWritesTable::new(
+            MergeFn::UnionId => SortedWritesTable::new_bookkeeping(
                 n_args,
                 n_cols,
                 Some(ColumnId::from_usize(schema.len())),
-                move |state, cur, new, out| {
+                move |state, cur, new| {
                     let l = cur[n_args];
                     let r = new[n_args];
                     let next_ts = new[n_args + 1];
-                    if l != r {
-                        if tracing {
-                            // These are the same term. They are already equal
-                            // and we can just do nothing.
-                        } else {
-                            state.stage_insert(uf_table, &[l, r, next_ts]);
-                        }
-                        out.extend_from_slice(new);
-                        let todo_return_old_and_optimize = 0;
+                    if l != r && !tracing {
+                        // When proofs are enabled, these are the same term. They are already
+                        // equal and we can just do nothing.
+                        state.stage_insert(uf_table, &[l, r, next_ts]);
                         true
                     } else {
                         false

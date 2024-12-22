@@ -301,9 +301,6 @@ impl Database {
     pub fn merge_all(&mut self) -> bool {
         let mut ever_changed = false;
         loop {
-            // Support merge functions that never update the table but can still
-            // signal a change elsewhere in the db.
-            let todo_better_merge_functions = 1;
             let mut changed = false;
             let predicted = PredictedVals::default();
             let mut tables_merging =
