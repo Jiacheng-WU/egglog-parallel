@@ -837,13 +837,6 @@ fn basic_math_egraph() -> MathEgraph {
     let id_counter = db.add_counter();
     let num = db.add_table(num_impl, iter::once(uf));
     let add_impl = SortedWritesTable::new(2, 4, Some(ColumnId::new(3)), move |state, a, b, res| {
-        let todo_remove = {
-            if a == [Value::new(7), Value::new(4), Value::new(8), Value::new(6)]
-                || b == [Value::new(7), Value::new(4), Value::new(8), Value::new(6)]
-            {
-                eprintln!("ADD MERGE: {a:?}, {b:?}");
-            }
-        };
         // Capture a backtrace as a string
         if a[2] != b[2] {
             // Mark the two ids as equal. Picking b[2] as the 'presumed winner'

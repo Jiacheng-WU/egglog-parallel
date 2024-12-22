@@ -376,10 +376,14 @@ pub(crate) struct ReadHandle<'a, T> {
 }
 
 impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
-    pub(crate) fn get_row(&self, row: RowId) -> &[Value] {
-        // SAFETY: ParallelVecWriter guarantees that data within bounds is not
-        // being modified concurrently.
-        unsafe { get_row(&self.data, self.buf.n_columns, row) }
+    pub(crate) fn get_row(&self, row: RowId) -> Option<&[Value]> {
+        if row.index() < self.data.len() {
+            // SAFETY: ParallelVecWriter guarantees that data within bounds is not
+            // being modified concurrently.
+            Some(unsafe { get_row(&self.data, self.buf.n_columns, row) })
+        } else {
+            None
+        }
     }
 
     /// Get a raw pointer to the start of the buffer.

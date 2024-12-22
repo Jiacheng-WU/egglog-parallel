@@ -313,7 +313,6 @@ impl Database {
                     tables_merging.insert(table, self.tables.unwrap_val(table));
                 }
                 let db = self.read_only_view();
-                let revert_parallel = 1;
                 changed |= tables_merging
                     .par_iter_mut()
                     .map(|(_, info)| {
