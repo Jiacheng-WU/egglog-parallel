@@ -123,13 +123,26 @@ impl Rows {
     }
 }
 
+type UpdateFn =
+    dyn Fn(&mut ExecutionState, &[Value], &[Value], &mut Vec<Value>) -> bool + Send + Sync;
+
+type BookkeepFn = dyn Fn(&mut ExecutionState, &[Value], &[Value]) -> bool + Send + Sync;
+
 /// A callback that can perform merges for a table.
 ///
-/// Merge functions get a handle to the current ExecutionState, the current
-/// value, and the newly inserted row (in that order). Returns `true` if the
-/// value was updated.
-pub(crate) type MergeFn =
-    Arc<dyn Fn(&mut ExecutionState, &[Value], &[Value], &mut Vec<Value>) -> bool + Send + Sync>;
+/// Merge functions get a handle to the current ExecutionState, the old row, and the updated row.
+/// They can then return some new output and indicate if they have mutated the state of the table.
+
+#[derive(Clone)]
+enum MergeFn {
+    /// Standard merge functions: the output is written to the fourth argument, and is only used if
+    /// the function returns true.
+    Update(Arc<UpdateFn>),
+    /// "Bookkeeping-only" merge functions which _never_ change the table, but may enqueue updates
+    /// in the execution state depending on the value of the new row. These merge functions are
+    /// common and allow for more efficient insertion operations.
+    Bookkeeping(Arc<BookkeepFn>),
+}
 
 #[derive(Clone)]
 pub struct SortedWritesTable {
@@ -451,7 +464,7 @@ impl SortedWritesTable {
             sort_by,
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
-            merge: Arc::new(merge_fn),
+            merge: MergeFn::Update(Arc::new(merge_fn)),
         }
     }
 
@@ -589,21 +602,27 @@ impl SortedWritesTable {
                                 .data
                                 .get_row(*row)
                                 .expect("table should not point to stale entry");
-                            if (self.merge)(exec_state, cur, query, &mut scratch) {
-                                let new = self.data.add_row(&scratch);
-                                if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
-                                    assert!(sort_val >= largest, "inserting row that violates sort order ({sort_val:?} vs. {largest:?})");
-                                    if sort_val > largest {
-                                        self.offsets.push((sort_val, new));
+                            match &self.merge {
+                                MergeFn::Update(f) => {
+                                    if f(exec_state, cur, query, &mut scratch) {
+                                        let new = self.data.add_row(&scratch);
+                                        if let Some(largest) = self.offsets.last().map(|(v, _)| *v)
+                                        {
+                                            assert!(sort_val >= largest, "inserting row that violates sort order ({sort_val:?} vs. {largest:?})");
+                                            if sort_val > largest {
+                                                self.offsets.push((sort_val, new));
+                                            }
+                                        } else {
+                                            self.offsets.push((sort_val, new));
+                                        }
+                                        self.data.set_stale(*row);
+                                        *row = new;
+                                        changed = true;
                                     }
-                                } else {
-                                    self.offsets.push((sort_val, new));
+                                    scratch.clear();
                                 }
-                                self.data.set_stale(*row);
-                                *row = new;
-                                changed = true;
+                                MergeFn::Bookkeeping(f) => todo!(),
                             }
-                            scratch.clear();
                         } else {
                             // New value: update invariants.
                             let new = self.data.add_row(query);
@@ -649,13 +668,18 @@ impl SortedWritesTable {
                                 .data
                                 .get_row(*row)
                                 .expect("table should not point to stale entry");
-                            if (self.merge)(exec_state, cur, query, &mut scratch) {
-                                let new = self.data.add_row(&scratch);
-                                self.data.set_stale(*row);
-                                *row = new;
-                                changed = true;
+                            match &self.merge {
+                                MergeFn::Update(f) => {
+                                    if f(exec_state, cur, query, &mut scratch) {
+                                        let new = self.data.add_row(&scratch);
+                                        self.data.set_stale(*row);
+                                        *row = new;
+                                        changed = true;
+                                    }
+                                    scratch.clear();
+                                }
+                                MergeFn::Bookkeeping(f) => todo!(),
                             }
-                            scratch.clear();
                         } else {
                             // New value: update invariants.
                             let new = self.data.add_row(query);
@@ -678,11 +702,12 @@ impl SortedWritesTable {
         changed
     }
 
-    fn parallel_insert<C: OrderingChecker>(
+    fn parallel_insert_update<C: OrderingChecker>(
         &mut self,
         exec_state: &ExecutionState,
         checker: C,
         n_rows: usize,
+        merge_fn: &UpdateFn,
     ) -> bool {
         // Parallel insert uses one giant parallel foreach. We have updates
         // pre-sharded, and one logical thread can process updates for each
@@ -716,7 +741,7 @@ impl SortedWritesTable {
                     // writer.
                     for row in buf.non_stale() {
                         staged.insert(row, |cur, new, out| {
-                            (self.merge)(&mut exec_state, cur, new, out)
+                            merge_fn(&mut exec_state, cur, new, out)
                         });
                     }
                 }
@@ -781,7 +806,7 @@ impl SortedWritesTable {
                             // concurrent accesses to `row`. We have
                             // exclusive access to any row whose hash matches this
                             // shard.
-                            if (self.merge)(&mut exec_state, cur, row, &mut scratch) {
+                            if merge_fn(&mut exec_state, cur, row, &mut scratch) {
                                 unsafe {
                                     let _was_stale = read_handle.set_stale_shared(occ.get().row);
                                     debug_assert!(!_was_stale);
@@ -831,6 +856,32 @@ impl SortedWritesTable {
             .flatten()
             .any(|(_, _, changed)| *changed);
         changed
+    }
+
+    fn parallel_insert_bookkeep<C: OrderingChecker>(
+        &mut self,
+        exec_state: &ExecutionState,
+        checker: C,
+        n_rows: usize,
+        merge_fn: &BookkeepFn,
+    ) -> bool {
+        todo!()
+    }
+
+    fn parallel_insert<C: OrderingChecker>(
+        &mut self,
+        exec_state: &ExecutionState,
+        checker: C,
+        n_rows: usize,
+    ) -> bool {
+        match self.merge.clone() {
+            MergeFn::Update(f) => {
+                self.parallel_insert_update(exec_state, checker, n_rows, f.as_ref())
+            }
+            MergeFn::Bookkeeping(f) => {
+                self.parallel_insert_bookkeep(exec_state, checker, n_rows, f.as_ref())
+            }
+        }
     }
 
     fn binary_search_sort_val(&self, val: Value) -> Result<(RowId, RowId), RowId> {
