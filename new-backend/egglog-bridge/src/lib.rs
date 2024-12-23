@@ -500,6 +500,7 @@ impl EGraph {
                         // When proofs are enabled, these are the same term. They are already
                         // equal and we can just do nothing.
                         state.stage_insert(uf_table, &[l, r, next_ts]);
+                        let todo_always_return_false = 1;
                         true
                     } else {
                         false

@@ -673,7 +673,7 @@ impl SortedWritesTable {
                                     hashcode: hc as _,
                                     row: new,
                                 },
-                                |entry| entry.hashcode(),
+                                TableEntry::hashcode,
                             );
                             changed = true;
                         }
@@ -1198,18 +1198,20 @@ impl OrderingChecker for SortChecker {
 }
 
 fn do_parallel(_workload_size: usize) -> bool {
-    #[cfg(test)]
-    {
-        // In tests, run serial and parallel variants half the time,
-        // nondeterministically.
-        use rand::{thread_rng, Rng};
-        thread_rng().gen::<bool>()
-    }
+    let todo_remove = 1;
+    false
+    // #[cfg(test)]
+    // {
+    //     // In tests, run serial and parallel variants half the time,
+    //     // nondeterministically.
+    //     use rand::{thread_rng, Rng};
+    //     thread_rng().gen::<bool>()
+    // }
 
-    #[cfg(not(test))]
-    {
-        _workload_size > 50_000 && rayon::current_num_threads() > 1
-    }
+    // #[cfg(not(test))]
+    // {
+    //     _workload_size > 50_000 && rayon::current_num_threads() > 1
+    // }
 }
 
 /// A type similar to a SortedWritesTable used to buffer outputs. The main thing
