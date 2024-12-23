@@ -427,7 +427,7 @@ impl Database {
             let index = get_column_index_from_tableinfo(table_info, col);
             match index.read().get_subset(&val) {
                 Some(s) => {
-                    with_pool_set(|ps| subset.intersect(s, &ps.get_pool()));
+                    with_pool_set(|ps| subset.intersect(*s, &ps.get_pool()));
                 }
                 None => {
                     // There are no rows matching this key! We can constrain this to nothing.

@@ -103,6 +103,12 @@ impl<T> ReadOptimizedLock<T> {
         self.data.0.into_inner()
     }
 
+    /// Get mutable access to the underlying data. This operation does no synchronization as the
+    /// mutable receiver guarantees exclusive access for safe code.
+    pub fn as_mut_ref(&mut self) -> &mut T {
+        self.data.0.get_mut()
+    }
+
     /// Create a `Reader` object that grants read access to the data.
     ///
     /// This method will block for any ongoing writes to complete.

@@ -241,6 +241,14 @@ impl SubsetRef<'_> {
             }
         }
     }
+
+    /// Get the underlying slice of a sparse subset. Used for debugging.
+    pub(crate) fn _slice(&self) -> &[RowId] {
+        match self {
+            SubsetRef::Dense(_) => panic!("getting slice from dense subset"),
+            SubsetRef::Sparse(slc) => slc.inner(),
+        }
+    }
     pub(crate) fn iter_bounded(
         self,
         start: usize,

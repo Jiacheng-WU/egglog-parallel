@@ -147,6 +147,17 @@ impl<T> ParallelVecWriter<T> {
         res
     }
 
+    pub fn take(&mut self) -> Vec<T> {
+        let mut res = mem::take(self.data.as_mut_ref());
+        // SAFETY: this value is incremented past the original length of the
+        // vector once for each item written to it.
+        unsafe {
+            res.set_len(self.end_len.load(Ordering::Acquire));
+        }
+        self.end_len.store(0, Ordering::Release);
+        res
+    }
+
     unsafe fn write_contents_at(&self, items: impl ExactSizeIterator<Item = T>, start: usize) {
         let mut written = 0;
         let expected = items.len();
