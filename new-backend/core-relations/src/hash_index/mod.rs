@@ -20,8 +20,24 @@ use crate::{
     OffsetRange,
 };
 
+// Target <14s on math and <5.7s on ac
+// * Want to avoid needing to grab a read lock when reading.
+// * SubsetBuffer should be a normal vector
+// * get rid of the impl Deref everywhere.
+// * Provide a ParallelSubsetBuffer struct that can convert to/from a regular SubsetBuffer.
+// * Keep free lists as SegQueues
+// * Should simplify/remove some unsafe code.
+//
+// Then shard the hash table (in all cases)
+//
+// Then implement parallel refresh
+
+type CleanupTodos = ();
+
+mod parallel_buffer;
 #[cfg(test)]
 mod tests;
+
 struct TableEntry<T> {
     hash: u64,
     /// Points into `keys`
@@ -314,231 +330,106 @@ define_id!(BufferIndex, u32, "an index into a subset buffer");
 /// A shared pool of row ids used to store sorted offset vectors with a common
 /// lifetime.
 ///
-/// This is used as the backing store for subsets stored in indexes. While this scheme definitely
-/// saves some allocations, the primary use for SubsetBuffer is to make deallocation faster: with a
-/// standard [`crate::offsets::Subset`] structure stored in the index, dropping requires an O(n)
-/// traversal of the index. SubsetBuffer allows deallocation to happen in constant time (given our
-/// use of memory pools).
-///
-/// The uses of BufferedVec and similar in this module are safe, but the API is *not* properly safe
-/// as a public API. In particular, passing a BufferedVec to a SubsetBuffer that didn't create it
-/// could cause an out-of-bounds read.
+/// This is used as the backing store for subsets stored in indexes. While
+/// definitely saves some allocations, the primary use for SubsetBuffer is to
+/// make deallocation faster: with a standard [`crate::offsets::Subset`]
+/// structure stored in the index, dropping requires an O(n) traversal of the
+/// index. SubsetBuffer allows deallocation to happen in constant time (given
+/// our use of memory pools).
 struct SubsetBuffer {
-    buf: ParallelVecWriter<RowId>,
-    free_list: ConcurrentVec<SegQueue<BufferIndex>>,
+    buf: Pooled<Vec<RowId>>,
+    free_list: Vec<Vec<BufferIndex>>,
 }
 
 impl Default for SubsetBuffer {
     fn default() -> SubsetBuffer {
-        with_pool_set(|ps| {
-            let buf: Pooled<Vec<RowId>> = ps.get();
-            SubsetBuffer {
-                buf: ParallelVecWriter::new(Pooled::into_inner(buf)),
-                free_list: ConcurrentVec::with_capacity(4),
-            }
+        with_pool_set(|ps| SubsetBuffer {
+            buf: ps.get(),
+            free_list: Default::default(),
         })
     }
 }
 
-impl Drop for SubsetBuffer {
-    fn drop(&mut self) {
-        // Return the underlying vector to the pool.
-        Pooled::new(self.buf.take());
-    }
-}
-
-struct ReadHandle<'a> {
-    reader: UnsafeReadAccess<'a, RowId>,
-}
-
-impl ReadHandle<'_> {
-    /// Get a reference to the underlying subset associated with this vector.
-    ///
-    /// # Safety
-    /// Assumes that the underlying vector is sorted, and that `vec` was returned from the same
-    /// SubsetBuffer that this read handle came from.
-    unsafe fn make_ref(&self, vec: &BufferedVec) -> SubsetRef<'_> {
-        SubsetRef::Sparse(SortedOffsetSlice::new_unchecked(
-            self.reader
-                .get_unchecked_slice(vec.0.index()..vec.1.index()),
-        ))
-    }
-}
-
 impl SubsetBuffer {
-    fn return_vec(&self, vec: BufferedVec) {
-        let free_list = self.get_free_list(vec.len());
-        free_list.push(vec.0);
-    }
-
-    fn read_handle(&self) -> ReadHandle {
-        ReadHandle {
-            reader: self.buf.unsafe_read_access(),
-        }
-    }
-
-    fn make_ref<'a>(&'a self, vec: &BufferedVec) -> impl Deref<Target = SubsetRef<'a>> {
-        struct Slice<'a, T> {
-            _handle: T,
-            subset: SubsetRef<'a>,
-        }
-        impl<'a, T> Deref for Slice<'a, T> {
-            type Target = SubsetRef<'a>;
-            fn deref(&self) -> &SubsetRef<'a> {
-                &self.subset
-            }
-        }
-        let handle = self.buf.read_access();
-        let subset = unsafe {
-            SortedOffsetSlice::new_unchecked(std::slice::from_raw_parts(
-                handle.as_ptr().add(vec.0.index()),
-                vec.len(),
-            ))
-        };
-        debug_assert!(subset.inner().iter().all(|x| x.rep() != u32::MAX));
-        Slice {
-            _handle: handle,
-            subset: SubsetRef::Sparse(subset),
-        }
-    }
-
-    fn new_vec(&self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
+    fn new_vec(&mut self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
         let len = rows.len();
-        if len == 0 {
-            return BufferedVec::default();
+        assert!(len > 0);
+        let size_class = len.next_power_of_two().trailing_zeros() as usize;
+        if let Some(v) = self.free_list.get_mut(size_class).and_then(Vec::pop) {
+            return self.fill_at(v, rows);
         }
-        {
-            let free_list = self.get_free_list(rows.len());
-            if let Some(index) = free_list.pop() {
-                let read_handle = self.buf.read_access();
-                let mut written = 0;
-                let mut cur_ptr =
-                    unsafe { (read_handle.as_ptr() as *mut RowId).add(index.index()) };
-                for row in rows {
-                    assert!(written < len, "ExactSizeIterator lied about its length");
-                    unsafe {
-                        cur_ptr.write(row);
-                        cur_ptr = cur_ptr.add(1);
-                    }
-                    written += 1;
-                }
-                assert_eq!(written, len, "ExactSizeIterator lied about its length");
-                return BufferedVec(index, BufferIndex::from_usize(index.index() + written));
-            }
-        }
-        // We don't have a previously-used vector in the given size class. Add a new one.
-        let mut scratch: Pooled<Vec<RowId>> = with_pool_set(|ps| ps.get());
-        scratch.extend(rows);
-        assert_eq!(
-            scratch.len(),
-            len,
-            "ExactSizeIterator lied about its length"
+        let start = BufferIndex::from_usize(self.buf.len());
+        self.buf.resize(
+            start.index() + len.next_power_of_two(),
+            RowId::new(u32::MAX),
         );
-        scratch.resize(len.next_power_of_two(), RowId::new(!0));
-        let start_index = self.buf.write_contents(scratch.iter().copied());
-        let res = BufferedVec(
-            BufferIndex::from_usize(start_index),
-            BufferIndex::from_usize(start_index + len),
-        );
-        debug_assert_eq!(self.make_ref(&res)._slice(), &scratch.as_slice()[0..len]);
-        res
+        self.fill_at(start, rows)
     }
 
-    /// Push `item` onto the vector.
-    ///
-    /// # Safety
-    /// This method is safe so long as `vec` was returned from this buffer at some point. Aside
-    /// from that requirement, the safety of this method relies on the fact that:
-    /// * `BufferedVec`s cannot be copied. Hence, methods that take a BufferedVec by value have
-    ///   exclusive access to that vector.
-    /// * Each `BufferedVec`'s start index identifies a power-of-two-length subslice of the
-    ///   underlying buffer _uniquely_ occupied by that vector.
-    ///
-    /// Together, these requirements ensure that mutable writes to `vec` do not overlap with
-    /// another existing borrow of a given cell.
-    unsafe fn push_vec(&self, vec: BufferedVec, item: RowId) -> BufferedVec {
-        if !vec.is_empty() && !vec.len().is_power_of_two() {
-            let read_handle = self.buf.read_access();
-            (read_handle.as_ptr() as *mut RowId)
-                .add(vec.1.index())
-                .write(item);
+    fn fill_at(
+        &mut self,
+        start: BufferIndex,
+        rows: impl ExactSizeIterator<Item = RowId>,
+    ) -> BufferedVec {
+        let mut cur = start;
+        for i in rows {
+            self.buf[cur.index()] = i;
+            cur = cur.inc();
+        }
+        BufferedVec(start, cur)
+    }
+
+    fn push_vec(&mut self, vec: BufferedVec, row: RowId) -> BufferedVec {
+        assert!(
+            vec.is_empty() || self.buf[vec.1.index() - 1] <= row,
+            "vec={vec:?}, row={row:?}, last_elt={:?}",
+            self.buf[vec.1.index() - 1]
+        );
+        if !vec.len().is_power_of_two() {
+            self.buf[vec.1.index()] = row;
             return BufferedVec(vec.0, vec.1.inc());
         }
-        {
-            let free_list = self.get_free_list(vec.len() + 1);
-            if let Some(v) = free_list.pop() {
-                let read_handle = self.buf.read_access();
-                let dst_ptr = read_handle.as_ptr().add(v.index()) as *mut RowId;
-                let src_ptr = read_handle.as_ptr().add(vec.0.index());
-                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, vec.len());
-                dst_ptr.add(vec.len()).write(item);
-                let res = BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1));
-                self.return_vec(vec);
-                return res;
-            }
-        } // drop the read guard for free_list
-        if vec.is_empty() {
-            let start_index = self.buf.write_contents(std::iter::once(item));
-            return BufferedVec(
-                BufferIndex::from_usize(start_index),
-                BufferIndex::from_usize(start_index + 1),
-            );
+        // The vector is full.  Add it to the free list.
+        let size_class = vec.len().trailing_zeros() as usize;
+        if self.free_list.len() <= size_class {
+            self.free_list.resize_with(size_class + 1, Vec::new);
         }
 
-        // We don't have a previously-used vector in the given size class. Add a new one.
-        let read_handle = self.buf.unsafe_read_access();
-        let mut scratch: Pooled<Vec<RowId>> = with_pool_set(|ps| ps.get());
-        scratch.extend((0..(vec.len() + 1).next_power_of_two()).map(|x| {
-            use std::cmp::Ordering;
-            match x.cmp(&vec.len()) {
-                Ordering::Less => *read_handle.get_unchecked(vec.0.index() + x),
-                Ordering::Equal => item,
-                Ordering::Greater => RowId::new(!0),
-            }
-        }));
-        mem::drop(read_handle);
-        let start_index = self.buf.write_contents(scratch.iter().copied());
-        BufferedVec(
-            BufferIndex::from_usize(start_index),
-            BufferIndex::from_usize(start_index + vec.len() + 1),
-        )
+        // Allocate a new one and move the contents over.
+        self.free_list[size_class].push(vec.0);
+        let next = size_class + 1;
+        if let Some(v) = self.free_list.get_mut(next).and_then(Vec::pop) {
+            self.buf
+                .copy_within(vec.0.index()..vec.1.index(), v.index());
+            self.buf[v.index() + vec.len()] = row;
+            BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1))
+        } else {
+            let start = self.buf.len();
+            self.buf.resize(
+                start + (vec.len() + 1).next_power_of_two(),
+                RowId::new(u32::MAX),
+            );
+            self.buf.copy_within(vec.0.index()..vec.1.index(), start);
+            self.buf[start + vec.len()] = row;
+            let end = start + vec.len() + 1;
+            BufferedVec(BufferIndex::from_usize(start), BufferIndex::from_usize(end))
+        }
     }
 
-    /// Get a handle on a free list that can store vectors of the given size.
-    ///
-    /// The returned object keeps an RCU-style read handle on the buffer, meaning that it can block
-    /// resizes of the underlying vector. Callers should avoid keeping these objects around for too
-    /// long.
-    fn get_free_list(&self, size: usize) -> impl Deref<Target = SegQueue<BufferIndex>> + '_ {
-        struct FreeListHandle<T> {
-            reader: T,
-            index: usize,
+    fn make_ref<'a>(&'a self, vec: &BufferedVec) -> SubsetRef<'a> {
+        // SAFETY: if `vec` is a valid index into self.buf, it will be sorted.
+        //
+        // NB: we do not guarantee this in the type signature of BufferedVec,
+        // etc. But this is indeed safe given the usage within this module.
+        let res = SubsetRef::Sparse(unsafe {
+            SortedOffsetSlice::new_unchecked(&self.buf[vec.0.index()..vec.1.index()])
+        });
+        #[cfg(debug_assertions)]
+        {
+            use crate::offsets::Offsets;
+            res.offsets(|x| assert_ne!(x.rep(), u32::MAX))
         }
-
-        impl<T: Deref<Target = [SegQueue<BufferIndex>]>> Deref for FreeListHandle<T> {
-            type Target = SegQueue<BufferIndex>;
-            fn deref(&self) -> &SegQueue<BufferIndex> {
-                &self.reader[self.index]
-            }
-        }
-        let size_class = size.next_power_of_two().trailing_zeros() as usize;
-        let reader = self.free_list.read();
-        if size_class < reader.len() {
-            return FreeListHandle {
-                reader,
-                index: size_class,
-            };
-        }
-        mem::drop(reader);
-        // There are faster ways to do this.. but it's unlikely we'll ever have more than a few
-        // dozen size classes.
-        loop {
-            let largest_size = self.free_list.push(Default::default());
-            if largest_size > size_class {
-                break;
-            }
-        }
-        self.get_free_list(size)
+        res
     }
 }
 
@@ -584,9 +475,7 @@ impl BufferedSubset {
                 v = buf.push_vec(v, row);
                 *self = BufferedSubset::Sparse(v);
             }
-            BufferedSubset::Sparse(vec) => unsafe {
-                *vec = buf.push_vec(mem::take(vec), row);
-            },
+            BufferedSubset::Sparse(vec) => *vec = buf.push_vec(mem::take(vec), row),
         }
     }
 
