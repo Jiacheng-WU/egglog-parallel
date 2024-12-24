@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
 };
 
-use concurrency::{parallel_writer::UnsafeReadAccess, ConcurrentVec, ParallelVecWriter};
+use concurrency::ConcurrentVec;
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{define_id, NumericId};
@@ -65,10 +65,7 @@ impl<TI: IndexBase> Index<TI> {
 
     /// Get the nonempty subset of rows associated with this key, if there is
     /// one.
-    pub(crate) fn get_subset<'a>(
-        &'a self,
-        key: &'a TI::Key,
-    ) -> Option<impl Deref<Target = SubsetRef<'a>>> {
+    pub(crate) fn get_subset<'a>(&'a self, key: &'a TI::Key) -> Option<SubsetRef<'a>> {
         self.table.get_subset(key)
     }
 
@@ -76,11 +73,15 @@ impl<TI: IndexBase> Index<TI> {
         table.version() != self.updated_to
     }
 
+    pub(crate) fn refresh(&mut self, table: &WrappedTable) {
+        self.refresh_serial(table)
+    }
+
     /// Update the contents of the index to the current version of the table.
     ///
     /// The index is guaranteed to be up to date until `merge` is called on the
     /// table again.
-    pub(crate) fn refresh(&mut self, table: &WrappedTable) {
+    pub(crate) fn refresh_serial(&mut self, table: &WrappedTable) {
         let cur_version = table.version();
         if cur_version == self.updated_to {
             return;
@@ -130,19 +131,6 @@ impl Clear for SubsetTable {
     }
 }
 
-// Define a newtype to hook things into the PoolSet machinery.
-#[derive(Default)]
-pub(crate) struct KeyPresenceTable(HashTable<TableEntry<()>>);
-
-impl Clear for KeyPresenceTable {
-    fn clear(&mut self) {
-        self.0.clear();
-    }
-    fn reuse(&self) -> bool {
-        self.0.capacity() > 0
-    }
-}
-
 pub(crate) trait IndexBase {
     /// The type of keys for this index.  Keys can have validity constraints
     /// (e.g. the arity of a slice for `Key = [Value]`). If keys are invalid,
@@ -151,10 +139,7 @@ pub(crate) trait IndexBase {
     /// Remove any existing entries in the index.
     fn clear(&mut self);
     /// Get the subset corresponding to this key, if there is one.
-    fn get_subset<'a, 'b>(
-        &'a self,
-        key: &'b Self::Key,
-    ) -> Option<impl Deref<Target = SubsetRef<'a>>>;
+    fn get_subset(&self, key: &Self::Key) -> Option<SubsetRef>;
     /// Add the given key and row id to the table.
     fn add_row(&mut self, key: &Self::Key, row: RowId);
     /// Merge the contents of the [`TaggedRowBuffer`] into the table.
@@ -183,7 +168,7 @@ impl IndexBase for ColumnIndex {
             }
         }
     }
-    fn get_subset<'a>(&'a self, key: &Value) -> Option<impl Deref<Target = SubsetRef<'a>>> {
+    fn get_subset<'a>(&'a self, key: &Value) -> Option<SubsetRef<'a>> {
         self.table.get(key).map(|x| x.as_ref(&self.subsets))
     }
     fn add_row(&mut self, key: &Value, row: RowId) {
@@ -203,12 +188,9 @@ impl IndexBase for ColumnIndex {
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
-        let read_handle = self.subsets.read_handle();
         for (k, v) in self.table.iter() {
             // SAFETY: all of the vectors in `table` come from `subsets`.
-            unsafe {
-                f(k, *v.as_ref_from_handle(&read_handle));
-            }
+            f(k, v.as_ref(&self.subsets));
         }
     }
     fn len(&self) -> usize {
@@ -263,7 +245,7 @@ impl IndexBase for TupleIndex {
         self.keys.clear();
     }
 
-    fn get_subset<'a>(&'a self, key: &[Value]) -> Option<impl Deref<Target = SubsetRef<'a>>> {
+    fn get_subset<'a>(&'a self, key: &[Value]) -> Option<SubsetRef<'a>> {
         let hash = hash_key(key);
         let entry = self.table.0.find(hash, |entry| {
             entry.hash == hash && self.keys.get_row(entry.key) == key
@@ -304,13 +286,10 @@ impl IndexBase for TupleIndex {
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
         // SAFETY: `f` cannot leak references from the callback due to its type.
-        let read_handle = self.subsets.read_handle();
         self.table.0.iter().for_each(|entry| {
             let key = self.keys.get_row(entry.key);
             // SAFETY: all of the vectors in `table` come from `subsets`.
-            unsafe {
-                f(key, *entry.vals.as_ref_from_handle(&read_handle));
-            }
+            f(key, entry.vals.as_ref(&self.subsets));
         });
     }
 
@@ -338,7 +317,7 @@ define_id!(BufferIndex, u32, "an index into a subset buffer");
 /// our use of memory pools).
 struct SubsetBuffer {
     buf: Pooled<Vec<RowId>>,
-    free_list: Vec<Vec<BufferIndex>>,
+    free_list: ConcurrentVec<SegQueue<BufferIndex>>,
 }
 
 impl Default for SubsetBuffer {
@@ -351,12 +330,51 @@ impl Default for SubsetBuffer {
 }
 
 impl SubsetBuffer {
+    /// Get a handle on a free list that can store vectors of the given size.
+    ///
+    /// The returned object keeps an RCU-style read handle on the buffer, meaning that it can block
+    /// resizes of the underlying vector. Callers should avoid keeping these objects around for too
+    /// long.
+    fn get_free_list(&self, size: usize) -> impl Deref<Target = SegQueue<BufferIndex>> + '_ {
+        struct FreeListHandle<T> {
+            reader: T,
+            index: usize,
+        }
+
+        impl<T: Deref<Target = [SegQueue<BufferIndex>]>> Deref for FreeListHandle<T> {
+            type Target = SegQueue<BufferIndex>;
+            fn deref(&self) -> &SegQueue<BufferIndex> {
+                &self.reader[self.index]
+            }
+        }
+        let size_class = size.next_power_of_two().trailing_zeros() as usize;
+        let reader = self.free_list.read();
+        if size_class < reader.len() {
+            return FreeListHandle {
+                reader,
+                index: size_class,
+            };
+        }
+        mem::drop(reader);
+        // There are faster ways to do this.. but it's unlikely we'll ever have more than a few
+        // dozen size classes.
+        loop {
+            let largest_size = self.free_list.push(Default::default());
+            if largest_size > size_class {
+                break;
+            }
+        }
+        self.get_free_list(size)
+    }
     fn new_vec(&mut self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
         let len = rows.len();
         assert!(len > 0);
-        let size_class = len.next_power_of_two().trailing_zeros() as usize;
-        if let Some(v) = self.free_list.get_mut(size_class).and_then(Vec::pop) {
-            return self.fill_at(v, rows);
+        {
+            let free_list = self.get_free_list(len);
+            if let Some(v) = free_list.pop() {
+                mem::drop(free_list);
+                return self.fill_at(v, rows);
+            }
         }
         let start = BufferIndex::from_usize(self.buf.len());
         self.buf.resize(
@@ -379,6 +397,11 @@ impl SubsetBuffer {
         BufferedVec(start, cur)
     }
 
+    fn return_vec(&self, vec: BufferedVec) {
+        let free_list = self.get_free_list(vec.len());
+        free_list.push(vec.0);
+    }
+
     fn push_vec(&mut self, vec: BufferedVec, row: RowId) -> BufferedVec {
         assert!(
             vec.is_empty() || self.buf[vec.1.index() - 1] <= row,
@@ -389,21 +412,17 @@ impl SubsetBuffer {
             self.buf[vec.1.index()] = row;
             return BufferedVec(vec.0, vec.1.inc());
         }
-        // The vector is full.  Add it to the free list.
-        let size_class = vec.len().trailing_zeros() as usize;
-        if self.free_list.len() <= size_class {
-            self.free_list.resize_with(size_class + 1, Vec::new);
-        }
 
-        // Allocate a new one and move the contents over.
-        self.free_list[size_class].push(vec.0);
-        let next = size_class + 1;
-        if let Some(v) = self.free_list.get_mut(next).and_then(Vec::pop) {
+        let free_list = self.get_free_list(vec.len() + 1);
+
+        let res = if let Some(v) = free_list.pop() {
+            mem::drop(free_list);
             self.buf
                 .copy_within(vec.0.index()..vec.1.index(), v.index());
             self.buf[v.index() + vec.len()] = row;
             BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1))
         } else {
+            mem::drop(free_list);
             let start = self.buf.len();
             self.buf.resize(
                 start + (vec.len() + 1).next_power_of_two(),
@@ -413,7 +432,9 @@ impl SubsetBuffer {
             self.buf[start + vec.len()] = row;
             let end = start + vec.len() + 1;
             BufferedVec(BufferIndex::from_usize(start), BufferIndex::from_usize(end))
-        }
+        };
+        self.return_vec(vec);
+        res
     }
 
     fn make_ref<'a>(&'a self, vec: &BufferedVec) -> SubsetRef<'a> {
@@ -487,30 +508,10 @@ impl BufferedSubset {
         BufferedSubset::Dense(OffsetRange::new(row, row.inc()))
     }
 
-    /// A more finnicky variant of `as_ref` that allows callers to amortize the cost of grabbing a
-    /// read handle.
-    ///
-    /// # Safety
-    /// Callers must ensure that the given vector for `Sparse` variants comes from the given
-    /// buffer corresponding to the input `ReadHandle`.
-    unsafe fn as_ref_from_handle<'a>(
-        &self,
-        buf: &'a ReadHandle,
-    ) -> impl Deref<Target = SubsetRef<'a>> {
+    fn as_ref<'a>(&self, buf: &'a SubsetBuffer) -> SubsetRef<'a> {
         match self {
-            BufferedSubset::Dense(range) => {
-                WrappedSubset::<VoidWithLifetime<'a>>::Dense(SubsetRef::Dense(*range))
-            }
-            BufferedSubset::Sparse(vec) => {
-                WrappedSubset::<VoidWithLifetime<'a>>::Dense(buf.make_ref(vec))
-            }
-        }
-    }
-
-    fn as_ref<'a>(&self, buf: &'a SubsetBuffer) -> impl Deref<Target = SubsetRef<'a>> {
-        match self {
-            BufferedSubset::Dense(range) => WrappedSubset::Dense(SubsetRef::Dense(*range)),
-            BufferedSubset::Sparse(vec) => WrappedSubset::Sparse(buf.make_ref(vec)),
+            BufferedSubset::Dense(range) => SubsetRef::Dense(*range),
+            BufferedSubset::Sparse(vec) => buf.make_ref(vec),
         }
     }
 }

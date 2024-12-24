@@ -25,7 +25,7 @@ use crate::{
     primitives::Primitives,
     query::{Query, RuleSetBuilder},
     table_spec::{ColumnId, Constraint, Table, TableSpec, WrappedTable},
-    QueryEntry, TupleIndex, Value,
+    PoolSet, QueryEntry, TupleIndex, Value,
 };
 
 use self::plan::Plan;
@@ -201,6 +201,9 @@ pub(crate) fn inc_counter(
 
 impl Database {
     /// Create an empty Database.
+    ///
+    /// Queries are executed using the current rayon thread pool, which defaults to the global
+    /// thread pool.
     pub fn new() -> Database {
         Database::default()
     }
@@ -427,7 +430,7 @@ impl Database {
             let index = get_column_index_from_tableinfo(table_info, col);
             match index.read().get_subset(&val) {
                 Some(s) => {
-                    with_pool_set(|ps| subset.intersect(*s, &ps.get_pool()));
+                    with_pool_set(|ps| subset.intersect(s, &ps.get_pool()));
                 }
                 None => {
                     // There are no rows matching this key! We can constrain this to nothing.
@@ -453,6 +456,16 @@ impl Database {
 
     pub(crate) fn plan_query(&mut self, query: Query) -> Plan {
         plan::plan_query(query)
+    }
+}
+
+impl Drop for Database {
+    fn drop(&mut self) {
+        // Clean up the ambient thread pool.
+        //
+        // Calling mem::forget on the egraph can result in much faster execution times.
+        with_pool_set(PoolSet::clear);
+        rayon::broadcast(|_| with_pool_set(PoolSet::clear));
     }
 }
 

@@ -37,7 +37,7 @@ fn basic_updates() {
         for i in 0..=4 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();
-            table.scan(*subset).iter().for_each(|(id, row)| {
+            table.scan(subset).iter().for_each(|(id, row)| {
                 assert_eq!(&row[0..3], &[v(i), v(i + 1), v(i + 2)]);
                 let readback = table.get_row(&row[0..2]).expect("row should exist");
                 assert_eq!(readback.id, id);
@@ -58,7 +58,7 @@ fn basic_updates() {
         for i in 0..10 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();
-            table.scan(*subset).iter().for_each(|(id, row)| {
+            table.scan(subset).iter().for_each(|(id, row)| {
                 assert_eq!(&row[0..3], &[v(i), v(i + 1), v(i + 2)]);
                 let readback = table.get_row(&row[0..2]).expect("row should exist");
                 assert_eq!(readback.id, id);
@@ -80,7 +80,7 @@ fn basic_updates() {
         for i in 0..10 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();
-            table.scan(*subset).iter().for_each(|(id, row)| {
+            table.scan(subset).iter().for_each(|(id, row)| {
                 assert_eq!(&row[0..3], &[v(i), v(i + 1), v(i + 2)]);
                 let readback = table.get_row(&row[0..2]).expect("row should exist");
                 assert_eq!(readback.id, id);

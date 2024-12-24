@@ -16,7 +16,7 @@ use crate::{
     action::Instr,
     common::{HashMap, HashSet, IndexMap, IndexSet, Value},
     free_join::execute::FrameUpdate,
-    hash_index::{BufferedSubset, KeyPresenceTable, SubsetTable},
+    hash_index::{BufferedSubset, SubsetTable},
     offsets::SortedOffsetVector,
     table_spec::Constraint,
     RowId,
@@ -140,6 +140,13 @@ impl<T: Clear + InPoolSet<PoolSet>> Pool<T> {
         Pooled {
             data: ManuallyDrop::new(empty),
         }
+    }
+
+    /// Clear the contents of the pool and release any memory associated with it.
+    pub(crate) fn clear(&self) {
+        let mut data_mut = self.data.borrow_mut();
+        data_mut.clear();
+        data_mut.shrink_to_fit();
     }
 }
 
@@ -281,6 +288,9 @@ macro_rules! pool_set {
             $vis fn get<T: InPoolSet<Self> + Default>(&self) -> Pooled<T> {
                 self.get_pool().get()
             }
+            $vis fn clear(&self) {
+                $( self.$ident.clear(); )*
+            }
         }
 
         $(
@@ -306,7 +316,6 @@ pool_set! {
         bitsets: FixedBitSet,
         instrs: Vec<Instr>,
         index_hashes: SubsetTable,
-        key_presence: KeyPresenceTable,
         frame_updates: FrameUpdate,
         frame_update_vecs: Vec<Pooled<FrameUpdate>>,
     }
