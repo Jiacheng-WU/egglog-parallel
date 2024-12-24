@@ -5,7 +5,7 @@ use std::{
     ops::Deref,
 };
 
-use concurrency::{ConcurrentVec, ParallelVecWriter};
+use concurrency::{parallel_writer::UnsafeReadAccess, ConcurrentVec, ParallelVecWriter};
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{define_id, NumericId};
@@ -187,9 +187,12 @@ impl IndexBase for ColumnIndex {
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
-        let todo_share_read_lock_in_both = 1;
+        let read_handle = self.subsets.read_handle();
         for (k, v) in self.table.iter() {
-            f(k, *v.as_ref(&self.subsets));
+            // SAFETY: all of the vectors in `table` come from `subsets`.
+            unsafe {
+                f(k, *v.as_ref_from_handle(&read_handle));
+            }
         }
     }
     fn len(&self) -> usize {
@@ -285,9 +288,13 @@ impl IndexBase for TupleIndex {
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
         // SAFETY: `f` cannot leak references from the callback due to its type.
+        let read_handle = self.subsets.read_handle();
         self.table.0.iter().for_each(|entry| {
             let key = self.keys.get_row(entry.key);
-            f(key, *entry.vals.as_ref(&self.subsets));
+            // SAFETY: all of the vectors in `table` come from `subsets`.
+            unsafe {
+                f(key, *entry.vals.as_ref_from_handle(&read_handle));
+            }
         });
     }
 
@@ -340,10 +347,34 @@ impl Drop for SubsetBuffer {
     }
 }
 
+struct ReadHandle<'a> {
+    reader: UnsafeReadAccess<'a, RowId>,
+}
+
+impl ReadHandle<'_> {
+    /// Get a reference to the underlying subset associated with this vector.
+    ///
+    /// # Safety
+    /// Assumes that the underlying vector is sorted, and that `vec` was returned from the same
+    /// SubsetBuffer that this read handle came from.
+    unsafe fn make_ref(&self, vec: &BufferedVec) -> SubsetRef<'_> {
+        SubsetRef::Sparse(SortedOffsetSlice::new_unchecked(
+            self.reader
+                .get_unchecked_slice(vec.0.index()..vec.1.index()),
+        ))
+    }
+}
+
 impl SubsetBuffer {
     fn return_vec(&self, vec: BufferedVec) {
         let free_list = self.get_free_list(vec.len());
         free_list.push(vec.0);
+    }
+
+    fn read_handle(&self) -> ReadHandle {
+        ReadHandle {
+            reader: self.buf.unsafe_read_access(),
+        }
     }
 
     fn make_ref<'a>(&'a self, vec: &BufferedVec) -> impl Deref<Target = SubsetRef<'a>> {
@@ -567,23 +598,58 @@ impl BufferedSubset {
         BufferedSubset::Dense(OffsetRange::new(row, row.inc()))
     }
 
-    fn as_ref<'a>(&self, buf: &'a SubsetBuffer) -> impl Deref<Target = SubsetRef<'a>> {
-        enum WrappedSubset<'a, T> {
-            Dense(SubsetRef<'a>),
-            Sparse(T),
-        }
-        impl<'a, T: Deref<Target = SubsetRef<'a>>> Deref for WrappedSubset<'a, T> {
-            type Target = SubsetRef<'a>;
-            fn deref(&self) -> &SubsetRef<'a> {
-                match self {
-                    WrappedSubset::Dense(s) => s,
-                    WrappedSubset::Sparse(s) => s.deref(),
-                }
+    /// A more finnicky variant of `as_ref` that allows callers to amortize the cost of grabbing a
+    /// read handle.
+    ///
+    /// # Safety
+    /// Callers must ensure that the given vector for `Sparse` variants comes from the given
+    /// buffer corresponding to the input `ReadHandle`.
+    unsafe fn as_ref_from_handle<'a>(
+        &self,
+        buf: &'a ReadHandle,
+    ) -> impl Deref<Target = SubsetRef<'a>> {
+        match self {
+            BufferedSubset::Dense(range) => {
+                WrappedSubset::<VoidWithLifetime<'a>>::Dense(SubsetRef::Dense(*range))
+            }
+            BufferedSubset::Sparse(vec) => {
+                WrappedSubset::<VoidWithLifetime<'a>>::Dense(buf.make_ref(vec))
             }
         }
+    }
+
+    fn as_ref<'a>(&self, buf: &'a SubsetBuffer) -> impl Deref<Target = SubsetRef<'a>> {
         match self {
             BufferedSubset::Dense(range) => WrappedSubset::Dense(SubsetRef::Dense(*range)),
             BufferedSubset::Sparse(vec) => WrappedSubset::Sparse(buf.make_ref(vec)),
+        }
+    }
+}
+
+struct VoidWithLifetime<'a> {
+    _marker: std::marker::PhantomData<&'a ()>,
+    _void: Void,
+}
+
+enum Void {}
+
+impl<'a> Deref for VoidWithLifetime<'a> {
+    type Target = SubsetRef<'a>;
+    fn deref(&self) -> &SubsetRef<'a> {
+        match self._void {}
+    }
+}
+
+enum WrappedSubset<'a, T> {
+    Dense(SubsetRef<'a>),
+    Sparse(T),
+}
+impl<'a, T: Deref<Target = SubsetRef<'a>>> Deref for WrappedSubset<'a, T> {
+    type Target = SubsetRef<'a>;
+    fn deref(&self) -> &SubsetRef<'a> {
+        match self {
+            WrappedSubset::Dense(s) => s,
+            WrappedSubset::Sparse(s) => s.deref(),
         }
     }
 }

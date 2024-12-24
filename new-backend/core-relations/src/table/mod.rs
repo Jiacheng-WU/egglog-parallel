@@ -39,8 +39,10 @@ mod sharded_hash_table;
 #[cfg(test)]
 mod tests;
 
-// NB: we currently only use 32 bits of hash code. To use 64, we can change
-// `HashCode` here to `u64`.
+// NB: Having this type def lets us switch between 64 and 32 bits of hashcode.
+//
+// We should consider just using u64 everywhere though. Hashbrown doesn't play nicely with 32-bit
+// hashcodes because it uses both the high and low bits of a 64-bit code.
 
 type HashCode = u64;
 
@@ -618,8 +620,6 @@ impl SortedWritesTable {
                             &row[0..n_keys] == key
                         });
 
-                        let sort_val = query[sort_by.index()];
-
                         if let Some(row) = entry {
                             // First case: overwriting an existing value. Apply merge
                             // function. Insert new row and update hash table if merge
@@ -631,6 +631,7 @@ impl SortedWritesTable {
                             match &self.merge {
                                 MergeFn::Update(f) => {
                                     if f(exec_state, cur, query, &mut scratch) {
+                                        let sort_val = query[sort_by.index()];
                                         let new = self.data.add_row(&scratch);
                                         if let Some(largest) = self.offsets.last().map(|(v, _)| *v)
                                         {
@@ -652,6 +653,7 @@ impl SortedWritesTable {
                                 }
                             }
                         } else {
+                            let sort_val = query[sort_by.index()];
                             // New value: update invariants.
                             let new = self.data.add_row(query);
                             if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
@@ -914,6 +916,17 @@ impl SortedWritesTable {
     }
 
     fn binary_search_sort_val(&self, val: Value) -> Result<(RowId, RowId), RowId> {
+        debug_assert!(
+            self.offsets.windows(2).all(|x| x[0].1 < x[1].1),
+            "{:?}",
+            self.offsets
+        );
+
+        debug_assert!(
+            self.offsets.windows(2).all(|x| x[0].0 < x[1].0),
+            "{:?}",
+            self.offsets
+        );
         match self.offsets.binary_search_by_key(&val, |(v, _)| *v) {
             Ok(got) => Ok((
                 self.offsets[got].1,
@@ -1198,20 +1211,18 @@ impl OrderingChecker for SortChecker {
 }
 
 fn do_parallel(_workload_size: usize) -> bool {
-    let todo_remove = 1;
-    false
-    // #[cfg(test)]
-    // {
-    //     // In tests, run serial and parallel variants half the time,
-    //     // nondeterministically.
-    //     use rand::{thread_rng, Rng};
-    //     thread_rng().gen::<bool>()
-    // }
+    #[cfg(test)]
+    {
+        // In tests, run serial and parallel variants half the time,
+        // nondeterministically.
+        use rand::{thread_rng, Rng};
+        thread_rng().gen::<bool>()
+    }
 
-    // #[cfg(not(test))]
-    // {
-    //     _workload_size > 50_000 && rayon::current_num_threads() > 1
-    // }
+    #[cfg(not(test))]
+    {
+        _workload_size > 50_000 && rayon::current_num_threads() > 1
+    }
 }
 
 /// A type similar to a SortedWritesTable used to buffer outputs. The main thing

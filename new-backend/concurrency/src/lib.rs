@@ -3,7 +3,7 @@
 pub(crate) mod bitset;
 pub(crate) mod concurrent_vec;
 pub(crate) mod notification;
-pub(crate) mod parallel_writer;
+pub mod parallel_writer;
 use arc_swap::{ArcSwap, Guard};
 
 pub use bitset::BitSet;

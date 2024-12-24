@@ -9,7 +9,7 @@
 //! joins, union-finds, etc.
 
 use std::{
-    iter, mem,
+    cmp, iter, mem,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -488,11 +488,20 @@ impl EGraph {
             deps.push(uf_table);
         }
         let table = match merge {
-            MergeFn::UnionId => SortedWritesTable::new_bookkeeping(
+            // XXX: One interesting fact that isn't fully understood at the moment.
+            //
+            // This merge function seems to "over-promote" rows to new timestamps. We ought to be
+            // able to use a bookkeeping-only merge function and rely on rebuilding to update the
+            // entry in the table if the id isn't cnaonical.
+            //
+            // When we make this change one of the "exact match" tests fails (`math`). I suspect
+            // that this is a benign change, reflecting the fact that egglog does this too. But it
+            // is not clear to me why we should have different database counts with that change.
+            MergeFn::UnionId => SortedWritesTable::new(
                 n_args,
                 n_cols,
                 Some(ColumnId::from_usize(schema.len())),
-                move |state, cur, new| {
+                move |state, cur, new, out| {
                     let l = cur[n_args];
                     let r = new[n_args];
                     let next_ts = new[n_args + 1];
@@ -500,7 +509,11 @@ impl EGraph {
                         // When proofs are enabled, these are the same term. They are already
                         // equal and we can just do nothing.
                         state.stage_insert(uf_table, &[l, r, next_ts]);
-                        let todo_always_return_false = 1;
+                        out.extend_from_slice(&new[0..n_args]);
+                        // We pick the minimum when unioning. This matches the original egglog
+                        // behavior.
+                        out.push(cmp::min(l, r));
+                        out.extend_from_slice(&new[n_args + 1..]);
                         true
                     } else {
                         false
@@ -851,13 +864,8 @@ fn run_rules_impl(
     let mut rsb = db.new_rule_set();
     for rule in rules {
         let info = &mut rule_info[*rule];
-        info.query.add_rules(
-            &mut rsb,
-            Timestamp::new(0),
-            info.last_run_at,
-            next_ts,
-            &info.desc,
-        )?;
+        info.query
+            .add_rules(&mut rsb, info.last_run_at, next_ts, &info.desc)?;
         info.last_run_at = next_ts;
     }
     let ruleset = rsb.build();

@@ -868,7 +868,6 @@ impl Query {
     pub(crate) fn add_rules(
         &self,
         rsb: &mut RuleSetBuilder,
-        start_ts: Timestamp,
         mid_ts: Timestamp,
         next_ts: Timestamp,
         desc: &str,
@@ -893,70 +892,58 @@ impl Query {
             let (mut qb, inner) = self.query_state(rsb, next_ts);
             for (i, (table, entries)) in self.atoms.iter().enumerate() {
                 let dst_vars = inner.convert_all(entries);
-                let ts_range = if i == focus_atom {
-                    mid_ts..next_ts
-                } else {
-                    start_ts..next_ts
-                };
-                if ts_range.start == ts_range.end {
-                    // Empty timestamp range. This query will not run.
-                    return Ok(());
-                }
                 let ts_col = get_ts_col(entries, self.tracing);
-                qb.add_atom(
-                    *table,
-                    &dst_vars,
-                    &[
-                        Constraint::GeConst {
-                            col: ts_col,
-                            val: ts_range.start.to_value(),
-                        },
-                        Constraint::LtConst {
-                            col: ts_col,
-                            val: ts_range.end.to_value(),
-                        },
-                    ],
-                )?;
+                let constraint = if i == focus_atom {
+                    Some(Constraint::GeConst {
+                        col: ts_col,
+                        val: mid_ts.to_value(),
+                    })
+                } else {
+                    None
+                };
+                if let Some(c) = constraint {
+                    qb.add_atom(*table, &dst_vars, &[c])
+                } else {
+                    qb.add_atom(*table, &dst_vars, &[])
+                }?;
             }
             return self.run_rules_and_build(
                 qb,
                 inner,
-                &format!("{desc}-atom({focus_atom})[{start_ts:?},{mid_ts:?},{next_ts:?}]"),
+                &format!("{desc}-atom({focus_atom})[{mid_ts:?},{next_ts:?}]"),
             );
         }
         'outer: for focus_atom in 0..self.atoms.len() {
             let (mut qb, inner) = self.query_state(rsb, next_ts);
             for (i, (table, entries)) in self.atoms.iter().enumerate() {
                 let dst_vars = inner.convert_all(entries);
-                let ts_range = match focus_atom.cmp(&i) {
-                    Ordering::Less => start_ts..next_ts,
-                    Ordering::Equal => mid_ts..next_ts,
-                    Ordering::Greater => start_ts..mid_ts,
-                };
-                if ts_range.start == ts_range.end {
-                    // Empty timestamp range. This query will not run.
-                    continue 'outer;
-                }
                 let ts_col = get_ts_col(entries, self.tracing);
-                qb.add_atom(
-                    *table,
-                    &dst_vars,
-                    &[
-                        Constraint::GeConst {
+                let constraint = match i.cmp(&focus_atom) {
+                    Ordering::Less => {
+                        if mid_ts == Timestamp::new(0) {
+                            continue 'outer;
+                        }
+                        Some(Constraint::LtConst {
                             col: ts_col,
-                            val: ts_range.start.to_value(),
-                        },
-                        Constraint::LtConst {
-                            col: ts_col,
-                            val: ts_range.end.to_value(),
-                        },
-                    ],
-                )?;
+                            val: mid_ts.to_value(),
+                        })
+                    }
+                    Ordering::Equal => Some(Constraint::GeConst {
+                        col: ts_col,
+                        val: mid_ts.to_value(),
+                    }),
+                    Ordering::Greater => None,
+                };
+                if let Some(c) = constraint {
+                    qb.add_atom(*table, &dst_vars, &[c])
+                } else {
+                    qb.add_atom(*table, &dst_vars, &[])
+                }?;
             }
             self.run_rules_and_build(
                 qb,
                 inner,
-                &format!("{desc}-atom({focus_atom})[{start_ts:?},{mid_ts:?},{next_ts:?}]"),
+                &format!("{desc}-atom({focus_atom})[{mid_ts:?},{next_ts:?}]"),
             )?;
         }
         Ok(())
