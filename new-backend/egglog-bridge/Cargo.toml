@@ -20,6 +20,8 @@ rayon = "1.10.0"
 
 [features]
 serial_examples = []
+# See the comment in `add_table` in src/mod.rs.
+fast_merge = []
 
 [dev-dependencies]
 env_logger = "0.11"

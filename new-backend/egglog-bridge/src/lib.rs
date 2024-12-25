@@ -9,7 +9,7 @@
 //! joins, union-finds, etc.
 
 use std::{
-    cmp, iter, mem,
+    iter, mem,
     rc::Rc,
     sync::{Arc, Mutex},
 };
@@ -488,38 +488,70 @@ impl EGraph {
             deps.push(uf_table);
         }
         let table = match merge {
-            // XXX: One interesting fact that isn't fully understood at the moment.
-            //
-            // This merge function seems to "over-promote" rows to new timestamps. We ought to be
-            // able to use a bookkeeping-only merge function and rely on rebuilding to update the
-            // entry in the table if the id isn't cnaonical.
-            //
-            // When we make this change one of the "exact match" tests fails (`math`). I suspect
-            // that this is a benign change, reflecting the fact that egglog does this too. But it
-            // is not clear to me why we should have different database counts with that change.
-            MergeFn::UnionId => SortedWritesTable::new(
-                n_args,
-                n_cols,
-                Some(ColumnId::from_usize(schema.len())),
-                move |state, cur, new, out| {
-                    let l = cur[n_args];
-                    let r = new[n_args];
-                    let next_ts = new[n_args + 1];
-                    if l != r && !tracing {
-                        // When proofs are enabled, these are the same term. They are already
-                        // equal and we can just do nothing.
-                        state.stage_insert(uf_table, &[l, r, next_ts]);
-                        out.extend_from_slice(&new[0..n_args]);
-                        // We pick the minimum when unioning. This matches the original egglog
-                        // behavior.
-                        out.push(cmp::min(l, r));
-                        out.extend_from_slice(&new[n_args + 1..]);
-                        true
-                    } else {
-                        false
+            MergeFn::UnionId => {
+                #[cfg(not(feature = "fast_merge"))]
+                {
+                    {
+                        SortedWritesTable::new(
+                            n_args,
+                            n_cols,
+                            Some(ColumnId::from_usize(schema.len())),
+                            move |state, cur, new, out| {
+                                let l = cur[n_args];
+                                let r = new[n_args];
+                                let next_ts = new[n_args + 1];
+                                if l != r && !tracing {
+                                    // When proofs are enabled, these are the same term. They are already
+                                    // equal and we can just do nothing.
+                                    state.stage_insert(uf_table, &[l, r, next_ts]);
+                                    out.extend_from_slice(&new[0..n_args]);
+                                    // We pick the minimum when unioning. This matches the original egglog
+                                    // behavior.
+                                    let res = std::cmp::min(l, r);
+                                    out.push(std::cmp::min(l, r));
+                                    out.extend_from_slice(&new[n_args + 1..]);
+                                    r == res
+                                } else {
+                                    false
+                                }
+                            },
+                        )
                     }
-                },
-            ),
+                }
+                // XXX: One interesting fact that isn't fully understood at the moment.
+                //
+                // The default merge function seems to "over-promote" rows to new timestamps. We
+                // ought to be able to use a bookkeeping-only merge function and rely on rebuilding
+                // to update the entry in the table if the id isn't canonical.
+                //
+                // However, when we make this change, the `math` test, which looks at exact table
+                // sizes, starts flaking. No other parts of the test flake. I suspect that this is
+                // a benign change, reflecting the fact that egglog does this too. But it is not
+                // clear to me why we should have different database counts with that change at
+                // all. Making seminaive more conservative by scanning up _through_ `mid_ts` for
+                // "old-only" atoms also avoids the flake, suggesting that we are relying on
+                // newly-written-to rows showing up as new even when their canonical value did not
+                // change.
+                #[cfg(feature = "fast_merge")]
+                {
+                    SortedWritesTable::new_bookkeeping(
+                        n_args,
+                        n_cols,
+                        Some(ColumnId::from_usize(schema.len())),
+                        move |state, cur, new| {
+                            let l = cur[n_args];
+                            let r = new[n_args];
+                            let next_ts = new[n_args + 1];
+                            if l != r && !tracing {
+                                state.stage_insert(uf_table, &[l, r, next_ts]);
+                                true
+                            } else {
+                                false
+                            }
+                        },
+                    )
+                }
+            }
             MergeFn::Table(merge_table) => {
                 deps.push(merge_table);
                 let id_counter = self.id_counter;

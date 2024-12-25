@@ -1,8 +1,12 @@
 use std::mem;
 
 use egglog_bridge::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, MergeFn};
+use mimalloc::MiMalloc;
 use num_rational::Rational64;
 use web_time::Instant;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[allow(clippy::disallowed_macros)]
 fn main() {

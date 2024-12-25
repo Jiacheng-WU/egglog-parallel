@@ -220,23 +220,75 @@ impl<K: NumericId, V: Default> DenseIdMap<K, V> {
     }
 }
 
-mod context {
-    #[derive(Copy, Clone, Debug)]
-    pub struct ContextHandle;
+pub struct IdVec<K, V> {
+    data: Vec<V>,
+    _marker: std::marker::PhantomData<K>,
+}
 
-    impl ContextHandle {
-        #[inline(always)]
-        pub fn new(_: impl Into<String>) -> ContextHandle {
-            ContextHandle::empty()
-        }
-
-        pub const fn empty() -> ContextHandle {
-            ContextHandle
+impl<K, V> Default for IdVec<K, V> {
+    fn default() -> IdVec<K, V> {
+        IdVec {
+            data: Default::default(),
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
-pub use context::ContextHandle;
+impl<K: NumericId, V> IdVec<K, V> {
+    pub fn with_capacity(cap: usize) -> IdVec<K, V> {
+        IdVec {
+            data: Vec::with_capacity(cap),
+            _marker: std::marker::PhantomData,
+        }
+    }
+
+    pub fn push(&mut self, elt: V) -> K {
+        let res = K::from_usize(self.data.len());
+        self.data.push(elt);
+        res
+    }
+
+    pub fn resize_with(&mut self, size: usize, init: impl FnMut() -> V) {
+        self.data.resize_with(size, init)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (K, &V)> {
+        self.data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (K::from_usize(i), v))
+    }
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (K, &mut V)> {
+        self.data
+            .iter_mut()
+            .enumerate()
+            .map(|(i, v)| (K::from_usize(i), v))
+    }
+}
+
+impl<K: NumericId, V: Send + Sync> IdVec<K, V> {
+    pub fn par_iter_mut(&mut self) -> impl IndexedParallelIterator<Item = (K, &mut V)> {
+        self.data
+            .par_iter_mut()
+            .enumerate()
+            .map(|(i, v)| (K::from_usize(i), v))
+    }
+}
+
+impl<K: NumericId, V> ops::Index<K> for IdVec<K, V> {
+    type Output = V;
+
+    fn index(&self, key: K) -> &Self::Output {
+        &self.data[key.index()]
+    }
+}
+
+impl<K: NumericId, V> ops::IndexMut<K> for IdVec<K, V> {
+    fn index_mut(&mut self, key: K) -> &mut Self::Output {
+        &mut self.data[key.index()]
+    }
+}
+
 use rayon::iter::{
     IndexedParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
@@ -269,8 +321,6 @@ macro_rules! define_id {
         #[doc = $doc]
         $v struct $name {
             rep: $repr,
-            #[allow(unused)]
-            context: $crate::ContextHandle,
         }
 
         impl PartialEq for $name {
@@ -300,20 +350,10 @@ macro_rules! define_id {
         }
 
         impl $name {
-            $v fn with_context(id: $repr, message: impl Into<String>) -> Self {
-                $name {
-                    rep: id,
-                    context: $crate::ContextHandle::new(message)
-                }
-            }
-
-
-
             #[allow(unused)]
             $v const fn new_const(id: $repr) -> Self {
                 $name {
                     rep: id,
-                    context: $crate::ContextHandle::empty(),
                 }
             }
 
@@ -329,7 +369,7 @@ macro_rules! define_id {
             type Rep = $repr;
             type Atomic = $crate::atomic_of!($repr);
             fn new(id: $repr) -> Self {
-                Self::with_context(id, "")
+                Self::new_const(id)
             }
             fn from_usize(index: usize) -> Self {
                 assert!(<$repr>::MAX as usize >= index,

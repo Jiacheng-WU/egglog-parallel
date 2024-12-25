@@ -1,4 +1,4 @@
-use crate::{define_id, DenseIdMap, NumericId};
+use crate::{define_id, DenseIdMap, IdVec, NumericId};
 
 define_id!(pub(crate) Id, u32, "a unique id");
 
@@ -56,4 +56,19 @@ fn get_or_insert() {
 
     map.get_or_insert(id, || "three");
     assert_eq!(to_vec(&map), vec![(id, "")]);
+}
+
+#[test]
+fn basic_id_vec() {
+    let mut v = IdVec::<Id, usize>::default();
+    let id0 = v.push(0);
+    let id1 = v.push(1);
+    assert_eq!(0, v[id0]);
+    assert_eq!(1, v[id1]);
+    let mut i = 2;
+    v.resize_with(100, || {
+        let res = i;
+        i += 1;
+        res
+    });
 }

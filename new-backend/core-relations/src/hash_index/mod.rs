@@ -1,4 +1,4 @@
-//! Indexes on specific projections of tables.
+//! Hash-based secondary indexes.
 use std::{
     hash::{Hash, Hasher},
     mem,
@@ -8,31 +8,18 @@ use std::{
 use concurrency::ConcurrentVec;
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
-use numeric_id::{define_id, NumericId};
+use numeric_id::{define_id, IdVec, NumericId};
+use parallel_buffer::ParallelSubsetBuffer;
 use rustc_hash::FxHasher;
 
 use crate::{
-    common::{IndexMap, Value},
+    common::{IndexMap, ShardData, ShardId, Value},
     offsets::{RowId, SortedOffsetSlice, SubsetRef},
     pool::{with_pool_set, Clear, Pooled},
     row_buffer::{RowBuffer, TaggedRowBuffer},
     table_spec::{ColumnId, Generation, Offset, TableVersion, WrappedTable},
     OffsetRange,
 };
-
-// Target <14s on math and <5.7s on ac
-// * Want to avoid needing to grab a read lock when reading.
-// * SubsetBuffer should be a normal vector
-// * get rid of the impl Deref everywhere.
-// * Provide a ParallelSubsetBuffer struct that can convert to/from a regular SubsetBuffer.
-// * Keep free lists as SegQueues
-// * Should simplify/remove some unsafe code.
-//
-// Then shard the hash table (in all cases)
-//
-// Then implement parallel refresh
-
-type CleanupTodos = ();
 
 mod parallel_buffer;
 #[cfg(test)]
@@ -150,31 +137,48 @@ pub(crate) trait IndexBase {
     fn len(&self) -> usize;
 }
 
+/// Types that support merging the contents of `table`'s `subset`, in parallel.
+///
+/// Right now, this is always a wrapped variant of an underlying `IndexBase` (`T`) but with more
+/// complicated wrappers supporting parallel writes.
+pub(crate) trait ParallelIndexWriter<T> {
+    fn finish(self) -> T;
+    fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef);
+}
+
 pub struct ColumnIndex {
     // A specialized index used when we are indexing on a single column.
-    table: Pooled<IndexMap<Value, BufferedSubset>>,
+    shard_data: ShardData,
+    table: IdVec<ShardId, Pooled<IndexMap<Value, BufferedSubset>>>,
     subsets: SubsetBuffer,
 }
 
 impl IndexBase for ColumnIndex {
     type Key = Value;
     fn clear(&mut self) {
-        for (_, subset) in self.table.drain(..) {
-            match subset {
-                BufferedSubset::Dense(_) => {}
-                BufferedSubset::Sparse(buffered_vec) => {
-                    self.subsets.return_vec(buffered_vec);
+        for (_, shard) in self.table.iter_mut() {
+            for (_, subset) in shard.drain(..) {
+                match subset {
+                    BufferedSubset::Dense(_) => {}
+                    BufferedSubset::Sparse(buffered_vec) => {
+                        self.subsets.return_vec(buffered_vec);
+                    }
                 }
             }
         }
     }
+
     fn get_subset<'a>(&'a self, key: &Value) -> Option<SubsetRef<'a>> {
-        self.table.get(key).map(|x| x.as_ref(&self.subsets))
+        self.shard_data
+            .get_shard(key, &self.table)
+            .get(key)
+            .map(|x| x.as_ref(&self.subsets))
     }
     fn add_row(&mut self, key: &Value, row: RowId) {
         // SAFETY: everything in `table` comes from `subsets`.
         unsafe {
-            self.table
+            self.shard_data
+                .get_shard_mut(key, &mut self.table)
                 .entry(*key)
                 .or_insert_with(BufferedSubset::empty)
                 .add_row_sorted(row, &mut self.subsets);
@@ -188,22 +192,46 @@ impl IndexBase for ColumnIndex {
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
-        for (k, v) in self.table.iter() {
-            // SAFETY: all of the vectors in `table` come from `subsets`.
+        for (k, v) in self.table.iter().flat_map(|(_, shard)| shard.iter()) {
             f(k, v.as_ref(&self.subsets));
         }
     }
     fn len(&self) -> usize {
-        self.table.len()
+        self.table.iter().map(|(_, shard)| shard.len()).sum()
     }
 }
 
 impl ColumnIndex {
     pub(crate) fn new() -> ColumnIndex {
-        with_pool_set(|ps| ColumnIndex {
-            table: ps.get(),
-            subsets: SubsetBuffer::default(),
+        with_pool_set(|ps| {
+            let shard_data = ShardData::new(num_shards());
+            let mut table = IdVec::with_capacity(shard_data.n_shards());
+            table.resize_with(shard_data.n_shards(), || ps.get());
+            ColumnIndex {
+                shard_data,
+                table,
+                subsets: SubsetBuffer::default(),
+            }
         })
+    }
+}
+
+struct ParallelColumnIndexWriter {
+    shard_data: ShardData,
+    table: IdVec<ShardId, Pooled<IndexMap<Value, BufferedSubset>>>,
+    subsets: ParallelSubsetBuffer,
+}
+
+impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
+    fn finish(self) -> ColumnIndex {
+        ColumnIndex {
+            shard_data: self.shard_data,
+            table: self.table,
+            subsets: self.subsets.finish(),
+        }
+    }
+    fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef) {
+        todo!()
     }
 }
 
@@ -211,17 +239,21 @@ impl ColumnIndex {
 pub struct TupleIndex {
     // NB: we could store RowBuffers inline and then have indexes reference
     // (u32, RowId) instead of RowId. Trades copying off for indirections.
+    shard_data: ShardData,
     subsets: SubsetBuffer,
     keys: RowBuffer,
-    table: Pooled<SubsetTable>,
+    table: IdVec<ShardId, Pooled<SubsetTable>>,
 }
 
 impl TupleIndex {
     pub(crate) fn new(key_arity: usize) -> TupleIndex {
         let keys = RowBuffer::new(key_arity);
+        let shard_data = ShardData::new(num_shards());
         with_pool_set(|ps| {
-            let table = ps.get();
+            let mut table = IdVec::with_capacity(shard_data.n_shards());
+            table.resize_with(shard_data.n_shards(), || ps.get());
             TupleIndex {
+                shard_data,
                 keys,
                 table,
                 subsets: SubsetBuffer::default(),
@@ -234,7 +266,7 @@ impl IndexBase for TupleIndex {
     type Key = [Value];
 
     fn clear(&mut self) {
-        for entry in self.table.0.drain() {
+        for entry in self.table.iter_mut().flat_map(|(_, shard)| shard.0.drain()) {
             match entry.vals {
                 BufferedSubset::Dense(_) => {}
                 BufferedSubset::Sparse(v) => {
@@ -247,27 +279,30 @@ impl IndexBase for TupleIndex {
 
     fn get_subset<'a>(&'a self, key: &[Value]) -> Option<SubsetRef<'a>> {
         let hash = hash_key(key);
-        let entry = self.table.0.find(hash, |entry| {
-            entry.hash == hash && self.keys.get_row(entry.key) == key
-        })?;
+        let entry = self.table[self.shard_data.shard_id(hash)]
+            .0
+            .find(hash, |entry| {
+                entry.hash == hash && self.keys.get_row(entry.key) == key
+            })?;
         Some(entry.vals.as_ref(&self.subsets))
     }
 
     fn add_row(&mut self, key: &[Value], row: RowId) {
+        use hashbrown::hash_table::Entry;
         let hash = hash_key(key);
-        let table_entry = self.table.0.entry(
+        let table_entry = self.table[self.shard_data.shard_id(hash)].0.entry(
             hash,
             |entry| entry.hash == hash && self.keys.get_row(entry.key) == key,
             |ent| ent.hash,
         );
         match table_entry {
-            hashbrown::hash_table::Entry::Occupied(mut occ) => {
+            Entry::Occupied(mut occ) => {
                 // SAFETY: everything in `table_entry` comes from `vals`.
                 unsafe {
                     occ.get_mut().vals.add_row_sorted(row, &mut self.subsets);
                 }
             }
-            hashbrown::hash_table::Entry::Vacant(v) => {
+            Entry::Vacant(v) => {
                 let key_id = self.keys.add_row(key);
                 let subset = BufferedSubset::singleton(row);
                 v.insert(TableEntry {
@@ -285,16 +320,18 @@ impl IndexBase for TupleIndex {
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
-        // SAFETY: `f` cannot leak references from the callback due to its type.
-        self.table.0.iter().for_each(|entry| {
-            let key = self.keys.get_row(entry.key);
-            // SAFETY: all of the vectors in `table` come from `subsets`.
-            f(key, entry.vals.as_ref(&self.subsets));
-        });
+        self.table
+            .iter()
+            .flat_map(|(_, shard)| shard.0.iter())
+            .for_each(|entry| {
+                let key = self.keys.get_row(entry.key);
+                // SAFETY: all of the vectors in `table` come from `subsets`.
+                f(key, entry.vals.as_ref(&self.subsets));
+            });
     }
 
     fn len(&self) -> usize {
-        self.table.0.len()
+        self.table.iter().map(|(_, shard)| shard.0.len()).sum()
     }
 }
 
@@ -541,5 +578,13 @@ impl<'a, T: Deref<Target = SubsetRef<'a>>> Deref for WrappedSubset<'a, T> {
             WrappedSubset::Dense(s) => s,
             WrappedSubset::Sparse(s) => s.deref(),
         }
+    }
+}
+fn num_shards() -> usize {
+    let n_threads = rayon::current_num_threads();
+    if n_threads == 1 {
+        1
+    } else {
+        n_threads * 2
     }
 }

@@ -7,7 +7,7 @@ use std::{
 
 use concurrency::ConcurrentVec;
 use hashbrown::HashTable;
-use numeric_id::{define_id, DenseIdMap, NumericId};
+use numeric_id::{define_id, DenseIdMap, IdVec, NumericId};
 use rustc_hash::FxHasher;
 
 use crate::pool::Clear;
@@ -122,5 +122,53 @@ impl<S, T: Deref<Target = [S]>> Deref for MapDeref<T> {
 
     fn deref(&self) -> &S {
         &(&*self.base)[self.index]
+    }
+}
+
+define_id!(pub(crate) ShardId, u32, "an identifier pointing to a shard in a sharded hash table");
+
+/// Sharding metadata used for sharding hash tables.
+///
+/// This is a separate type in order to allow other data-structures to pre-shard
+/// data bound for a particular table.
+#[derive(Copy, Clone)]
+pub(crate) struct ShardData {
+    log2_shard_count: u32,
+}
+
+impl ShardData {
+    pub(crate) fn new(n_shards: usize) -> Self {
+        Self {
+            log2_shard_count: n_shards.next_power_of_two().trailing_zeros(),
+        }
+    }
+    pub(crate) fn n_shards(&self) -> usize {
+        1 << self.log2_shard_count
+    }
+    pub(crate) fn shard_id(&self, hash: u64) -> ShardId {
+        let high_bits = (hash.wrapping_shr(64 - (self.log2_shard_count + 7)))
+            & ((1 << self.log2_shard_count) - 1);
+        ShardId::from_usize(high_bits as usize)
+    }
+    pub(crate) fn get_shard<'a, V>(&self, val: &impl Hash, table: &'a IdVec<ShardId, V>) -> &'a V {
+        let hc = {
+            let mut hasher = FxHasher::default();
+            val.hash(&mut hasher);
+            hasher.finish()
+        };
+        &table[self.shard_id(hc)]
+    }
+
+    pub(crate) fn get_shard_mut<'a, V>(
+        &self,
+        val: &impl Hash,
+        table: &'a mut IdVec<ShardId, V>,
+    ) -> &'a mut V {
+        let hc = {
+            let mut hasher = FxHasher::default();
+            val.hash(&mut hasher);
+            hasher.finish()
+        };
+        &mut table[self.shard_id(hc)]
     }
 }

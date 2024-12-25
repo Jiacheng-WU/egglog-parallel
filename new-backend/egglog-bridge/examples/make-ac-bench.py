@@ -1,7 +1,7 @@
 """
 This is a simple script to generate an AC benchmark for egglog.
 """
-N=12
+N=13
 
 print("""
 (datatype Num (N i64) (Add Num Num))

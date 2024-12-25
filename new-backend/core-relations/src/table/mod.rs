@@ -20,11 +20,11 @@ use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefMutIterator, ParallelIterator};
 use rustc_hash::FxHasher;
-use sharded_hash_table::{ShardData, ShardId, ShardedHashTable};
+use sharded_hash_table::ShardedHashTable;
 
 use crate::{
     action::ExecutionState,
-    common::Value,
+    common::{ShardData, ShardId, Value},
     offsets::{OffsetRange, Offsets, RowId, Subset, SubsetRef},
     pool::with_pool_set,
     row_buffer::{ParallelRowBufWriter, RowBuffer},

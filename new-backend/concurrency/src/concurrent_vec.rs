@@ -1,6 +1,7 @@
 //! A variant of a vector supporting pushes that do not block reads.
 
 use std::{
+    cell::UnsafeCell,
     mem::{self, MaybeUninit},
     ops::Deref,
     sync::{
@@ -9,7 +10,9 @@ use std::{
     },
 };
 
-use crate::{MutexReader, ReadOptimizedLock, SyncUnsafeCell};
+use crate::{MutexReader, ReadOptimizedLock};
+
+// NB: probably don't need to do SyncUnsafeCell here. Can probably just do MaybeUninit?
 
 /// A simple concurrent vector type supporting push operations that do not block
 /// reads. Concurrent pushes are serialized, but reads need not wait for writes
@@ -119,3 +122,8 @@ impl<T> Deref for ReadHandle<'_, T> {
         }
     }
 }
+
+struct SyncUnsafeCell<T>(UnsafeCell<T>);
+
+unsafe impl<T: Send> Send for SyncUnsafeCell<T> {}
+unsafe impl<T: Sync> Sync for SyncUnsafeCell<T> {}

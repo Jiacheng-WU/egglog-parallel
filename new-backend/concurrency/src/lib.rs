@@ -38,7 +38,7 @@ use std::{
 /// operations.
 pub struct ReadOptimizedLock<T> {
     token: ArcSwap<ReadToken>,
-    data: SyncUnsafeCell<T>,
+    data: UnsafeCell<T>,
 }
 
 /// A handle granting read access to the data guarded by a [`ReadOptimizedLock`].
@@ -68,7 +68,7 @@ impl<T> Deref for MutexWriter<'_, T> {
         // SAFETY: `data` is valid as long as we have a valid reference to it.
         // We only create a `Writer` after the current thread has exclusive
         // access to data.
-        unsafe { &*self.lock.data.0.get() }
+        unsafe { &*self.lock.data.get() }
     }
 }
 
@@ -77,7 +77,7 @@ impl<T> DerefMut for MutexWriter<'_, T> {
         // SAFETY: `data` is valid as long as we have a valid reference to it.
         // We only create a `Writer` after the current thread has exclusive
         // access to data.
-        unsafe { &mut *self.lock.data.0.get() }
+        unsafe { &mut *self.lock.data.get() }
     }
 }
 
@@ -94,19 +94,19 @@ impl<T> ReadOptimizedLock<T> {
     pub fn new(data: T) -> Self {
         Self {
             token: ArcSwap::from_pointee(ReadToken::ReadOk(TriggerWhenDone::default())),
-            data: SyncUnsafeCell(UnsafeCell::new(data)),
+            data: UnsafeCell::new(data),
         }
     }
 
     /// Extract the inner data from the lock.
     pub fn into_inner(self) -> T {
-        self.data.0.into_inner()
+        self.data.into_inner()
     }
 
     /// Get mutable access to the underlying data. This operation does no synchronization as the
     /// mutable receiver guarantees exclusive access for safe code.
     pub fn as_mut_ref(&mut self) -> &mut T {
-        self.data.0.get_mut()
+        self.data.get_mut()
     }
 
     /// Create a `Reader` object that grants read access to the data.
@@ -123,7 +123,7 @@ impl<T> ReadOptimizedLock<T> {
                     return MutexReader {
                         // SAFETY: We guarantee that as long as a guard that's
                         // in scope observes a ReadOk token
-                        data: unsafe { &*self.data.0.get() },
+                        data: unsafe { &*self.data.get() },
                         _guard: guard,
                     };
                 }
@@ -187,7 +187,3 @@ impl Drop for TriggerWhenDone {
         self.0.notify();
     }
 }
-
-struct SyncUnsafeCell<T>(UnsafeCell<T>);
-unsafe impl<T> Sync for SyncUnsafeCell<T> {}
-unsafe impl<T> Send for SyncUnsafeCell<T> {}

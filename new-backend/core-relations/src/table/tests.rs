@@ -2,10 +2,10 @@ use numeric_id::NumericId;
 use rand::{thread_rng, Rng};
 
 use crate::{
-    common::{HashMap, Value},
+    common::{HashMap, ShardId, Value},
     offsets::{RowId, SubsetRef},
     row_buffer::TaggedRowBuffer,
-    table::{hash_code, sharded_hash_table::ShardId, TableEntry},
+    table::{hash_code, TableEntry},
     table_shortcuts::{fill_table, v},
     table_spec::{ColumnId, Constraint, Offset, Table, WrappedTable},
 };
