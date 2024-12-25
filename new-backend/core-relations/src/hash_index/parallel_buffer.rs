@@ -2,18 +2,36 @@
 
 use std::{mem, ops::Deref};
 
-use concurrency::{parallel_writer::UnsafeReadAccess, ConcurrentVec, ParallelVecWriter};
-use crossbeam_queue::SegQueue;
+use concurrency::{parallel_writer::UnsafeReadAccess, ParallelVecWriter};
 use numeric_id::NumericId;
 
-use crate::{offsets::SortedOffsetSlice, pool::with_pool_set, Pooled, RowId, SubsetRef};
+use crate::{
+    common::DashMap, offsets::SortedOffsetSlice, pool::with_pool_set, Pooled, RowId, SubsetRef,
+};
 
 use super::{BufferIndex, BufferedVec, SubsetBuffer};
+
+#[derive(Default)]
+pub(super) struct FreeList {
+    data: DashMap<usize, Vec<BufferIndex>>,
+}
+
+impl FreeList {
+    pub(super) fn with_size_class<R>(
+        &self,
+        size: usize,
+        f: impl FnOnce(&mut Vec<BufferIndex>) -> R,
+    ) -> R {
+        let size_class = size.next_power_of_two();
+        let mut guard = self.data.entry(size_class).or_default();
+        f(&mut guard)
+    }
+}
 
 /// A buffer for sorted vectors of [`RowId`]s that supports parallel writes.
 pub(super) struct ParallelSubsetBuffer {
     buf: ParallelVecWriter<RowId>,
-    free_list: ConcurrentVec<SegQueue<BufferIndex>>,
+    free_list: FreeList,
 }
 
 struct ReadHandle<'a> {
@@ -48,8 +66,7 @@ impl ParallelSubsetBuffer {
         }
     }
     fn return_vec(&self, vec: BufferedVec) {
-        let free_list = self.get_free_list(vec.len());
-        free_list.push(vec.0);
+        self.free_list.with_size_class(vec.len(), |v| v.push(vec.0));
     }
 
     fn read_handle(&self) -> ReadHandle {
@@ -83,14 +100,13 @@ impl ParallelSubsetBuffer {
         }
     }
 
-    fn new_vec(&self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
+    pub(super) fn new_vec(&self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
         let len = rows.len();
         if len == 0 {
             return BufferedVec::default();
         }
         {
-            let free_list = self.get_free_list(rows.len());
-            if let Some(index) = free_list.pop() {
+            if let Some(index) = self.free_list.with_size_class(rows.len(), Vec::pop) {
                 let read_handle = self.buf.read_access();
                 let mut written = 0;
                 let mut cur_ptr =
@@ -137,7 +153,7 @@ impl ParallelSubsetBuffer {
     ///
     /// Together, these requirements ensure that mutable writes to `vec` do not overlap with
     /// another existing borrow of a given cell.
-    unsafe fn push_vec(&self, vec: BufferedVec, item: RowId) -> BufferedVec {
+    pub(super) unsafe fn push_vec(&self, vec: BufferedVec, item: RowId) -> BufferedVec {
         if !vec.is_empty() && !vec.len().is_power_of_two() {
             let read_handle = self.buf.read_access();
             (read_handle.as_ptr() as *mut RowId)
@@ -145,19 +161,16 @@ impl ParallelSubsetBuffer {
                 .write(item);
             return BufferedVec(vec.0, vec.1.inc());
         }
-        {
-            let free_list = self.get_free_list(vec.len() + 1);
-            if let Some(v) = free_list.pop() {
-                let read_handle = self.buf.read_access();
-                let dst_ptr = read_handle.as_ptr().add(v.index()) as *mut RowId;
-                let src_ptr = read_handle.as_ptr().add(vec.0.index());
-                std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, vec.len());
-                dst_ptr.add(vec.len()).write(item);
-                let res = BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1));
-                self.return_vec(vec);
-                return res;
-            }
-        } // drop the read guard for free_list
+        if let Some(v) = self.free_list.with_size_class(vec.len() + 1, Vec::pop) {
+            let read_handle = self.buf.read_access();
+            let dst_ptr = read_handle.as_ptr().add(v.index()) as *mut RowId;
+            let src_ptr = read_handle.as_ptr().add(vec.0.index());
+            std::ptr::copy_nonoverlapping(src_ptr, dst_ptr, vec.len());
+            dst_ptr.add(vec.len()).write(item);
+            let res = BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1));
+            self.return_vec(vec);
+            return res;
+        }
         if vec.is_empty() {
             let start_index = self.buf.write_contents(std::iter::once(item));
             return BufferedVec(
@@ -183,42 +196,5 @@ impl ParallelSubsetBuffer {
             BufferIndex::from_usize(start_index),
             BufferIndex::from_usize(start_index + vec.len() + 1),
         )
-    }
-
-    /// Get a handle on a free list that can store vectors of the given size.
-    ///
-    /// The returned object keeps an RCU-style read handle on the buffer, meaning that it can block
-    /// resizes of the underlying vector. Callers should avoid keeping these objects around for too
-    /// long.
-    fn get_free_list(&self, size: usize) -> impl Deref<Target = SegQueue<BufferIndex>> + '_ {
-        struct FreeListHandle<T> {
-            reader: T,
-            index: usize,
-        }
-
-        impl<T: Deref<Target = [SegQueue<BufferIndex>]>> Deref for FreeListHandle<T> {
-            type Target = SegQueue<BufferIndex>;
-            fn deref(&self) -> &SegQueue<BufferIndex> {
-                &self.reader[self.index]
-            }
-        }
-        let size_class = size.next_power_of_two().trailing_zeros() as usize;
-        let reader = self.free_list.read();
-        if size_class < reader.len() {
-            return FreeListHandle {
-                reader,
-                index: size_class,
-            };
-        }
-        mem::drop(reader);
-        // There are faster ways to do this.. but it's unlikely we'll ever have more than a few
-        // dozen size classes.
-        loop {
-            let largest_size = self.free_list.push(Default::default());
-            if largest_size > size_class {
-                break;
-            }
-        }
-        self.get_free_list(size)
     }
 }

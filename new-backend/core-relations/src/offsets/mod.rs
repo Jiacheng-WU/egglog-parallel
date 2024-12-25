@@ -231,6 +231,13 @@ impl Offsets for SubsetRef<'_> {
 }
 
 impl SubsetRef<'_> {
+    pub(crate) fn size(&self) -> usize {
+        match self {
+            SubsetRef::Dense(range) => range.size(),
+            SubsetRef::Sparse(vec) => vec.0.len(),
+        }
+    }
+
     pub(crate) fn to_owned(self, pool: &Pool<SortedOffsetVector>) -> Subset {
         match self {
             SubsetRef::Dense(r) => Subset::Dense(r),

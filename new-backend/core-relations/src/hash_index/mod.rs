@@ -3,13 +3,15 @@ use std::{
     hash::{Hash, Hasher},
     mem,
     ops::Deref,
+    sync::Mutex,
 };
 
 use concurrency::ConcurrentVec;
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{define_id, IdVec, NumericId};
-use parallel_buffer::ParallelSubsetBuffer;
+use parallel_buffer::{FreeList, ParallelSubsetBuffer};
+use rayon::iter::ParallelIterator;
 use rustc_hash::FxHasher;
 
 use crate::{
@@ -18,7 +20,7 @@ use crate::{
     pool::{with_pool_set, Clear, Pooled},
     row_buffer::{RowBuffer, TaggedRowBuffer},
     table_spec::{ColumnId, Generation, Offset, TableVersion, WrappedTable},
-    OffsetRange,
+    OffsetRange, Subset,
 };
 
 mod parallel_buffer;
@@ -61,14 +63,6 @@ impl<TI: IndexBase> Index<TI> {
     }
 
     pub(crate) fn refresh(&mut self, table: &WrappedTable) {
-        self.refresh_serial(table)
-    }
-
-    /// Update the contents of the index to the current version of the table.
-    ///
-    /// The index is guaranteed to be up to date until `merge` is called on the
-    /// table again.
-    pub(crate) fn refresh_serial(&mut self, table: &WrappedTable) {
         let cur_version = table.version();
         if cur_version == self.updated_to {
             return;
@@ -79,6 +73,21 @@ impl<TI: IndexBase> Index<TI> {
         } else {
             table.updates_since(self.updated_to.minor)
         };
+        if let Some(mut parallel_writer) = self.table.parallel_writer(subset.size()) {
+            parallel_writer.merge_rows(&self.key, table, subset.as_ref());
+            self.table = parallel_writer.finish()
+        } else {
+            self.refresh_serial(table, subset)
+        }
+
+        self.updated_to = cur_version;
+    }
+
+    /// Update the contents of the index to the current version of the table.
+    ///
+    /// The index is guaranteed to be up to date until `merge` is called on the
+    /// table again.
+    pub(crate) fn refresh_serial(&mut self, table: &WrappedTable, subset: Subset) {
         let mut buf = TaggedRowBuffer::new(self.key.len());
         let mut cur = Offset::new(0);
         loop {
@@ -93,7 +102,6 @@ impl<TI: IndexBase> Index<TI> {
                 break;
             }
         }
-        self.updated_to = cur_version;
     }
 
     pub(crate) fn for_each(&self, f: impl FnMut(&TI::Key, SubsetRef)) {
@@ -118,11 +126,24 @@ impl Clear for SubsetTable {
     }
 }
 
+// TODOs:
+//  * clean up RowBuffer cell stuff.
+//  * Give ParallelRowBuffer a value-based API (or ParallelWriter a reference-based one).
+//  * implement parallel Tuple index
+//  * measure -- unlikely to be able to download xcode on this trip
+//  * manage own thread pool.
+
+type TodoImplTraitAndPrivateForParallelWriter = ();
+
 pub(crate) trait IndexBase {
     /// The type of keys for this index.  Keys can have validity constraints
     /// (e.g. the arity of a slice for `Key = [Value]`). If keys are invalid,
     /// these methods can panic.
     type Key: ?Sized;
+
+    /// A type that indexes can use to handle parallel writes.
+    type ParallelWriter: ParallelIndexWriter<Self>;
+
     /// Remove any existing entries in the index.
     fn clear(&mut self);
     /// Get the subset corresponding to this key, if there is one.
@@ -135,13 +156,18 @@ pub(crate) trait IndexBase {
     fn for_each(&self, f: impl FnMut(&Self::Key, SubsetRef));
     /// The number of keys in the index.
     fn len(&self) -> usize;
+
+    /// Initialize a parallel writer. Depending on the workload size and the current number of
+    /// active threads, the index may return None, in which case writes should be performed
+    /// serially.
+    fn parallel_writer(&mut self, workload_size: usize) -> Option<Self::ParallelWriter>;
 }
 
 /// Types that support merging the contents of `table`'s `subset`, in parallel.
 ///
 /// Right now, this is always a wrapped variant of an underlying `IndexBase` (`T`) but with more
 /// complicated wrappers supporting parallel writes.
-pub(crate) trait ParallelIndexWriter<T> {
+pub(crate) trait ParallelIndexWriter<T: ?Sized> {
     fn finish(self) -> T;
     fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef);
 }
@@ -155,6 +181,7 @@ pub struct ColumnIndex {
 
 impl IndexBase for ColumnIndex {
     type Key = Value;
+    type ParallelWriter = ParallelColumnIndexWriter;
     fn clear(&mut self) {
         for (_, shard) in self.table.iter_mut() {
             for (_, subset) in shard.drain(..) {
@@ -199,6 +226,17 @@ impl IndexBase for ColumnIndex {
     fn len(&self) -> usize {
         self.table.iter().map(|(_, shard)| shard.len()).sum()
     }
+    fn parallel_writer(&mut self, workload_size: usize) -> Option<Self::ParallelWriter> {
+        if do_parallel(workload_size) {
+            Some(ParallelColumnIndexWriter {
+                shard_data: self.shard_data,
+                table: mem::take(&mut self.table),
+                subsets: ParallelSubsetBuffer::from_serial(mem::take(&mut self.subsets)),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl ColumnIndex {
@@ -216,7 +254,7 @@ impl ColumnIndex {
     }
 }
 
-struct ParallelColumnIndexWriter {
+pub(crate) struct ParallelColumnIndexWriter {
     shard_data: ShardData,
     table: IdVec<ShardId, Pooled<IndexMap<Value, BufferedSubset>>>,
     subsets: ParallelSubsetBuffer,
@@ -231,7 +269,80 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
         }
     }
     fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef) {
-        todo!()
+        const BATCH_SIZE: usize = 2048;
+        assert_eq!(cols.len(), 1);
+        let shard_data = self.shard_data;
+        let mut queues = IdVec::<ShardId, Mutex<Vec<(RowId, TaggedRowBuffer)>>>::with_capacity(
+            shard_data.n_shards(),
+        );
+        queues.resize_with(shard_data.n_shards(), || {
+            Mutex::new(Vec::with_capacity((subset.size() / BATCH_SIZE) + 1))
+        });
+        let split_buf = |buf: TaggedRowBuffer| {
+            let mut split = IdVec::<ShardId, TaggedRowBuffer>::default();
+            split.resize_with(shard_data.n_shards(), || TaggedRowBuffer::new(1));
+            for (row_id, key) in buf.iter_non_stale() {
+                shard_data
+                    .get_shard_mut(&key[0], &mut split)
+                    .add_row(row_id, key);
+            }
+            for (shard_id, buf) in split.drain() {
+                if buf.is_empty() {
+                    continue;
+                }
+                let first = buf.get_row(RowId::new(0)).0;
+                queues[shard_id].lock().unwrap().push((first, buf));
+            }
+        };
+        rayon::scope(|scope| {
+            let mut cur = Offset::new(0);
+            loop {
+                let mut buf = TaggedRowBuffer::new(1);
+                if let Some(next) = table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
+                {
+                    cur = next;
+                    scope.spawn(move |_| split_buf(buf));
+                } else {
+                    scope.spawn(move |_| split_buf(buf));
+                    break;
+                }
+            }
+        });
+        let subsets = &self.subsets;
+        self.table.par_iter_mut().for_each(|(shard_id, shard)| {
+            use indexmap::map::Entry;
+            // Sort the vector by start row id to ensure we populate subsets in sorted order.
+            let mut vec = queues[shard_id].lock().unwrap();
+            vec.sort_by_key(|(start, _)| *start);
+            for (_, buf) in vec.drain(..) {
+                for (row_id, key) in buf.iter_non_stale() {
+                    match shard.entry(key[0]) {
+                        Entry::Occupied(mut occ) => {
+                            // SAFETY: all of the buffered vectors in this map come from `subsets`.
+                            unsafe {
+                                occ.get_mut().add_row_sorted_parallel(row_id, subsets);
+                            }
+                        }
+                        Entry::Vacant(v) => {
+                            v.insert(BufferedSubset::singleton(row_id));
+                        }
+                    }
+                }
+            }
+        });
+    }
+}
+
+type TodoImplement = ();
+
+pub(crate) enum ParallelTupleIndexWriter {}
+
+impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
+    fn finish(self) -> TupleIndex {
+        match self {}
+    }
+    fn merge_rows(&mut self, _cols: &[ColumnId], _table: &WrappedTable, _subset: SubsetRef) {
+        match *self {}
     }
 }
 
@@ -264,6 +375,7 @@ impl TupleIndex {
 
 impl IndexBase for TupleIndex {
     type Key = [Value];
+    type ParallelWriter = ParallelTupleIndexWriter;
 
     fn clear(&mut self) {
         for entry in self.table.iter_mut().flat_map(|(_, shard)| shard.0.drain()) {
@@ -333,6 +445,10 @@ impl IndexBase for TupleIndex {
     fn len(&self) -> usize {
         self.table.iter().map(|(_, shard)| shard.0.len()).sum()
     }
+
+    fn parallel_writer(&mut self, workload_size: usize) -> Option<Self::ParallelWriter> {
+        None
+    }
 }
 
 fn hash_key(key: &[Value]) -> u64 {
@@ -354,7 +470,7 @@ define_id!(BufferIndex, u32, "an index into a subset buffer");
 /// our use of memory pools).
 struct SubsetBuffer {
     buf: Pooled<Vec<RowId>>,
-    free_list: ConcurrentVec<SegQueue<BufferIndex>>,
+    free_list: FreeList,
 }
 
 impl Default for SubsetBuffer {
@@ -367,51 +483,10 @@ impl Default for SubsetBuffer {
 }
 
 impl SubsetBuffer {
-    /// Get a handle on a free list that can store vectors of the given size.
-    ///
-    /// The returned object keeps an RCU-style read handle on the buffer, meaning that it can block
-    /// resizes of the underlying vector. Callers should avoid keeping these objects around for too
-    /// long.
-    fn get_free_list(&self, size: usize) -> impl Deref<Target = SegQueue<BufferIndex>> + '_ {
-        struct FreeListHandle<T> {
-            reader: T,
-            index: usize,
-        }
-
-        impl<T: Deref<Target = [SegQueue<BufferIndex>]>> Deref for FreeListHandle<T> {
-            type Target = SegQueue<BufferIndex>;
-            fn deref(&self) -> &SegQueue<BufferIndex> {
-                &self.reader[self.index]
-            }
-        }
-        let size_class = size.next_power_of_two().trailing_zeros() as usize;
-        let reader = self.free_list.read();
-        if size_class < reader.len() {
-            return FreeListHandle {
-                reader,
-                index: size_class,
-            };
-        }
-        mem::drop(reader);
-        // There are faster ways to do this.. but it's unlikely we'll ever have more than a few
-        // dozen size classes.
-        loop {
-            let largest_size = self.free_list.push(Default::default());
-            if largest_size > size_class {
-                break;
-            }
-        }
-        self.get_free_list(size)
-    }
     fn new_vec(&mut self, rows: impl ExactSizeIterator<Item = RowId>) -> BufferedVec {
         let len = rows.len();
-        assert!(len > 0);
-        {
-            let free_list = self.get_free_list(len);
-            if let Some(v) = free_list.pop() {
-                mem::drop(free_list);
-                return self.fill_at(v, rows);
-            }
+        if let Some(v) = self.free_list.with_size_class(len, Vec::pop) {
+            return self.fill_at(v, rows);
         }
         let start = BufferIndex::from_usize(self.buf.len());
         self.buf.resize(
@@ -435,8 +510,7 @@ impl SubsetBuffer {
     }
 
     fn return_vec(&self, vec: BufferedVec) {
-        let free_list = self.get_free_list(vec.len());
-        free_list.push(vec.0);
+        self.free_list.with_size_class(vec.len(), |v| v.push(vec.0))
     }
 
     fn push_vec(&mut self, vec: BufferedVec, row: RowId) -> BufferedVec {
@@ -450,16 +524,12 @@ impl SubsetBuffer {
             return BufferedVec(vec.0, vec.1.inc());
         }
 
-        let free_list = self.get_free_list(vec.len() + 1);
-
-        let res = if let Some(v) = free_list.pop() {
-            mem::drop(free_list);
+        let res = if let Some(v) = self.free_list.with_size_class(vec.len() + 1, Vec::pop) {
             self.buf
                 .copy_within(vec.0.index()..vec.1.index(), v.index());
             self.buf[v.index() + vec.len()] = row;
             BufferedVec(v, BufferIndex::from_usize(v.index() + vec.len() + 1))
         } else {
-            mem::drop(free_list);
             let start = self.buf.len();
             self.buf.resize(
                 start + (vec.len() + 1).next_power_of_two(),
@@ -537,6 +607,28 @@ impl BufferedSubset {
         }
     }
 
+    /// A variant of `add_row_sorted` that works on a [`ParallelSubsetBuffer`]. Safety requirements
+    /// are the same as [`BufferedSubset::add_row_sorted`]
+    unsafe fn add_row_sorted_parallel(&mut self, row: RowId, buf: &ParallelSubsetBuffer) {
+        match self {
+            BufferedSubset::Dense(range) => {
+                if range.end == range.start {
+                    range.start = row;
+                    range.end = row.inc();
+                    return;
+                }
+                if range.end == row {
+                    range.end = row.inc();
+                    return;
+                }
+                let mut v = buf.new_vec((range.start.rep()..range.end.rep()).map(RowId::new));
+                v = buf.push_vec(v, row);
+                *self = BufferedSubset::Sparse(v);
+            }
+            BufferedSubset::Sparse(vec) => *vec = buf.push_vec(mem::take(vec), row),
+        }
+    }
+
     fn empty() -> Self {
         BufferedSubset::Dense(OffsetRange::new(RowId::new(0), RowId::new(0)))
     }
@@ -586,5 +678,17 @@ fn num_shards() -> usize {
         1
     } else {
         n_threads * 2
+    }
+}
+
+fn do_parallel(workload_size: usize) -> bool {
+    #[cfg(test)]
+    {
+        let todo_random = 1;
+        true
+    }
+    #[cfg(not(test))]
+    {
+        rayon::current_num_threads() > 1 && workload_size > 50_000
     }
 }

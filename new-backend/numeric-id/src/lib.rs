@@ -264,12 +264,19 @@ impl<K: NumericId, V> IdVec<K, V> {
             .enumerate()
             .map(|(i, v)| (K::from_usize(i), v))
     }
+    pub fn drain(&mut self) -> impl Iterator<Item = (K, V)> + '_ {
+        self.data
+            .drain(..)
+            .enumerate()
+            .map(|(i, v)| (K::from_usize(i), v))
+    }
 }
 
 impl<K: NumericId, V: Send + Sync> IdVec<K, V> {
     pub fn par_iter_mut(&mut self) -> impl IndexedParallelIterator<Item = (K, &mut V)> {
         self.data
             .par_iter_mut()
+            .with_max_len(1)
             .enumerate()
             .map(|(i, v)| (K::from_usize(i), v))
     }
