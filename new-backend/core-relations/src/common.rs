@@ -161,7 +161,7 @@ impl ShardData {
 
     pub(crate) fn get_shard_mut<'a, V>(
         &self,
-        val: &impl Hash,
+        val: impl Hash,
         table: &'a mut IdVec<ShardId, V>,
     ) -> &'a mut V {
         let hc = {

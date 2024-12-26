@@ -11,12 +11,13 @@ use std::{
 };
 
 use fixedbitset::FixedBitSet;
+use hashbrown::HashTable;
 
 use crate::{
     action::Instr,
     common::{HashMap, HashSet, IndexMap, IndexSet, Value},
     free_join::execute::FrameUpdate,
-    hash_index::{BufferedSubset, SubsetTable},
+    hash_index::{BufferedSubset, TableEntry},
     offsets::SortedOffsetVector,
     table_spec::Constraint,
     RowId,
@@ -67,6 +68,15 @@ where
 }
 
 impl<T> Clear for HashSet<T> {
+    fn clear(&mut self) {
+        self.clear()
+    }
+    fn reuse(&self) -> bool {
+        self.capacity() > 0
+    }
+}
+
+impl<T> Clear for HashTable<T> {
     fn clear(&mut self) {
         self.clear()
     }
@@ -315,9 +325,9 @@ pool_set! {
         constraints: Vec<Constraint>,
         bitsets: FixedBitSet,
         instrs: Vec<Instr>,
-        index_hashes: SubsetTable,
         frame_updates: FrameUpdate,
         frame_update_vecs: Vec<Pooled<FrameUpdate>>,
+        tuple_indexes: HashTable<TableEntry<BufferedSubset>>,
     }
 }
 

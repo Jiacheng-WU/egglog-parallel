@@ -65,10 +65,14 @@ impl RowBuffer {
         }
     }
 
-    pub(crate) fn parallel_writer(&mut self) -> ParallelRowBufWriter<'_> {
+    pub(crate) fn parallel_writer(&mut self) -> ParallelRowBufWriter {
         let data = mem::take(&mut self.data);
         ParallelRowBufWriter {
-            buf: self,
+            buf: RowBuffer {
+                n_columns: self.n_columns,
+                total_rows: self.total_rows,
+                data: Default::default(),
+            },
             vec: Some(ParallelVecWriter::new(Pooled::into_inner(data))),
         }
     }
@@ -330,17 +334,17 @@ unsafe fn get_row(data: &[Cell<Value>], n_columns: usize, row: RowId) -> &[Value
 /// This is a type that is used to speed up parallel `merge` operations on
 /// `SortedWritesTable`. It uses a low-level interface that should be avoided in
 /// most cases.
-pub(crate) struct ParallelRowBufWriter<'a> {
-    buf: &'a mut RowBuffer,
+pub(crate) struct ParallelRowBufWriter {
+    buf: RowBuffer,
     // This is only an option so we can move out of it in `drop`. It is always
     // populated.
     vec: Option<ParallelVecWriter<Cell<Value>>>,
 }
 
-impl ParallelRowBufWriter<'_> {
+impl ParallelRowBufWriter {
     pub(crate) fn read_handle(&self) -> ReadHandle<impl Deref<Target = [Cell<Value>]> + '_> {
         ReadHandle {
-            buf: self.buf,
+            buf: &self.buf,
             data: self.vec.as_ref().unwrap().read_access(),
         }
     }
@@ -359,12 +363,11 @@ impl ParallelRowBufWriter<'_> {
         debug_assert_eq!(start_off % self.buf.n_columns, 0);
         RowId::from_usize(start_off / self.buf.n_columns)
     }
-}
 
-impl Drop for ParallelRowBufWriter<'_> {
-    fn drop(&mut self) {
+    pub(crate) fn finish(mut self) -> RowBuffer {
         self.buf.data = Pooled::new(self.vec.take().unwrap().finish());
         self.buf.total_rows = self.buf.data.len() / self.buf.n_columns;
+        self.buf
     }
 }
 

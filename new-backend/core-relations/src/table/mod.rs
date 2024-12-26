@@ -8,7 +8,6 @@ use std::{
     any::Any,
     cmp,
     hash::Hasher,
-    mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
@@ -892,7 +891,7 @@ impl SortedWritesTable {
                 (checker, marked_stale, changed || staged.changed)
             })
             .collect_vec_list();
-        mem::drop(row_writer);
+        self.data.data = row_writer.finish();
         // Now we just need to reset our invariants.
 
         // Confirm none of the writes violated sort order and update the
@@ -1221,7 +1220,7 @@ fn do_parallel(_workload_size: usize) -> bool {
 
     #[cfg(not(test))]
     {
-        _workload_size > 50_000 && rayon::current_num_threads() > 1
+        _workload_size > 20_000 && rayon::current_num_threads() > 1
     }
 }
 

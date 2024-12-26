@@ -1,8 +1,13 @@
 //! A variant of SubsetBuffer that supports concurrent insertions.
+//!
+//! This variant of SubsetBuffer is thread-safe and has comparable-but-slower single-threaded
+//! performance to the serial version in the parent module, while also adding reasonable
+//! multi-threaded scalability. However, the implementation is more complex and the safety of the
+//! implementation is harder to reason about. As such, we keep both implementations around.
 
 use std::{mem, ops::Deref};
 
-use concurrency::{parallel_writer::UnsafeReadAccess, ParallelVecWriter};
+use concurrency::ParallelVecWriter;
 use numeric_id::NumericId;
 
 use crate::{
@@ -11,6 +16,10 @@ use crate::{
 
 use super::{BufferIndex, BufferedVec, SubsetBuffer};
 
+/// A simple free list used to reuse slots in a [`SubsetBuffer`] or [`ParallelSubsetBuffer`].
+///
+/// This free list works as a map from power-of-two size classes to a vector of offsets that point
+/// to the beginning of an unused vector.
 #[derive(Default)]
 pub(super) struct FreeList {
     data: DashMap<usize, Vec<BufferIndex>>,
@@ -34,24 +43,6 @@ pub(super) struct ParallelSubsetBuffer {
     free_list: FreeList,
 }
 
-struct ReadHandle<'a> {
-    reader: UnsafeReadAccess<'a, RowId>,
-}
-
-impl ReadHandle<'_> {
-    /// Get a reference to the underlying subset associated with this vector.
-    ///
-    /// # Safety
-    /// Assumes that the underlying vector is sorted, and that `vec` was returned from the same
-    /// ParallelSubsetBuffer that this read handle came from.
-    unsafe fn make_ref(&self, vec: &BufferedVec) -> SubsetRef<'_> {
-        SubsetRef::Sparse(SortedOffsetSlice::new_unchecked(
-            self.reader
-                .get_unchecked_slice(vec.0.index()..vec.1.index()),
-        ))
-    }
-}
-
 impl ParallelSubsetBuffer {
     pub(super) fn from_serial(subsets: SubsetBuffer) -> ParallelSubsetBuffer {
         ParallelSubsetBuffer {
@@ -67,12 +58,6 @@ impl ParallelSubsetBuffer {
     }
     fn return_vec(&self, vec: BufferedVec) {
         self.free_list.with_size_class(vec.len(), |v| v.push(vec.0));
-    }
-
-    fn read_handle(&self) -> ReadHandle {
-        ReadHandle {
-            reader: self.buf.unsafe_read_access(),
-        }
     }
 
     fn make_ref<'a>(&'a self, vec: &BufferedVec) -> impl Deref<Target = SubsetRef<'a>> {
