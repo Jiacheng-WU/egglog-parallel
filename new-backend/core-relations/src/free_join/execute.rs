@@ -180,7 +180,7 @@ impl Database {
                 rayon::current_num_threads() > 1
             }
         }
-        let preds = PredictedVals::default();
+        let preds = with_pool_set(|ps| ps.get::<PredictedVals>());
         let index_cache = IndexCache::default();
 
         if do_parallel() {
@@ -763,7 +763,7 @@ impl Clear for FrameUpdate {
     }
 }
 
-const VAR_BATCH_SIZE: usize = 1024;
+const VAR_BATCH_SIZE: usize = 512;
 
 /// A trait used to abstract over different ways of buffering actions together
 /// before running them.
@@ -807,7 +807,7 @@ trait ActionBuffer<'state>: Send {
     /// As of right now this is just a hard-coded value. We may change it in the
     /// future to fan out more at higher levels though.
     fn morsel_size(_level: usize) -> usize {
-        512
+        1024
     }
 }
 

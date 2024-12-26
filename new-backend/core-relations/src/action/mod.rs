@@ -5,12 +5,13 @@
 use std::{ops::Deref, sync::atomic::AtomicUsize};
 
 use numeric_id::{DenseIdMap, NumericId};
+use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 use smallvec::SmallVec;
 
 use crate::{
     common::{DashMap, Value},
     free_join::{CounterId, ExternalFunctionExt, TableId, TableInfo, Variable},
-    pool::{with_pool_set, PoolSet, Pooled},
+    pool::{with_pool_set, Clear, PoolSet, Pooled},
     primitives::PrimitiveFunctionId,
     table_spec::{ColumnId, MutationBuffer},
     ExternalFunctionId, Primitives, WrappedTable,
@@ -97,6 +98,21 @@ pub(crate) type Bindings = DenseIdMap<Variable, Pooled<Vec<Value>>>;
 pub(crate) struct PredictedVals {
     #[allow(clippy::type_complexity)]
     data: DashMap<(TableId, SmallVec<[Value; 3]>), Pooled<Vec<Value>>>,
+}
+
+impl Clear for PredictedVals {
+    fn reuse(&self) -> bool {
+        self.data.capacity() > 0
+    }
+    fn clear(&mut self) {
+        if self.data.len() > 500 && rayon::current_num_threads() > 1 {
+            self.data
+                .shards_mut()
+                .par_iter_mut()
+                .for_each(|shard| shard.get_mut().clear());
+        }
+        self.data.clear()
+    }
 }
 
 impl PredictedVals {

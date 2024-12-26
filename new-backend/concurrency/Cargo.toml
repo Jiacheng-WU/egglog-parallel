@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 arc-swap = "1.7.1"
+rayon = "1.10"
 
 [dev-dependencies]
 divan = "0.1.15"

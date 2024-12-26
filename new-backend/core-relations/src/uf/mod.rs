@@ -26,7 +26,7 @@ use crate::{
 #[cfg(test)]
 mod tests;
 
-type UnionFind = union_find::concurrent::UnionFind<Value>;
+type UnionFind = union_find::UnionFind<Value>;
 
 /// A special table backed by a union-find used to efficiently implement
 /// egglog-style canonicaliztion.
@@ -63,7 +63,7 @@ pub struct DisplacedTable {
 impl Default for DisplacedTable {
     fn default() -> Self {
         Self {
-            uf: UnionFind::with_capacity(1 << 20),
+            uf: UnionFind::default(),
             displaced: Vec::new(),
             changed: false,
             lookup_table: HashMap::default(),
@@ -75,7 +75,7 @@ impl Default for DisplacedTable {
 impl Clone for DisplacedTable {
     fn clone(&self) -> Self {
         DisplacedTable {
-            uf: self.uf.deep_copy(),
+            uf: self.uf.clone(),
             displaced: self.displaced.clone(),
             changed: self.changed,
             lookup_table: self.lookup_table.clone(),
@@ -273,7 +273,7 @@ impl Table for DisplacedTable {
     fn get_row_column(&self, key: &[Value], col: ColumnId) -> Option<Value> {
         assert_eq!(key.len(), 1, "attempt to lookup a row with the wrong key");
         if col == ColumnId::new(1) {
-            Some(self.uf.find(key[0]))
+            Some(self.uf.find_naive(key[0]))
         } else {
             let row_id = *self.lookup_table.get(&key[0])?;
             Some(self.expand(row_id)[col.index()])
@@ -303,7 +303,7 @@ impl DisplacedTable {
     }
     fn expand(&self, row: RowId) -> [Value; 3] {
         let (child, ts) = self.displaced[row.index()];
-        [child, self.uf.find(child), ts]
+        [child, self.uf.find_naive(child), ts]
     }
     fn timestamp_bounds(&self, val: Value) -> Result<(RowId, RowId), RowId> {
         match self.displaced.binary_search_by_key(&val, |(_, ts)| *ts) {
@@ -326,10 +326,14 @@ impl DisplacedTable {
     }
     fn insert_impl(&mut self, row: &[Value]) -> Option<(Value, Value)> {
         assert_eq!(row.len(), 3, "attempt to insert a row with the wrong arity");
-        if self.uf.same_set(row[0], row[1]) {
+        if self.uf.find(row[0]) == self.uf.find(row[1]) {
             return None;
         }
         let (parent, child) = self.uf.union(row[0], row[1]);
+
+        // Compress paths somewhat, given that we perform naive finds everywhere else.
+        let _ = self.uf.find(parent);
+        let _ = self.uf.find(child);
         let ts = row[2];
         if let Some((_, highest)) = self.displaced.last() {
             assert!(
@@ -415,11 +419,11 @@ impl DisplacedTableWithProvenance {
         }
         let mut l_proofs = IndexMap::new();
         let mut r_proofs = IndexMap::new();
-        if !self.base.uf.same_set(l, r) {
+        if self.base.uf.find_naive(l) != self.base.uf.find_naive(r) {
             // The two values aren't equal.
             return None;
         }
-        let canon = self.base.uf.find(l);
+        let canon = self.base.uf.find_naive(l);
 
         // General case: collect individual equality proofs that point from `l`
         // (sim. `r`) and move towards canon. We stop early and don't always go

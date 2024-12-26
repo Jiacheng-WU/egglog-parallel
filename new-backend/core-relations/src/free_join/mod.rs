@@ -256,7 +256,7 @@ impl Database {
 
     /// Run `f` with access to an `ExecutionState` mapped to this database.
     pub fn with_execution_state<R>(&self, f: impl FnOnce(&mut ExecutionState) -> R) -> R {
-        let predicted = PredictedVals::default();
+        let predicted = with_pool_set(|ps| ps.get::<PredictedVals>());
         let mut state = ExecutionState {
             db: self.read_only_view(),
             predicted: &predicted,
@@ -305,7 +305,7 @@ impl Database {
         let mut ever_changed = false;
         loop {
             let mut changed = false;
-            let predicted = PredictedVals::default();
+            let predicted = with_pool_set(|ps| ps.get::<PredictedVals>());
             let mut tables_merging =
                 DenseIdMap::<TableId, TableInfo>::with_capacity(self.tables.n_ids());
             for stratum in self.deps.strata() {
@@ -344,7 +344,7 @@ impl Database {
     /// surprises here.
     pub fn merge_table(&mut self, table: TableId) {
         let mut info = self.tables.unwrap_val(table);
-        let predicted = PredictedVals::default();
+        let predicted = with_pool_set(|ps| ps.get::<PredictedVals>());
         let _table_changed = info.table.merge(&mut ExecutionState {
             db: self.read_only_view(),
             predicted: &predicted,

@@ -14,7 +14,7 @@ use fixedbitset::FixedBitSet;
 use hashbrown::HashTable;
 
 use crate::{
-    action::Instr,
+    action::{Instr, PredictedVals},
     common::{HashMap, HashSet, IndexMap, IndexSet, Value},
     free_join::execute::FrameUpdate,
     hash_index::{BufferedSubset, TableEntry},
@@ -328,6 +328,7 @@ pool_set! {
         frame_updates: FrameUpdate,
         frame_update_vecs: Vec<Pooled<FrameUpdate>>,
         tuple_indexes: HashTable<TableEntry<BufferedSubset>>,
+        predicted_vals: PredictedVals,
     }
 }
 

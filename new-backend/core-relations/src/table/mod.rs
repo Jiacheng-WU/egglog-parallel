@@ -14,6 +14,7 @@ use std::{
     },
 };
 
+use concurrency::Lazy;
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
@@ -145,7 +146,6 @@ enum MergeFn {
     Bookkeeping(Arc<BookkeepFn>),
 }
 
-#[derive(Clone)]
 pub struct SortedWritesTable {
     generation: Generation,
     data: Rows,
@@ -157,7 +157,35 @@ pub struct SortedWritesTable {
     offsets: Vec<(Value, RowId)>,
 
     pending_state: Arc<PendingState>,
+    background_compaction: Option<Lazy<TableState>>,
     merge: MergeFn,
+}
+
+struct TableState {
+    data: Rows,
+    offsets: Vec<(Value, RowId)>,
+    hash: ShardedHashTable<TableEntry>,
+}
+
+impl Clone for SortedWritesTable {
+    fn clone(&self) -> SortedWritesTable {
+        let mut res = SortedWritesTable {
+            generation: self.generation,
+            data: self.data.clone(),
+            hash: self.hash.clone(),
+            n_keys: self.n_keys,
+            n_columns: self.n_columns,
+            sort_by: self.sort_by,
+            offsets: self.offsets.clone(),
+            pending_state: Arc::new(self.pending_state.deep_copy()),
+            background_compaction: None,
+            merge: self.merge.clone(),
+        };
+        if self.background_compaction.is_some() {
+            res.maybe_rehash();
+        }
+        res
+    }
 }
 
 struct Buffer {
@@ -407,6 +435,17 @@ impl Table for SortedWritesTable {
     }
 
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
+        if let Some(lazy) = self.background_compaction.take() {
+            let TableState {
+                data,
+                hash,
+                offsets,
+            } = lazy.take().unwrap();
+            self.data = data;
+            self.hash = hash;
+            self.offsets = offsets;
+            self.generation = self.generation.inc();
+        }
         let mut changed = false;
 
         // First: handle the removals.
@@ -466,6 +505,7 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Update(Arc::new(merge_fn)),
+            background_compaction: None,
         }
     }
 
@@ -492,6 +532,7 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Bookkeeping(Arc::new(merge_fn)),
+            background_compaction: None,
         }
     }
 
@@ -966,35 +1007,74 @@ impl SortedWritesTable {
     }
 
     fn maybe_rehash(&mut self) {
-        if self.data.stale_rows > cmp::max(16, self.data.data.len() / 2) {
+        if self.data.stale_rows <= cmp::max(16, self.data.data.len() / 2) {
+            return;
+        }
+
+        // Time to rehash. We can do this either in a background thread or synchronously. We'll
+        // make that call based on the parallelism heuristic. Doing the compaction in place saves a
+        // clone of the core table state. Compacting in the background allows us to interleave
+        // compaction work with the next round of queries.
+        //
+        // The '* 16' biases the heuristic towards background evaluation.
+        if do_parallel(self.data.data.len() * 16) {
+            let mut data = self.data.clone();
+            let mut hash = self.hash.clone();
+            let mut offsets = Vec::with_capacity(self.offsets.len());
+            let sort_by = self.sort_by;
+            let n_keys = self.n_keys;
+            self.background_compaction = Some(Lazy::new(move || {
+                Self::rehash_impl(sort_by, n_keys, &mut data, &mut offsets, &mut hash);
+                TableState {
+                    data,
+                    offsets,
+                    hash,
+                }
+            }));
+        } else {
             self.rehash();
+        }
+    }
+    fn rehash_impl(
+        sort_by: Option<ColumnId>,
+        n_keys: usize,
+        rows: &mut Rows,
+        offsets: &mut Vec<(Value, RowId)>,
+        hash: &mut ShardedHashTable<TableEntry>,
+    ) {
+        if let Some(sort_by) = sort_by {
+            offsets.clear();
+            rows.remove_stale(|row, old, new| {
+                let stale_entry = get_entry_mut(row, n_keys, hash, |x| x == old)
+                    .expect("non-stale entry not mapped in hash");
+                *stale_entry = new;
+                let sort_col = row[sort_by.index()];
+                if let Some((max, _)) = offsets.last() {
+                    if sort_col > *max {
+                        offsets.push((sort_col, new));
+                    }
+                } else {
+                    offsets.push((sort_col, new));
+                }
+            })
+        } else {
+            rows.remove_stale(|row, old, new| {
+                let stale_entry = get_entry_mut(row, n_keys, hash, |x| x == old)
+                    .expect("non-stale entry not mapped in hash");
+                *stale_entry = new;
+            })
         }
     }
 
     fn rehash(&mut self) {
         self.generation = self.generation.inc();
-        if let Some(sort_by) = self.sort_by {
-            self.offsets.clear();
-            self.data.remove_stale(|row, old, new| {
-                let stale_entry = get_entry_mut(row, self.n_keys, &mut self.hash, |x| x == old)
-                    .expect("non-stale entry not mapped in hash");
-                *stale_entry = new;
-                let sort_col = row[sort_by.index()];
-                if let Some((max, _)) = self.offsets.last() {
-                    if sort_col > *max {
-                        self.offsets.push((sort_col, new));
-                    }
-                } else {
-                    self.offsets.push((sort_col, new));
-                }
-            })
-        } else {
-            self.data.remove_stale(|row, old, new| {
-                let stale_entry = get_entry_mut(row, self.n_keys, &mut self.hash, |x| x == old)
-                    .expect("non-stale entry not mapped in hash");
-                *stale_entry = new;
-            })
-        }
+        Self::rehash_impl(
+            self.sort_by,
+            self.n_keys,
+            &mut self.data,
+            &mut self.offsets,
+            &mut self.hash,
+        )
     }
 }
 
@@ -1075,7 +1155,10 @@ impl PendingState {
 
     /// This is only really used in debugging, but it's annoying enough to write
     /// that it may help to have around.
-    fn _deep_copy(&self) -> PendingState {
+    ///
+    /// We also, however, use it in the clone impl (which should only be called when pending state
+    /// is empty).
+    fn deep_copy(&self) -> PendingState {
         let mut pending_rows = DenseIdMap::new();
         let mut pending_removals = DenseIdMap::new();
         fn drain_queue<T>(queue: &SegQueue<T>) -> Vec<T> {

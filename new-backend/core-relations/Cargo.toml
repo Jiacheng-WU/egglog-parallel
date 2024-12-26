@@ -21,7 +21,7 @@ union-find = {path = "../union-find"}
 log = "0.4"
 petgraph = "0.6.5"
 crossbeam-queue = "0.3.11"
-dashmap = "6.1.0"
+dashmap = { version = "6.1.0", features = ["raw-api"] }
 web-time = "1.1.0"
 rayon = "1.10.0"
 
