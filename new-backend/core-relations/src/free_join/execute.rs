@@ -143,7 +143,9 @@ impl Database {
                 let table = &info.table;
                 for ci in info.column_indexes.iter_mut() {
                     let (_, v) = ci.pair();
-                    if v.read().needs_refresh(table) {
+                    let reader = v.read();
+                    if reader.needs_refresh(table) {
+                        mem::drop(reader);
                         let v = v.clone();
                         scope.spawn(move |_| {
                             v.lock().refresh(table);
@@ -153,7 +155,9 @@ impl Database {
 
                 for ix in info.indexes.iter_mut() {
                     let (_, v) = ix.pair();
-                    if v.read().needs_refresh(table) {
+                    let reader = v.read();
+                    if reader.needs_refresh(table) {
+                        mem::drop(reader);
                         let v = v.clone();
                         scope.spawn(move |_| {
                             v.lock().refresh(table);

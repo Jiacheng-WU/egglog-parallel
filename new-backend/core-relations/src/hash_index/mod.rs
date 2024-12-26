@@ -260,7 +260,7 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
         }
     }
     fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef) {
-        const BATCH_SIZE: usize = 2048;
+        const BATCH_SIZE: usize = 1024;
         assert_eq!(cols.len(), 1);
         let shard_data = self.shard_data;
         let mut queues = IdVec::<ShardId, Mutex<Vec<(RowId, TaggedRowBuffer)>>>::with_capacity(
@@ -342,7 +342,7 @@ impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
         // The structure here is similar to the implementation for ParallelColumnIndexWriter, with
         // slightly more bookkeeping needed to handle arbitrary-arity keys.
 
-        const BATCH_SIZE: usize = 2048;
+        const BATCH_SIZE: usize = 1024;
         let shard_data = self.shard_data;
         let mut queues = IdVec::<ShardId, Mutex<Vec<(RowId, TaggedRowBuffer)>>>::with_capacity(
             shard_data.n_shards(),
