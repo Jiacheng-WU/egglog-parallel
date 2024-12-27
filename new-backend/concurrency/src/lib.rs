@@ -2,14 +2,12 @@
 
 pub(crate) mod bitset;
 pub(crate) mod concurrent_vec;
-pub(crate) mod lazy;
 pub(crate) mod notification;
 pub mod parallel_writer;
 use arc_swap::{ArcSwap, Guard};
 
 pub use bitset::BitSet;
 pub use concurrent_vec::ConcurrentVec;
-pub use lazy::Lazy;
 pub use notification::Notification;
 pub use parallel_writer::ParallelVecWriter;
 
