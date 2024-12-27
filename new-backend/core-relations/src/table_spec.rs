@@ -273,6 +273,9 @@ pub trait MutationBuffer: Any + Send + Sync {
     /// this buffer is dropped, and after `merge` is called on the underlying
     /// table.
     fn stage_remove(&mut self, key: &[Value]);
+
+    /// Get a fresh handle to the same table.
+    fn fresh_handle(&self) -> Box<dyn MutationBuffer>;
 }
 
 struct WrapperImpl<T>(PhantomData<T>);

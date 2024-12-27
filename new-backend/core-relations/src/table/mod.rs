@@ -8,13 +8,13 @@ use std::{
     any::Any,
     cmp,
     hash::Hasher,
+    mem,
     sync::{
         atomic::{AtomicUsize, Ordering},
         Arc, Weak,
     },
 };
 
-use concurrency::Lazy;
 use crossbeam_queue::SegQueue;
 use hashbrown::HashTable;
 use numeric_id::{DenseIdMap, NumericId};
@@ -24,7 +24,7 @@ use sharded_hash_table::ShardedHashTable;
 
 use crate::{
     action::ExecutionState,
-    common::{ShardData, ShardId, Value},
+    common::{HashMap, ShardData, ShardId, Value},
     offsets::{OffsetRange, Offsets, RowId, Subset, SubsetRef},
     pool::with_pool_set,
     row_buffer::{ParallelRowBufWriter, RowBuffer},
@@ -70,13 +70,16 @@ impl TableEntry {
 #[derive(Clone)]
 struct Rows {
     data: RowBuffer,
+    scratch: RowBuffer,
     stale_rows: usize,
 }
 
 impl Rows {
     fn new(data: RowBuffer) -> Rows {
+        let arity = data.arity();
         Rows {
             data,
+            scratch: RowBuffer::new(arity),
             stale_rows: 0,
         }
     }
@@ -157,19 +160,12 @@ pub struct SortedWritesTable {
     offsets: Vec<(Value, RowId)>,
 
     pending_state: Arc<PendingState>,
-    background_compaction: Option<Lazy<TableState>>,
     merge: MergeFn,
-}
-
-struct TableState {
-    data: Rows,
-    offsets: Vec<(Value, RowId)>,
-    hash: ShardedHashTable<TableEntry>,
 }
 
 impl Clone for SortedWritesTable {
     fn clone(&self) -> SortedWritesTable {
-        let mut res = SortedWritesTable {
+        SortedWritesTable {
             generation: self.generation,
             data: self.data.clone(),
             hash: self.hash.clone(),
@@ -178,13 +174,8 @@ impl Clone for SortedWritesTable {
             sort_by: self.sort_by,
             offsets: self.offsets.clone(),
             pending_state: Arc::new(self.pending_state.deep_copy()),
-            background_compaction: None,
             merge: self.merge.clone(),
-        };
-        if self.background_compaction.is_some() {
-            res.maybe_rehash();
         }
-        res
     }
 }
 
@@ -209,6 +200,16 @@ impl MutationBuffer for Buffer {
         self.pending_removals
             .get_or_insert(shard, || RowBuffer::new(self.n_keys as _))
             .add_row(key);
+    }
+    fn fresh_handle(&self) -> Box<dyn MutationBuffer> {
+        Box::new(Buffer {
+            pending_rows: Default::default(),
+            pending_removals: Default::default(),
+            state: self.state.clone(),
+            n_cols: self.n_cols,
+            n_keys: self.n_keys,
+            shard_data: self.shard_data,
+        })
     }
 }
 
@@ -435,17 +436,6 @@ impl Table for SortedWritesTable {
     }
 
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
-        if let Some(lazy) = self.background_compaction.take() {
-            let TableState {
-                data,
-                hash,
-                offsets,
-            } = lazy.take().unwrap();
-            self.data = data;
-            self.hash = hash;
-            self.offsets = offsets;
-            self.generation = self.generation.inc();
-        }
         let mut changed = false;
 
         // First: handle the removals.
@@ -505,7 +495,6 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Update(Arc::new(merge_fn)),
-            background_compaction: None,
         }
     }
 
@@ -532,7 +521,6 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Bookkeeping(Arc::new(merge_fn)),
-            background_compaction: None,
         }
     }
 
@@ -1011,29 +999,170 @@ impl SortedWritesTable {
             return;
         }
 
-        // Time to rehash. We can do this either in a background thread or synchronously. We'll
-        // make that call based on the parallelism heuristic. Doing the compaction in place saves a
-        // clone of the core table state. Compacting in the background allows us to interleave
-        // compaction work with the next round of queries.
-        //
-        // The '* 16' biases the heuristic towards background evaluation.
-        if do_parallel(self.data.data.len() * 16) {
-            let mut data = self.data.clone();
-            let mut hash = self.hash.clone();
-            let mut offsets = Vec::with_capacity(self.offsets.len());
-            let sort_by = self.sort_by;
-            let n_keys = self.n_keys;
-            self.background_compaction = Some(Lazy::new(move || {
-                Self::rehash_impl(sort_by, n_keys, &mut data, &mut offsets, &mut hash);
-                TableState {
-                    data,
-                    offsets,
-                    hash,
-                }
-            }));
+        // The '* 4' biases the heuristic towards background evaluation.
+        if do_parallel(self.data.data.len() * 4) {
+            self.parallel_rehash();
         } else {
             self.rehash();
         }
+    }
+    fn parallel_rehash(&mut self) {
+        use rayon::prelude::*;
+        // Parallel rehashes go "hash-first" rather than "rows-first".
+        //
+        // We iterate over each shard and then write out new contents to a fresh row, in parallel.
+        let Some(sort_by) = self.sort_by else {
+            // Just do a serial rehash for now. We currently do not have a use-case for parallel
+            // compaction of unsorted tables.
+            //
+            // Implementing parallel compaction for an unsorted table is much easier: each shard
+            // can write to a contiguous chunk of the `scratch` buffer, with the offsets being
+            // pre-chunked based on the size of each shard.
+            self.rehash();
+            return;
+        };
+        self.generation = self.generation.inc();
+        assert!(!self.offsets.is_empty());
+        struct TimestampStats {
+            value: Value,
+            count: usize,
+            histogram: Pooled<DenseIdMap<ShardId, usize>>,
+        }
+        impl Default for TimestampStats {
+            fn default() -> TimestampStats {
+                TimestampStats {
+                    value: Value::stale(),
+                    count: 0,
+                    histogram: with_pool_set(|ps| ps.get()),
+                }
+            }
+        }
+        let mut results = Vec::<TimestampStats>::with_capacity(self.offsets.len());
+        results.resize_with(self.offsets.len() - 1, Default::default);
+        // Use a macro rather than a lambda to avoid borrow issues.
+        macro_rules! compute_hist {
+            ($start_val: expr, $start_row: expr, $end_row: expr) => {{
+                let mut histogram: Pooled<DenseIdMap<ShardId, usize>> =
+                    with_pool_set(|ps| ps.get());
+                let mut cur_row = $start_row;
+                let mut count = 0;
+                while cur_row < $end_row {
+                    if let Some(row) = self.data.get_row(cur_row) {
+                        count += 1;
+                        let (shard, _) = hash_code(self.hash.shard_data(), row, self.n_keys);
+                        *histogram.get_or_default(shard) += 1;
+                    }
+                    cur_row = cur_row.inc();
+                }
+                TimestampStats {
+                    value: $start_val,
+                    count,
+                    histogram,
+                }
+            }};
+        }
+        let mut last: TimestampStats = Default::default();
+        rayon::join(
+            || {
+                // This closure handles computing all timestamps but the last one.
+                self.offsets
+                    .windows(2)
+                    .zip(results.iter_mut())
+                    .par_bridge()
+                    .for_each(|(xs, res)| {
+                        let [(start_val, start_row), (_, end_row)] = xs else {
+                            unreachable!()
+                        };
+                        *res = compute_hist!(*start_val, *start_row, *end_row);
+                    })
+            },
+            || {
+                // And here we handle the final one.
+                let (start_val, start_row) = self.offsets.last().unwrap();
+                let end_row = self.data.next_row();
+                last = compute_hist!(*start_val, *start_row, end_row);
+            },
+        );
+        results.push(last);
+        // Now we need to compute cumulative statistics on the row layouts here.
+        // We do this serially a we currently don't have a ton of use for cases with thousands
+        // of timestamps or more. There are well-known parallel algorithms for computing these
+        // cumulative statistics in parallel, but they aren't currently all that well-suited
+        // for rayon at the moment.
+        let mut prev_count = 0;
+        self.offsets.clear();
+        for stats in results.iter_mut() {
+            if stats.count == 0 {
+                continue;
+            }
+            self.offsets
+                .push((stats.value, RowId::from_usize(prev_count)));
+            let mut inner = prev_count;
+            for (_, count) in stats.histogram.iter_mut() {
+                // Each entry in the histogram now points to the start row for that shard's
+                // rows for a given timestamp.
+                let tmp = *count;
+                *count = inner;
+                inner += tmp;
+            }
+            prev_count += stats.count;
+            debug_assert_eq!(inner, prev_count)
+        }
+
+        // Now the part with some unsafe code.
+        // We will iterate over each shard and use the statistics in `results` to guide where
+        // each row will go.
+        //
+        // This involves doing unsynchronized writes to the table (ptr::copy_nonoverlapping)
+        // followed by a set_len. The safety of these operations relies on the fact that:
+        // * No one grabs a reference to the interior of `scratch` until these operations have
+        //   finished.
+        // * `scratch` does not overlap `data`.
+        // * The sharding function completely partitions the set of objects in the table: one
+        //   shard's writes will never stomp on those of another.
+
+        self.data.scratch.clear();
+        self.data.scratch.reserve(prev_count);
+        self.hash
+            .mut_shards()
+            .par_iter_mut()
+            .with_max_len(1)
+            .enumerate()
+            .for_each(|(shard_id, shard)| {
+                let shard_id = ShardId::from_usize(shard_id);
+                let scratch_ptr = self.data.scratch.raw_rows();
+                let mut progress =
+                    HashMap::<Value /* timestamp */, RowId /* next row */>::default();
+                progress.reserve(results.len());
+                for stats in &results {
+                    let Some(start) = stats.histogram.get(shard_id) else {
+                        continue;
+                    };
+                    progress.insert(stats.value, RowId::from_usize(*start));
+                }
+                for TableEntry { row: row_id, .. } in shard.iter_mut() {
+                    let row = self
+                        .data
+                        .get_row(*row_id)
+                        .expect("shard should not map to a stale value");
+                    let val = row[sort_by.index()];
+                    let next = progress[&val];
+                    // SAFETY: see above longer comment.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            row.as_ptr(),
+                            scratch_ptr.add(next.index() * self.n_columns) as *mut Value,
+                            self.n_columns,
+                        )
+                    }
+                    *row_id = next;
+                    progress.insert(val, next.inc());
+                }
+            });
+        // SAFETY: see above longer comment.
+        unsafe { self.data.scratch.set_len(prev_count) };
+        mem::swap(&mut self.data.data, &mut self.data.scratch);
+        self.data.stale_rows = 0;
     }
     fn rehash_impl(
         sort_by: Option<ColumnId>,

@@ -24,7 +24,7 @@ use crate::{
     pool::{with_pool_set, Pool, Pooled},
     primitives::Primitives,
     query::{Query, RuleSetBuilder},
-    table_spec::{ColumnId, Constraint, Table, TableSpec, WrappedTable},
+    table_spec::{ColumnId, Constraint, MutationBuffer, Table, TableSpec, WrappedTable},
     PoolSet, QueryEntry, TupleIndex, Value,
 };
 
@@ -306,26 +306,46 @@ impl Database {
         loop {
             let mut changed = false;
             let predicted = with_pool_set(|ps| ps.get::<PredictedVals>());
-            let mut tables_merging =
-                DenseIdMap::<TableId, TableInfo>::with_capacity(self.tables.n_ids());
+            let mut tables_merging = DenseIdMap::<
+                TableId,
+                (
+                    // The info needed to merge this table.
+                    Option<TableInfo>,
+                    // Pre-allocated write buffers, according to the tables declared write
+                    // dependencies.
+                    DenseIdMap<TableId, Box<dyn MutationBuffer>>,
+                ),
+            >::with_capacity(self.tables.n_ids());
             for stratum in self.deps.strata() {
+                // Initialize the write dependencies first.
                 for table in stratum.iter().copied() {
-                    tables_merging.insert(table, self.tables.unwrap_val(table));
+                    let mut bufs = DenseIdMap::default();
+                    for dep in self.deps.write_deps(table) {
+                        if let Some(info) = self.tables.get(dep) {
+                            bufs.insert(dep, info.table.new_buffer());
+                        }
+                    }
+                    tables_merging.insert(table, (None, bufs));
+                }
+                // Then initialize read dependencies (this two-phase structure is why we have an
+                // Option in the tables_merging map).
+                for table in stratum.iter().copied() {
+                    tables_merging[table].0 = Some(self.tables.unwrap_val(table));
                 }
                 let db = self.read_only_view();
                 changed |= tables_merging
                     .par_iter_mut()
-                    .map(|(_, info)| {
-                        info.table.merge(&mut ExecutionState {
+                    .map(|(_, (info, buffers))| {
+                        info.as_mut().unwrap().table.merge(&mut ExecutionState {
                             predicted: &predicted,
                             db,
-                            buffers: Default::default(),
+                            buffers: mem::take(buffers),
                         })
                     })
                     .max()
                     .unwrap_or(false);
-                for (id, table) in tables_merging.drain() {
-                    self.tables.insert(id, table);
+                for (id, (table, _)) in tables_merging.drain() {
+                    self.tables.insert(id, table.unwrap());
                 }
             }
             ever_changed |= changed;
@@ -373,7 +393,8 @@ impl Database {
     pub fn add_table<T: Table + Sized + 'static>(
         &mut self,
         table: T,
-        deps: impl IntoIterator<Item = TableId>,
+        read_deps: impl IntoIterator<Item = TableId>,
+        write_deps: impl IntoIterator<Item = TableId>,
     ) -> TableId {
         let spec = table.spec();
         let table = WrappedTable::new(table);
@@ -383,7 +404,7 @@ impl Database {
             indexes: Default::default(),
             column_indexes: Default::default(),
         });
-        self.deps.add_table(res, deps);
+        self.deps.add_table(res, read_deps, write_deps);
         res
     }
 

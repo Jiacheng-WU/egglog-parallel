@@ -17,6 +17,7 @@ fn main() {
             .build_global()
             .unwrap();
     }
+
     let mut egraph = EGraph::default();
     let int_prim = egraph.primitives_mut().get_ty::<i64>();
     let num_table = egraph.add_table(

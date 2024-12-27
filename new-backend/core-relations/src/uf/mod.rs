@@ -106,6 +106,12 @@ impl MutationBuffer for UfBuffer {
     fn stage_remove(&mut self, _: &[Value]) {
         panic!("attempting to remove data from a DisplacedTable")
     }
+    fn fresh_handle(&self) -> Box<dyn MutationBuffer> {
+        Box::new(UfBuffer {
+            to_insert: RowBuffer::new(self.to_insert.arity()),
+            buffered_writes: self.buffered_writes.clone(),
+        })
+    }
 }
 
 impl Table for DisplacedTable {

@@ -128,7 +128,7 @@ fn line_graph_1_test(strat: PlanStrategy) {
             false
         }
     });
-    let edges = db.add_table(edge_impl, iter::empty());
+    let edges = db.add_table(edge_impl, iter::empty(), iter::empty());
     let nodes = Vec::from_iter((0..10).map(Value::new));
     {
         let mut edge_buf = db.get_table(edges).new_buffer();
@@ -194,7 +194,7 @@ fn line_graph_2_test(strat: PlanStrategy) {
             false
         }
     });
-    let edges = db.add_table(edge_impl, iter::empty());
+    let edges = db.add_table(edge_impl, iter::empty(), iter::empty());
     let nodes = Vec::from_iter((0..10).map(Value::new));
     {
         let mut edge_buf = db.get_table_mut(edges).new_buffer();
@@ -822,7 +822,7 @@ struct MathEgraph {
 
 fn basic_math_egraph() -> MathEgraph {
     let mut db = Database::default();
-    let uf = db.add_table(DisplacedTable::default(), iter::empty());
+    let uf = db.add_table(DisplacedTable::default(), iter::empty(), iter::empty());
     let num_impl = SortedWritesTable::new(1, 3, Some(ColumnId::new(2)), move |state, a, b, res| {
         if a[1] != b[1] {
             // Mark the two ids as equal. Picking b[1] as the 'presumed winner'
@@ -835,7 +835,7 @@ fn basic_math_egraph() -> MathEgraph {
     });
 
     let id_counter = db.add_counter();
-    let num = db.add_table(num_impl, iter::once(uf));
+    let num = db.add_table(num_impl, iter::once(uf), iter::empty());
     let add_impl = SortedWritesTable::new(2, 4, Some(ColumnId::new(3)), move |state, a, b, res| {
         // Capture a backtrace as a string
         if a[2] != b[2] {
@@ -848,7 +848,7 @@ fn basic_math_egraph() -> MathEgraph {
         }
     });
 
-    let add = db.add_table(add_impl, iter::once(uf));
+    let add = db.add_table(add_impl, iter::once(uf), iter::empty());
 
     MathEgraph {
         uf,

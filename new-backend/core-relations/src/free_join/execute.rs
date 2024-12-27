@@ -195,7 +195,7 @@ impl Database {
                             let table = join_state.db.get_table(info.table);
                             binding_info.subsets.insert(id, table.all());
                         }
-                        join_state.run_plan(plan, 0, &mut binding_info, &mut action_buf);
+                        join_state.run_plan(plan, 0, 0, &mut binding_info, &mut action_buf);
                         if action_buf.needs_flush {
                             action_buf.flush(&mut ExecutionState {
                                 db: self.read_only_view(),
@@ -220,7 +220,7 @@ impl Database {
                     let table = join_state.db.get_table(info.table);
                     binding_info.subsets.insert(id, table.all());
                 }
-                join_state.run_plan(plan, 0, &mut binding_info, &mut action_buf);
+                join_state.run_plan(plan, 0, 0, &mut binding_info, &mut action_buf);
             }
             action_buf.flush(&mut ExecutionState {
                 db: self.read_only_view(),
@@ -282,43 +282,46 @@ impl<'a> JoinState<'a> {
                 .unwrap_or(false)
         });
         let whole_table = info.table.all();
-        let dyn_index = if all_cacheable
-            && subset.is_dense()
-            && whole_table.size() / 2 < subset.size()
-        {
-            // Skip intersecting with the subset if we are just looking at the
-            // whole table.
-            let intersect_outer =
-                !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
-            // heuristic: if the subset we are scanning is somewhat
-            // large _or_ it is most of the table, or we already have a cached
-            // index for it, then return it.
-            if cols.len() != 1 {
-                DynamicIndex::Cached {
-                    intersect_outer,
-                    table: get_index_from_tableinfo(info, &cols).clone(),
+        let dyn_index =
+            if all_cacheable && subset.is_dense() && whole_table.size() / 2 < subset.size() {
+                // Skip intersecting with the subset if we are just looking at the
+                // whole table.
+                let intersect_outer =
+                    !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
+                // heuristic: if the subset we are scanning is somewhat
+                // large _or_ it is most of the table, or we already have a cached
+                // index for it, then return it.
+                if cols.len() != 1 {
+                    DynamicIndex::Cached {
+                        intersect_outer,
+                        table: get_index_from_tableinfo(info, &cols).clone(),
+                    }
+                } else {
+                    DynamicIndex::CachedColumn {
+                        intersect_outer,
+                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
+                    }
                 }
+            } else if cols.len() != 1 {
+                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
             } else {
-                DynamicIndex::CachedColumn {
-                    intersect_outer,
-                    table: get_column_index_from_tableinfo(info, cols[0]).clone(),
-                }
-            }
-        } else if cols.len() != 1 {
-            DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
-        } else {
-            DynamicIndex::DynamicColumn(if subset.size() > 16 {
-                // NB: we could use the raw api here to avoid cloning the subset
-                // on a cache hit.
-                let res = self
-                    .index_cache
-                    .entry((cols[0], subset.clone()))
-                    .or_insert_with(|| Arc::new(info.table.group_by_col(subset.as_ref(), cols[0])));
-                res.value().clone()
-            } else {
-                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
-            })
-        };
+                DynamicIndex::DynamicColumn(if subset.size() > 16 {
+                    // NB: we could use the raw api here to avoid cloning the subset
+                    // on a cache hit.
+                    loop {
+                        if let Some(entry) = self.index_cache.try_entry((cols[0], subset.clone())) {
+                            let res = entry.or_insert_with(|| {
+                                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
+                            });
+                            break res.value().clone();
+                        } else {
+                            rayon::yield_now();
+                        }
+                    }
+                } else {
+                    Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
+                })
+            };
         Prober {
             subset,
             pool: with_pool_set(|ps| ps.get_pool().clone()),
@@ -339,6 +342,7 @@ impl<'a> JoinState<'a> {
         &self,
         plan: &'a Plan,
         cur: usize,
+        level: usize,
         binding_info: &mut BindingInfo,
         action_buf: &mut BUF,
     ) where
@@ -347,7 +351,7 @@ impl<'a> JoinState<'a> {
         if cur >= plan.stages.len() {
             return;
         }
-        let chunk_size = BUF::morsel_size(cur);
+        let chunk_size = BUF::morsel_size(level);
         // Helper macro (not its own method to appease the borrow checker).
         macro_rules! drain_updates {
             ($updates:expr) => {
@@ -358,7 +362,7 @@ impl<'a> JoinState<'a> {
                     for (atom, subset) in update.refinements.drain(..) {
                         binding_info.subsets.insert(atom, subset);
                     }
-                    self.run_plan(plan, cur + 1, binding_info, action_buf);
+                    self.run_plan(plan, cur + 1, level + 1, binding_info, action_buf);
                 }
             };
         }
@@ -388,7 +392,13 @@ impl<'a> JoinState<'a> {
                                 preds: predicted,
                                 index_cache,
                             }
-                            .run_plan(plan, cur + 1, binding_info, buf);
+                            .run_plan(
+                                plan,
+                                cur + 1,
+                                level + 1,
+                                binding_info,
+                                buf,
+                            );
                         }
                     },
                 );
@@ -401,7 +411,7 @@ impl<'a> JoinState<'a> {
                 }
                 let prev = binding_info.subsets.unwrap_val(*atom);
                 binding_info.subsets.insert(*atom, subset.clone());
-                self.run_plan(plan, cur + 1, binding_info, action_buf);
+                self.run_plan(plan, cur + 1, level, binding_info, action_buf);
                 binding_info.subsets.insert(*atom, prev);
             }
             JoinStage::Intersect { var, scans } => match scans.as_slice() {
@@ -763,7 +773,7 @@ impl Clear for FrameUpdate {
     }
 }
 
-const VAR_BATCH_SIZE: usize = 512;
+const VAR_BATCH_SIZE: usize = 128;
 
 /// A trait used to abstract over different ways of buffering actions together
 /// before running them.
@@ -806,8 +816,12 @@ trait ActionBuffer<'state>: Send {
     ///
     /// As of right now this is just a hard-coded value. We may change it in the
     /// future to fan out more at higher levels though.
-    fn morsel_size(_level: usize) -> usize {
-        1024
+    fn morsel_size(level: usize) -> usize {
+        match level {
+            0 => 64,
+            1 => 128,
+            _ => 1024,
+        }
     }
 }
 

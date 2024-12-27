@@ -170,11 +170,15 @@ pub struct ExecutionState<'a, T = DenseIdMap<TableId, TableInfo>> {
 
 impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
     pub fn new_handle(&self) -> ExecutionState<'a, T> {
-        ExecutionState {
+        let mut res = ExecutionState {
             predicted: self.predicted,
             db: self.db,
             buffers: DenseIdMap::new(),
+        };
+        for (id, buf) in self.buffers.iter() {
+            res.buffers.insert(id, buf.fresh_handle());
         }
+        res
     }
     pub fn stage_insert(&mut self, table: TableId, vals: &[Value]) {
         self.buffers

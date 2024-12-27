@@ -12,10 +12,11 @@ use std::{
 
 use fixedbitset::FixedBitSet;
 use hashbrown::HashTable;
+use numeric_id::DenseIdMap;
 
 use crate::{
     action::{Instr, PredictedVals},
-    common::{HashMap, HashSet, IndexMap, IndexSet, Value},
+    common::{HashMap, HashSet, IndexMap, IndexSet, ShardId, Value},
     free_join::execute::FrameUpdate,
     hash_index::{BufferedSubset, TableEntry},
     offsets::SortedOffsetVector,
@@ -329,6 +330,7 @@ pool_set! {
         frame_update_vecs: Vec<Pooled<FrameUpdate>>,
         tuple_indexes: HashTable<TableEntry<BufferedSubset>>,
         predicted_vals: PredictedVals,
+        shard_hist: DenseIdMap<ShardId, usize>,
     }
 }
 

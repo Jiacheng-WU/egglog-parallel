@@ -87,6 +87,20 @@ impl RowBuffer {
         self.n_columns
     }
 
+    pub(crate) fn raw_rows(&self) -> *const Value {
+        self.data.as_ptr() as *const Value
+    }
+
+    /// Blindly set the length of the RowBuffer to the given number of rows.
+    ///
+    /// # Safety
+    /// `count` must be within the capacity of the RowBuffer and the resized buffer must point to
+    /// initialized memory. (Analogous to [`Vec::set_len`]).
+    pub(crate) unsafe fn set_len(&mut self, count: usize) {
+        self.data.set_len(count * self.n_columns);
+        self.total_rows = count;
+    }
+
     /// Return an iterator over the non-stale rows in the buffer.
     pub(crate) fn non_stale(&self) -> impl Iterator<Item = &[Value]> {
         self.data

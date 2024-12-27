@@ -80,7 +80,7 @@ pub type Result<T> = std::result::Result<T, anyhow::Error>;
 impl Default for EGraph {
     fn default() -> Self {
         let mut db = Database::new();
-        let uf_table = db.add_table(DisplacedTable::default(), iter::empty());
+        let uf_table = db.add_table(DisplacedTable::default(), iter::empty(), iter::empty());
         EGraph::create_internal(db, uf_table, false)
     }
 }
@@ -93,7 +93,11 @@ impl EGraph {
     /// came to appera.
     pub fn with_tracing() -> EGraph {
         let mut db = Database::new();
-        let uf_table = db.add_table(DisplacedTableWithProvenance::default(), iter::empty());
+        let uf_table = db.add_table(
+            DisplacedTableWithProvenance::default(),
+            iter::empty(),
+            iter::empty(),
+        );
         EGraph::create_internal(db, uf_table, true)
     }
 
@@ -167,7 +171,7 @@ impl EGraph {
                     None,
                     |_, _, _, _| false,
                 );
-                let table_id = self.db.add_table(table, iter::empty());
+                let table_id = self.db.add_table(table, iter::empty(), iter::empty());
                 *v.insert(table_id)
             }
         }
@@ -184,7 +188,7 @@ impl EGraph {
                     None,
                     |_, _, _, _| false,
                 );
-                let table_id = self.db.add_table(table, iter::empty());
+                let table_id = self.db.add_table(table, iter::empty(), iter::empty());
                 *v.insert(table_id)
             }
         }
@@ -483,9 +487,10 @@ impl EGraph {
         let uf_table = self.uf_table;
         let tracing = self.tracing;
         let next_func_id = self.funcs.next_id();
-        let mut deps = SmallVec::<[TableId; 2]>::new();
+        let mut read_deps = SmallVec::<[TableId; 2]>::new();
+        let mut write_deps = SmallVec::<[TableId; 2]>::new();
         if !tracing {
-            deps.push(uf_table);
+            write_deps.push(uf_table);
         }
         let table = match merge {
             MergeFn::UnionId => {
@@ -553,7 +558,8 @@ impl EGraph {
                 }
             }
             MergeFn::Table(merge_table) => {
-                deps.push(merge_table);
+                read_deps.push(merge_table);
+                write_deps.push(merge_table);
                 let id_counter = self.id_counter;
                 SortedWritesTable::new(
                     n_args,
@@ -598,7 +604,9 @@ impl EGraph {
                 )
             }
         };
-        let table_id = self.db.add_table(table, deps.iter().copied());
+        let table_id =
+            self.db
+                .add_table(table, read_deps.iter().copied(), write_deps.iter().copied());
         let res = self.funcs.push(FunctionInfo {
             table: table_id,
             schema: schema.clone(),
@@ -661,7 +669,7 @@ impl EGraph {
                         val: last_rebuilt_at.to_value(),
                     }),
                 );
-                if incremental_rebuild(uf_size, table_size) {
+                if incremental_rebuild(uf_size, table_size, false) {
                     marker_incremental_rebuild(|| -> Result<()> {
                         // Run each of the incremental rules serially.
                         //
@@ -737,7 +745,7 @@ impl EGraph {
                         val: last_rebuilt_at.to_value(),
                     }),
                 );
-                if incremental_rebuild(uf_size, table_size) {
+                if incremental_rebuild(uf_size, table_size, true) {
                     for (i, _) in info.incremental_rebuild_rules.iter().enumerate() {
                         state.incremental.get_or_default(i).push(func);
                     }
@@ -947,6 +955,10 @@ enum ProofReconstructionError {
 
 /// Heuristic for deciding whether to do an incremental or nonincremental
 /// rebuild for a given table.
-fn incremental_rebuild(uf_size: usize, table_size: usize) -> bool {
-    uf_size <= (table_size / 8)
+fn incremental_rebuild(uf_size: usize, table_size: usize, parallel: bool) -> bool {
+    if parallel {
+        uf_size <= (table_size / 16)
+    } else {
+        uf_size <= (table_size / 8)
+    }
 }
