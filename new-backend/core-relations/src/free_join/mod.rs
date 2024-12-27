@@ -33,6 +33,7 @@ use crate::action::{ExecutionState, PredictedVals};
 
 pub(crate) mod execute;
 pub(crate) mod plan;
+mod work_tracking;
 
 define_id!(
     pub(crate) AtomId,

@@ -21,7 +21,9 @@ use crate::{
 use super::{
     get_column_index_from_tableinfo,
     plan::{JoinStage, Plan},
-    with_pool_set, ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
+    with_pool_set,
+    work_tracking::{self, MorselSize},
+    ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
 };
 
 enum DynamicIndex {
@@ -348,7 +350,7 @@ impl<'a> JoinState<'a> {
         if cur >= plan.stages.len() {
             return;
         }
-        let chunk_size = BUF::morsel_size(level);
+        let chunk_size = action_buf.morsel_size(level);
         // Helper macro (not its own method to appease the borrow checker).
         macro_rules! drain_updates {
             ($updates:expr) => {
@@ -813,12 +815,8 @@ trait ActionBuffer<'state>: Send {
     ///
     /// As of right now this is just a hard-coded value. We may change it in the
     /// future to fan out more at higher levels though.
-    fn morsel_size(level: usize) -> usize {
-        match level {
-            0 => 32,
-            1 => 256,
-            _ => 1024,
-        }
+    fn morsel_size(&mut self, _level: usize) -> usize {
+        1024
     }
 }
 
@@ -877,6 +875,7 @@ struct ScopedActionBuffer<'inner, 'scope> {
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
     needs_flush: bool,
+    cur_morsel_size: MorselSize,
 }
 
 impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
@@ -886,6 +885,7 @@ impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
             rule_set,
             batches: Default::default(),
             needs_flush: false,
+            cur_morsel_size: MorselSize::new(1024),
         }
     }
 }
@@ -916,8 +916,10 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
             let mut bindings = mem::take(&mut action_state.bindings);
             action_state.len = 0;
             let rule_set = self.rule_set;
+            work_tracking::enter_work();
             self.scope.spawn(move |_| {
                 state.run_instrs(&rule_set.actions[action], &mut bindings);
+                work_tracking::exit_work();
             });
         }
     }
@@ -933,19 +935,26 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
         work: impl for<'a> FnOnce(&mut Local, &mut ScopedActionBuffer<'a, 'scope>) + Send + 'scope,
     ) {
         let rule_set = self.rule_set;
+        let cur_morsel_size = self.cur_morsel_size.clone();
         let mut inner = local.clone();
+        work_tracking::enter_work();
         self.scope.spawn(move |scope| {
             let mut buf: ScopedActionBuffer<'_, 'scope> = ScopedActionBuffer {
                 scope,
                 rule_set,
                 needs_flush: false,
                 batches: Default::default(),
+                cur_morsel_size,
             };
             work(&mut inner, &mut buf);
             if buf.needs_flush {
                 flush_action_states(&mut to_exec_state(), &mut buf.batches, buf.rule_set);
             }
+            work_tracking::exit_work();
         });
+    }
+    fn morsel_size(&mut self, _level: usize) -> usize {
+        self.cur_morsel_size.get()
     }
 }
 
