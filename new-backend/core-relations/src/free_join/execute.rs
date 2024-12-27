@@ -282,46 +282,43 @@ impl<'a> JoinState<'a> {
                 .unwrap_or(false)
         });
         let whole_table = info.table.all();
-        let dyn_index =
-            if all_cacheable && subset.is_dense() && whole_table.size() / 2 < subset.size() {
-                // Skip intersecting with the subset if we are just looking at the
-                // whole table.
-                let intersect_outer =
-                    !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
-                // heuristic: if the subset we are scanning is somewhat
-                // large _or_ it is most of the table, or we already have a cached
-                // index for it, then return it.
-                if cols.len() != 1 {
-                    DynamicIndex::Cached {
-                        intersect_outer,
-                        table: get_index_from_tableinfo(info, &cols).clone(),
-                    }
-                } else {
-                    DynamicIndex::CachedColumn {
-                        intersect_outer,
-                        table: get_column_index_from_tableinfo(info, cols[0]).clone(),
-                    }
+        let dyn_index = if all_cacheable
+            && subset.is_dense()
+            && whole_table.size() / 2 < subset.size()
+        {
+            // Skip intersecting with the subset if we are just looking at the
+            // whole table.
+            let intersect_outer =
+                !(whole_table.is_dense() && subset.bounds() == whole_table.bounds());
+            // heuristic: if the subset we are scanning is somewhat
+            // large _or_ it is most of the table, or we already have a cached
+            // index for it, then return it.
+            if cols.len() != 1 {
+                DynamicIndex::Cached {
+                    intersect_outer,
+                    table: get_index_from_tableinfo(info, &cols).clone(),
                 }
-            } else if cols.len() != 1 {
-                DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
             } else {
-                DynamicIndex::DynamicColumn(if subset.size() > 16 {
-                    // NB: we could use the raw api here to avoid cloning the subset
-                    // on a cache hit.
-                    loop {
-                        if let Some(entry) = self.index_cache.try_entry((cols[0], subset.clone())) {
-                            let res = entry.or_insert_with(|| {
-                                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
-                            });
-                            break res.value().clone();
-                        } else {
-                            rayon::yield_now();
-                        }
-                    }
-                } else {
-                    Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
-                })
-            };
+                DynamicIndex::CachedColumn {
+                    intersect_outer,
+                    table: get_column_index_from_tableinfo(info, cols[0]).clone(),
+                }
+            }
+        } else if cols.len() != 1 {
+            DynamicIndex::Dynamic(info.table.group_by_key(subset.as_ref(), &cols))
+        } else {
+            DynamicIndex::DynamicColumn(if subset.size() > 16 {
+                // NB: we could use the raw api here to avoid cloning the subset
+                // on a cache hit.
+                let entry = self.index_cache.entry((cols[0], subset.clone()));
+                entry
+                    .or_insert_with(|| Arc::new(info.table.group_by_col(subset.as_ref(), cols[0])))
+                    .value()
+                    .clone()
+            } else {
+                Arc::new(info.table.group_by_col(subset.as_ref(), cols[0]))
+            })
+        };
         Prober {
             subset,
             pool: with_pool_set(|ps| ps.get_pool().clone()),
@@ -818,8 +815,8 @@ trait ActionBuffer<'state>: Send {
     /// future to fan out more at higher levels though.
     fn morsel_size(level: usize) -> usize {
         match level {
-            0 => 64,
-            1 => 128,
+            0 => 32,
+            1 => 256,
             _ => 1024,
         }
     }

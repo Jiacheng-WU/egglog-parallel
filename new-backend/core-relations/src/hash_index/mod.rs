@@ -7,6 +7,7 @@ use std::{
 
 use hashbrown::HashTable;
 use numeric_id::{define_id, IdVec, NumericId};
+use once_cell::sync::Lazy;
 use parallel_buffer::{FreeList, ParallelSubsetBuffer};
 use rayon::iter::ParallelIterator;
 use rustc_hash::FxHasher;
@@ -285,41 +286,45 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
                 queues[shard_id].lock().unwrap().push((first, buf));
             }
         };
-        rayon::scope(|scope| {
-            let mut cur = Offset::new(0);
-            loop {
-                let mut buf = TaggedRowBuffer::new(1);
-                if let Some(next) = table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
-                {
-                    cur = next;
-                    scope.spawn(move |_| split_buf(buf));
-                } else {
-                    scope.spawn(move |_| split_buf(buf));
-                    break;
+
+        THREAD_POOL.install(|| {
+            rayon::scope(|scope| {
+                let mut cur = Offset::new(0);
+                loop {
+                    let mut buf = TaggedRowBuffer::new(1);
+                    if let Some(next) =
+                        table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
+                    {
+                        cur = next;
+                        scope.spawn(move |_| split_buf(buf));
+                    } else {
+                        scope.spawn(move |_| split_buf(buf));
+                        break;
+                    }
                 }
-            }
-        });
-        let subsets = &self.subsets;
-        self.table.par_iter_mut().for_each(|(shard_id, shard)| {
-            use indexmap::map::Entry;
-            // Sort the vector by start row id to ensure we populate subsets in sorted order.
-            let mut vec = queues[shard_id].lock().unwrap();
-            vec.sort_by_key(|(start, _)| *start);
-            for (_, buf) in vec.drain(..) {
-                for (row_id, key) in buf.iter_non_stale() {
-                    match shard.entry(key[0]) {
-                        Entry::Occupied(mut occ) => {
-                            // SAFETY: all of the buffered vectors in this map come from `subsets`.
-                            unsafe {
-                                occ.get_mut().add_row_sorted_parallel(row_id, subsets);
+            });
+            let subsets = &self.subsets;
+            self.table.par_iter_mut().for_each(|(shard_id, shard)| {
+                use indexmap::map::Entry;
+                // Sort the vector by start row id to ensure we populate subsets in sorted order.
+                let mut vec = queues[shard_id].lock().unwrap();
+                vec.sort_by_key(|(start, _)| *start);
+                for (_, buf) in vec.drain(..) {
+                    for (row_id, key) in buf.iter_non_stale() {
+                        match shard.entry(key[0]) {
+                            Entry::Occupied(mut occ) => {
+                                // SAFETY: all of the buffered vectors in this map come from `subsets`.
+                                unsafe {
+                                    occ.get_mut().add_row_sorted_parallel(row_id, subsets);
+                                }
                             }
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(BufferedSubset::singleton(row_id));
+                            Entry::Vacant(v) => {
+                                v.insert(BufferedSubset::singleton(row_id));
+                            }
                         }
                     }
                 }
-            }
+            });
         });
     }
 }
@@ -366,54 +371,57 @@ impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
                 queues[shard_id].lock().unwrap().push((first, buf));
             }
         };
-        rayon::scope(|scope| {
-            let mut cur = Offset::new(0);
-            loop {
-                let mut buf = TaggedRowBuffer::new(cols.len());
-                if let Some(next) = table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
-                {
-                    cur = next;
-                    scope.spawn(move |_| split_buf(buf));
-                } else {
-                    scope.spawn(move |_| split_buf(buf));
-                    break;
+        THREAD_POOL.install(|| {
+            rayon::scope(|scope| {
+                let mut cur = Offset::new(0);
+                loop {
+                    let mut buf = TaggedRowBuffer::new(cols.len());
+                    if let Some(next) =
+                        table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
+                    {
+                        cur = next;
+                        scope.spawn(move |_| split_buf(buf));
+                    } else {
+                        scope.spawn(move |_| split_buf(buf));
+                        break;
+                    }
                 }
-            }
-        });
-        self.table.par_iter_mut().for_each(|(shard_id, shard)| {
-            use hashbrown::hash_table::Entry;
-            // Sort the vector by start row id to ensure we populate subsets in sorted order.
-            let mut vec = queues[shard_id].lock().unwrap();
-            vec.sort_by_key(|(start, _)| *start);
-            for (_, buf) in vec.drain(..) {
-                for (row_id, key) in buf.iter_non_stale() {
-                    let hash = hash_key(key);
-                    let table_entry = shard.table.entry(
-                        hash,
-                        |entry| entry.hash == hash && shard.keys.get_row(entry.key) == key,
-                        |ent| ent.hash,
-                    );
-                    match table_entry {
-                        Entry::Occupied(mut occ) => {
-                            // SAFETY: everything in `table_entry` comes from `vals`.
-                            unsafe {
-                                occ.get_mut()
-                                    .vals
-                                    .add_row_sorted_parallel(row_id, &self.subsets);
+            });
+            self.table.par_iter_mut().for_each(|(shard_id, shard)| {
+                use hashbrown::hash_table::Entry;
+                // Sort the vector by start row id to ensure we populate subsets in sorted order.
+                let mut vec = queues[shard_id].lock().unwrap();
+                vec.sort_by_key(|(start, _)| *start);
+                for (_, buf) in vec.drain(..) {
+                    for (row_id, key) in buf.iter_non_stale() {
+                        let hash = hash_key(key);
+                        let table_entry = shard.table.entry(
+                            hash,
+                            |entry| entry.hash == hash && shard.keys.get_row(entry.key) == key,
+                            |ent| ent.hash,
+                        );
+                        match table_entry {
+                            Entry::Occupied(mut occ) => {
+                                // SAFETY: everything in `table_entry` comes from `vals`.
+                                unsafe {
+                                    occ.get_mut()
+                                        .vals
+                                        .add_row_sorted_parallel(row_id, &self.subsets);
+                                }
                             }
-                        }
-                        Entry::Vacant(v) => {
-                            let key_id = shard.keys.add_row(key);
-                            let subset = BufferedSubset::singleton(row_id);
-                            v.insert(TableEntry {
-                                hash,
-                                key: key_id,
-                                vals: subset,
-                            });
+                            Entry::Vacant(v) => {
+                                let key_id = shard.keys.add_row(key);
+                                let subset = BufferedSubset::singleton(row_id);
+                                v.insert(TableEntry {
+                                    hash,
+                                    key: key_id,
+                                    vals: subset,
+                                });
+                            }
                         }
                     }
                 }
-            }
+            });
         });
     }
 }
@@ -742,3 +750,17 @@ fn do_parallel(_workload_size: usize) -> bool {
         rayon::current_num_threads() > 1 && _workload_size > 20_000
     }
 }
+
+/// A thread pool specifically for parallel hash index construction.
+///
+/// We use a separate thread pool here because callers can construct an index under a lock,
+/// and we do not want to take a long-running lock in the global thread pool without another
+/// way to get parallelism.
+///
+/// Earlier solutions using rayon::yield_now() were unreliable.
+static THREAD_POOL: Lazy<rayon::ThreadPool> = Lazy::new(|| {
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(rayon::current_num_threads())
+        .build()
+        .unwrap()
+});
