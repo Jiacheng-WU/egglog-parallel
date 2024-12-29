@@ -4,7 +4,7 @@
 //! that scales better than work stealing for the kinds of work done in the main FJ loop in
 //! `core-relations`.
 
-use std::{cell::Cell, thread};
+use std::{cell::Cell, sync::Mutex, thread};
 
 use crossbeam_channel::{Receiver, Sender};
 use waitgroup::WaitGroup;
@@ -25,6 +25,16 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub fn new(n_threads: usize, on_exit: impl Fn() + Clone + Send + 'static) -> ThreadPool {
         let (sender, recvr) = crossbeam_channel::unbounded::<Work>();
+        {
+            let recvr = recvr.clone();
+            thread::spawn(move || {
+                let todo_remove = 1;
+                loop {
+                    thread::sleep(std::time::Duration::from_millis(500));
+                    eprintln!("pending work={}", recvr.len());
+                }
+            });
+        }
         for _ in 0..n_threads {
             let on_exit = on_exit.clone();
             let recvr = recvr.clone();
@@ -104,7 +114,7 @@ fn _test() {}
 pub struct Scope<'outer> {
     wg: WaitGroup,
     tp: &'outer ThreadPool,
-    _marker: std::marker::PhantomData<Cell<&'outer mut ()>>,
+    _marker: std::marker::PhantomData<Mutex<&'outer mut ()>>,
 }
 
 impl<'outer> Scope<'outer> {

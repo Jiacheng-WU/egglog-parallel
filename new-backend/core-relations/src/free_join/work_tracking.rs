@@ -14,10 +14,12 @@ use std::{
 use once_cell::sync::Lazy;
 
 static TARGET: Lazy<isize> = Lazy::new(|| {
-    (std::thread::available_parallelism()
-        .map(|x| x.get())
-        .unwrap_or(1)
-        * 2) as isize
+    let todo_revert = 1;
+    1024
+    // (std::thread::available_parallelism()
+    //     .map(|x| x.get())
+    //     .unwrap_or(1)
+    //     * 2) as isize
 });
 static OUTSTANDING_WORK: AtomicIsize = AtomicIsize::new(0);
 
@@ -58,13 +60,13 @@ impl MorselSize {
         let gain = match get_direction() {
             Direction::Increase => 1.2f64,
             Direction::Same => 1.0f64,
-            Direction::Decrease => 0.9f64,
+            Direction::Decrease => 0.85f64,
         };
         let cur = self.0.load(Ordering::Relaxed);
 
         let mut next = (cur as f64 * gain) as usize;
         next = cmp::max(next, 8);
-        next = cmp::min(next, 2048);
+        next = cmp::min(next, 512);
 
         self.0.store(next, Ordering::Relaxed);
         next

@@ -957,6 +957,7 @@ enum ProofReconstructionError {
 /// rebuild for a given table.
 fn incremental_rebuild(uf_size: usize, table_size: usize, parallel: bool) -> bool {
     if parallel {
+        let todo_revert = 1;
         uf_size <= (table_size / 16)
     } else {
         uf_size <= (table_size / 8)

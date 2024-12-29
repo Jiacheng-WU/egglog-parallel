@@ -436,12 +436,18 @@ impl Table for SortedWritesTable {
     }
 
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
+        let start = std::time::Instant::now();
         let mut changed = false;
 
         // First: handle the removals.
         changed |= self.do_delete();
         changed |= self.do_insert(exec_state);
         self.maybe_rehash();
+        let elapsed = start.elapsed();
+        let todo_remove = eprintln!(
+            "merge finished, took {elapsed:?} / {}",
+            elapsed.as_secs_f64()
+        );
         changed
     }
 

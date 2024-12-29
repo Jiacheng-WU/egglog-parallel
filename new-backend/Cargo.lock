@@ -195,6 +195,7 @@ dependencies = [
  "log",
  "numeric-id",
  "once_cell",
+ "parallelism",
  "petgraph",
  "rand",
  "rayon",

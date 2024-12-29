@@ -3,6 +3,7 @@
 use std::{iter, mem, sync::Arc};
 
 use numeric_id::{DenseIdMap, NumericId};
+use once_cell::sync::Lazy;
 use smallvec::SmallVec;
 
 use crate::{
@@ -186,8 +187,13 @@ impl Database {
         let index_cache = IndexCache::default();
 
         if do_parallel() {
+            let start = std::time::Instant::now();
+            let todo_remove = eprintln!(
+                "running ruleset! [{:?}]",
+                Vec::from_iter(rule_set.plans.iter().map(|(_, desc)| desc))
+            );
             self.update_cached_indexes();
-            rayon::in_place_scope(|scope| {
+            THREAD_POOL.scope(|scope| {
                 for (plan, _) in &rule_set.plans {
                     scope.spawn(|scope| {
                         let join_state = JoinState::new(self, &preds, &index_cache);
@@ -207,7 +213,12 @@ impl Database {
                         }
                     });
                 }
-            })
+            });
+            let elapsed = start.elapsed();
+            let todo_remove = eprintln!(
+                "ruleset finished, took {elapsed:?} / {}",
+                elapsed.as_secs_f64()
+            );
         } else {
             let join_state = JoinState::new(self, &preds, &index_cache);
             // Just run all of the plans in order with a single in-place action
@@ -354,14 +365,18 @@ impl<'a> JoinState<'a> {
         // Helper macro (not its own method to appease the borrow checker).
         macro_rules! drain_updates {
             ($updates:expr) => {
-                for mut update in $updates.drain(..) {
-                    for (var, val) in update.bindings.drain(..) {
-                        binding_info.bindings.insert(var, val);
+                if level == 0 || level == 1 {
+                    drain_updates_parallel!($updates)
+                } else {
+                    for mut update in $updates.drain(..) {
+                        for (var, val) in update.bindings.drain(..) {
+                            binding_info.bindings.insert(var, val);
+                        }
+                        for (atom, subset) in update.refinements.drain(..) {
+                            binding_info.subsets.insert(atom, subset);
+                        }
+                        self.run_plan(plan, cur + 1, level + 1, binding_info, action_buf);
                     }
-                    for (atom, subset) in update.refinements.drain(..) {
-                        binding_info.subsets.insert(atom, subset);
-                    }
-                    self.run_plan(plan, cur + 1, level + 1, binding_info, action_buf);
                 }
             };
         }
@@ -772,7 +787,7 @@ impl Clear for FrameUpdate {
     }
 }
 
-const VAR_BATCH_SIZE: usize = 128;
+const VAR_BATCH_SIZE: usize = 256;
 
 /// A trait used to abstract over different ways of buffering actions together
 /// before running them.
@@ -871,7 +886,7 @@ impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
 
 /// An Action buffer that hands off batches to of actions to rayon to execute.
 struct ScopedActionBuffer<'inner, 'scope> {
-    scope: &'inner rayon::Scope<'scope>,
+    scope: &'inner parallelism::Scope<'scope>,
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
     needs_flush: bool,
@@ -879,13 +894,13 @@ struct ScopedActionBuffer<'inner, 'scope> {
 }
 
 impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
-    fn new(scope: &'inner rayon::Scope<'scope>, rule_set: &'scope RuleSet) -> Self {
+    fn new(scope: &'inner parallelism::Scope<'scope>, rule_set: &'scope RuleSet) -> Self {
         Self {
             scope,
             rule_set,
             batches: Default::default(),
             needs_flush: false,
-            cur_morsel_size: MorselSize::new(1024),
+            cur_morsel_size: MorselSize::new(128),
         }
     }
 }
@@ -971,3 +986,9 @@ fn flush_action_states(
         }
     }
 }
+
+static THREAD_POOL: Lazy<parallelism::ThreadPool> = Lazy::new(|| {
+    parallelism::ThreadPool::new(rayon::current_num_threads(), || {
+        with_pool_set(PoolSet::clear)
+    })
+});
