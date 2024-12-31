@@ -13,14 +13,7 @@ pub(crate) struct ShardedHashTable<T> {
 
 impl<T> Default for ShardedHashTable<T> {
     fn default() -> Self {
-        if rayon::current_num_threads() == 1 {
-            Self::with_shards(1)
-        } else {
-            // When running parallel inserts, we want to ensure that we have more shards than the
-            // current number of rayon threads, otherwise we've noticed some instability / poor
-            // performance.
-            Self::with_shards(rayon::current_num_threads() * 2)
-        }
+        Self::with_shards(rayon::current_num_threads())
     }
 }
 
