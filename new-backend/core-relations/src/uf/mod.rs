@@ -18,9 +18,10 @@ use crate::{
     pool::with_pool_set,
     row_buffer::RowBuffer,
     table_spec::{
-        ColumnId, Constraint, Generation, MutationBuffer, Offset, Row, Table, TableSpec,
-        TableVersion,
+        ColumnId, Constraint, Generation, MutationBuffer, Offset, Rewriter, Row, Table, TableSpec,
+        TableVersion, WrappedTableRef,
     },
+    TaggedRowBuffer,
 };
 
 #[cfg(test)]
@@ -58,6 +59,130 @@ pub struct DisplacedTable {
     changed: bool,
     lookup_table: HashMap<Value, RowId>,
     buffered_writes: Arc<SegQueue<RowBuffer>>,
+}
+
+struct Canonicalizer<'a> {
+    cols: Vec<ColumnId>,
+    table: &'a DisplacedTable,
+}
+
+impl Rewriter for Canonicalizer<'_> {
+    fn hint_col(&self) -> Option<ColumnId> {
+        Some(ColumnId::new(0))
+    }
+    fn rewrite_slice(
+        &self,
+        buf: &RowBuffer,
+        start: RowId,
+        end: RowId,
+        out: &mut TaggedRowBuffer,
+        _exec_state: &mut ExecutionState,
+    ) {
+        if start >= end {
+            return;
+        }
+        assert!(end.index() <= buf.len());
+        let mut cur = start;
+        let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
+        // SAFETY: `cur` is always in-bounds, guaranteed by the above assertion.
+        let todo_cleanup = 1;
+        match self.cols.as_slice() {
+            [c] => {
+                while cur < end {
+                    let row = unsafe { buf.get_row_unchecked(cur) };
+                    let to_canon = row[c.index()];
+                    let canon = self.table.uf.find_naive(to_canon);
+                    if canon != to_canon {
+                        scratch.extend_from_slice(row);
+                        scratch[c.index()] = canon;
+                        out.add_row(cur, &scratch);
+                        scratch.clear();
+                    }
+                    cur = cur.inc();
+                }
+            }
+            [c1, c2] => {
+                while cur < end {
+                    let row = unsafe { buf.get_row_unchecked(cur) };
+                    let v1 = row[c1.index()];
+                    let v2 = row[c2.index()];
+                    let ca1 = self.table.uf.find_naive(v1);
+                    let ca2 = self.table.uf.find_naive(v2);
+                    if ca1 != v1 || ca2 != v2 {
+                        scratch.extend_from_slice(row);
+                        scratch[c1.index()] = ca1;
+                        scratch[c2.index()] = ca2;
+                        out.add_row(cur, &scratch);
+                        scratch.clear();
+                    }
+                    cur = cur.inc();
+                }
+            }
+            [c1, c2, c3] => {
+                while cur < end {
+                    let row = unsafe { buf.get_row_unchecked(cur) };
+                    let v1 = row[c1.index()];
+                    let v2 = row[c2.index()];
+                    let v3 = row[c3.index()];
+                    let ca1 = self.table.uf.find_naive(v1);
+                    let ca2 = self.table.uf.find_naive(v2);
+                    let ca3 = self.table.uf.find_naive(v3);
+                    if ca1 != v1 || ca2 != v2 || ca3 != v3 {
+                        scratch.extend_from_slice(row);
+                        scratch[c1.index()] = ca1;
+                        scratch[c2.index()] = ca2;
+                        scratch[c3.index()] = ca3;
+                        out.add_row(cur, &scratch);
+                        scratch.clear();
+                    }
+                    cur = cur.inc();
+                }
+            }
+            cs => {
+                while cur < end {
+                    scratch.extend_from_slice(unsafe { buf.get_row_unchecked(cur) });
+                    let mut changed = false;
+                    for c in cs {
+                        let to_canon = scratch[c.index()];
+                        let canon = self.table.uf.find_naive(to_canon);
+                        scratch[c.index()] = canon;
+                        changed |= canon != to_canon;
+                    }
+                    if changed {
+                        out.add_row(cur, &scratch);
+                    }
+                    scratch.clear();
+                    cur = cur.inc();
+                }
+            }
+        }
+    }
+
+    /// Rewrite am arbitrary subset of the table.
+    fn rewrite_subset(
+        &self,
+        other: WrappedTableRef,
+        subset: SubsetRef,
+        out: &mut TaggedRowBuffer,
+        _exec_state: &mut ExecutionState,
+    ) {
+        let _next = other.scan_bounded(subset, Offset::new(0), usize::MAX, out);
+        debug_assert!(_next.is_none());
+        for i in 0..u32::try_from(out.len()).expect("row buffer sizes should fit in a u32") {
+            let i = RowId::new(i);
+            let (_id, row) = out.get_row_mut(i);
+            let mut changed = false;
+            for col in &self.cols {
+                let to_canon = row[col.index()];
+                let canon = self.table.uf.find_naive(to_canon);
+                changed |= canon != to_canon;
+                row[col.index()] = canon;
+            }
+            if !changed {
+                out.set_stale(i);
+            }
+        }
+    }
 }
 
 impl Default for DisplacedTable {
@@ -131,6 +256,13 @@ impl Table for DisplacedTable {
             uncacheable_columns,
             allows_delete: false,
         }
+    }
+
+    fn rewriter<'a>(&'a self, cols: &[ColumnId]) -> Option<Box<dyn Rewriter + 'a>> {
+        Some(Box::new(Canonicalizer {
+            cols: cols.to_vec(),
+            table: self,
+        }))
     }
 
     fn clear(&mut self) {

@@ -23,8 +23,8 @@ use crate::{
     hash_index::{ColumnIndex, IndexBase, TupleIndex},
     offsets::{RowId, Subset, SubsetRef},
     pool::{with_pool_set, PoolSet, Pooled},
-    row_buffer::TaggedRowBuffer,
-    QueryEntry, Variable,
+    row_buffer::{RowBuffer, TaggedRowBuffer},
+    QueryEntry, TableId, Variable,
 };
 
 define_id!(pub ColumnId, u32, "a particular column in a table");
@@ -92,6 +92,37 @@ pub enum Constraint {
     GeConst { col: ColumnId, val: Value },
 }
 
+/// Custom functions used for tables that encode a bulk value-level rewrites of other tables.
+///
+/// The initial use-case for this trait is to support optimized implementations of rebuilding,
+/// where Rewriter is implemented as a Union-find.
+///
+/// Value-level rewrites are difficult to implement efficiently using rules as they require
+/// searching for changes to any column for a table: while it is possible to do, implementing this
+/// custom is more efficient in the case of rebuilding.
+pub trait Rewriter: Send + Sync {
+    /// The column that contains values that should be rewritten. If this is set, callers can use
+    /// this functionality to perform rewrites incrementally.
+    fn hint_col(&self) -> Option<ColumnId>;
+    /// Rewrite a contiguous slice of rows in the table.
+    fn rewrite_slice(
+        &self,
+        buf: &RowBuffer,
+        start: RowId,
+        end: RowId,
+        out: &mut TaggedRowBuffer,
+        exec_state: &mut ExecutionState,
+    );
+    /// Rewrite am arbitrary subset of the table.
+    fn rewrite_subset(
+        &self,
+        other: WrappedTableRef,
+        subset: SubsetRef,
+        out: &mut TaggedRowBuffer,
+        exec_state: &mut ExecutionState,
+    );
+}
+
 /// A row in a table.
 pub struct Row {
     /// The id associated with the row.
@@ -105,6 +136,27 @@ pub trait Table: Any + Send + Sync {
     /// A variant of clone that returns a boxed trait object; this trait object
     /// must contain all of the data associated with the current table.
     fn dyn_clone(&self) -> Box<dyn Table>;
+
+    /// If this table can perform a table-level rewrite, construct a [`Rewriter`] for it.
+    fn rewriter<'a>(&'a self, _cols: &[ColumnId]) -> Option<Box<dyn Rewriter + 'a>> {
+        None
+    }
+
+    /// Apply a rewrite to the table according to the given rewriter implemented by `table`, if
+    /// there is one. Applying a rewrite can cause more mutations to be buffered, which can in turn
+    /// be flushed by a call to [`Table::merge`].
+    ///
+    /// Note that value-level rewrites are only relevant for tables that opt into it. As a result,
+    /// tables do nothing by default.
+    fn apply_rewrite(
+        &mut self,
+        _table_id: TableId,
+        _table: &WrappedTable,
+        _next_ts: Value,
+        _exec_state: &mut ExecutionState,
+    ) {
+        // Default implementation does nothing.
+    }
 
     /// A boilerplate method to make it easier to downcast values of `Table`.
     ///
@@ -305,7 +357,7 @@ impl<T: Table> TableWrapper for WrapperImpl<T> {
         let table = table.as_any().downcast_ref::<T>().unwrap();
         let mut res = ColumnIndex::new();
         table.scan_generic(subset, |row_id, row| {
-            res.add_row(&row[col.index()], row_id);
+            res.add_row(&[row[col.index()]], row_id);
         });
         res
     }
@@ -509,6 +561,13 @@ impl WrappedTable {
         }
     }
 
+    pub(crate) fn as_ref(&self) -> WrappedTableRef {
+        WrappedTableRef {
+            inner: &*self.inner,
+            wrapper: &*self.wrapper,
+        }
+    }
+
     /// Starting at the given [`Offset`] into `subset`, scan up to `n` rows and
     /// write them to `out`. Return the next starting offset. If no offset is
     /// returned then the subset has been scanned completely.
@@ -519,18 +578,17 @@ impl WrappedTable {
         n: usize,
         out: &mut TaggedRowBuffer,
     ) -> Option<Offset> {
-        self.wrapper
-            .scan_bounded(&*self.inner, subset, start, n, out)
+        self.as_ref().scan_bounded(subset, start, n, out)
     }
 
     /// Group the contents of the given subset by the given column.
     pub(crate) fn group_by_col(&self, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
-        self.wrapper.group_by_col(&*self.inner, subset, col)
+        self.as_ref().group_by_col(subset, col)
     }
 
     /// A multi-column vairant of [`WrappedTable::group_by_col`].
     pub(crate) fn group_by_key(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
-        self.wrapper.group_by_key(&*self.inner, subset, cols)
+        self.as_ref().group_by_key(subset, cols)
     }
 
     /// A variant fo [`WrappedTable::scan_bounded`] that projects a subset of
@@ -544,13 +602,12 @@ impl WrappedTable {
         cs: &[Constraint],
         out: &mut TaggedRowBuffer,
     ) -> Option<Offset> {
-        self.wrapper
-            .scan_project(&*self.inner, subset, cols, start, n, cs, out)
+        self.as_ref().scan_project(subset, cols, start, n, cs, out)
     }
 
     /// Return the contents of the subset as a [`TaggedRowBuffer`].
     pub fn scan(&self, subset: SubsetRef) -> TaggedRowBuffer {
-        self.wrapper.scan(&*self.inner, subset)
+        self.as_ref().scan(subset)
     }
 
     pub(crate) fn lookup_row_vectorized(
@@ -561,8 +618,8 @@ impl WrappedTable {
         col: ColumnId,
         out_var: Variable,
     ) {
-        self.wrapper
-            .lookup_row_vectorized(&*self.inner, mask, bindings, args, col, out_var);
+        self.as_ref()
+            .lookup_row_vectorized(mask, bindings, args, col, out_var)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -575,15 +632,8 @@ impl WrappedTable {
         default: QueryEntry,
         out_var: Variable,
     ) {
-        self.wrapper.lookup_with_default_vectorized(
-            &*self.inner,
-            mask,
-            bindings,
-            args,
-            col,
-            default,
-            out_var,
-        );
+        self.as_ref()
+            .lookup_with_default_vectorized(mask, bindings, args, col, default, out_var)
     }
 }
 
@@ -657,4 +707,104 @@ pub(crate) trait TableWrapper: Send + Sync {
         default: QueryEntry,
         out_var: Variable,
     );
+}
+
+/// An extra layer of indirection over a [`WrappedTable`] that does not require that the caller
+/// actually own the table. This is useful when a table implementation needs to construct a
+/// WrappedTable on its own.
+#[derive(Clone, Copy)]
+pub struct WrappedTableRef<'a> {
+    inner: &'a dyn Table,
+    wrapper: &'a dyn TableWrapper,
+}
+
+impl WrappedTableRef<'_> {
+    pub(crate) fn with_wrapper<T: Table, R>(
+        inner: &T,
+        f: impl for<'a> FnOnce(WrappedTableRef<'a>) -> R,
+    ) -> R {
+        let wrapper = WrapperImpl::<T>(PhantomData);
+        f(WrappedTableRef {
+            inner,
+            wrapper: &wrapper,
+        })
+    }
+
+    /// Starting at the given [`Offset`] into `subset`, scan up to `n` rows and
+    /// write them to `out`. Return the next starting offset. If no offset is
+    /// returned then the subset has been scanned completely.
+    pub fn scan_bounded(
+        &self,
+        subset: SubsetRef,
+        start: Offset,
+        n: usize,
+        out: &mut TaggedRowBuffer,
+    ) -> Option<Offset> {
+        self.wrapper.scan_bounded(self.inner, subset, start, n, out)
+    }
+
+    /// Group the contents of the given subset by the given column.
+    pub(crate) fn group_by_col(&self, subset: SubsetRef, col: ColumnId) -> ColumnIndex {
+        self.wrapper.group_by_col(self.inner, subset, col)
+    }
+
+    /// A multi-column vairant of [`WrappedTable::group_by_col`].
+    pub(crate) fn group_by_key(&self, subset: SubsetRef, cols: &[ColumnId]) -> TupleIndex {
+        self.wrapper.group_by_key(self.inner, subset, cols)
+    }
+
+    /// A variant fo [`WrappedTable::scan_bounded`] that projects a subset of
+    /// columns and only appends rows that match the given constraints.
+    pub fn scan_project(
+        &self,
+        subset: SubsetRef,
+        cols: &[ColumnId],
+        start: Offset,
+        n: usize,
+        cs: &[Constraint],
+        out: &mut TaggedRowBuffer,
+    ) -> Option<Offset> {
+        self.wrapper
+            .scan_project(self.inner, subset, cols, start, n, cs, out)
+    }
+
+    /// Return the contents of the subset as a [`TaggedRowBuffer`].
+    pub fn scan(&self, subset: SubsetRef) -> TaggedRowBuffer {
+        self.wrapper.scan(self.inner, subset)
+    }
+
+    pub(crate) fn lookup_row_vectorized(
+        &self,
+        mask: &mut Mask,
+        bindings: &mut Bindings,
+        args: &[QueryEntry],
+        col: ColumnId,
+        out_var: Variable,
+    ) {
+        self.wrapper
+            .lookup_row_vectorized(self.inner, mask, bindings, args, col, out_var);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lookup_with_default_vectorized(
+        &self,
+        mask: &mut Mask,
+        bindings: &mut Bindings,
+        args: &[QueryEntry],
+        col: ColumnId,
+        default: QueryEntry,
+        out_var: Variable,
+    ) {
+        self.wrapper.lookup_with_default_vectorized(
+            self.inner, mask, bindings, args, col, default, out_var,
+        );
+    }
+}
+
+impl Deref for WrappedTableRef<'_> {
+    type Target = dyn Table;
+
+    fn deref(&self) -> &Self::Target {
+        self.inner
+    }
 }

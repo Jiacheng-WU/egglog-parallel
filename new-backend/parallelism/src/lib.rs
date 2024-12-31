@@ -25,16 +25,6 @@ pub struct ThreadPool {
 impl ThreadPool {
     pub fn new(n_threads: usize, on_exit: impl Fn() + Clone + Send + 'static) -> ThreadPool {
         let (sender, recvr) = crossbeam_channel::unbounded::<Work>();
-        {
-            let recvr = recvr.clone();
-            thread::spawn(move || {
-                let todo_remove = 1;
-                loop {
-                    thread::sleep(std::time::Duration::from_millis(500));
-                    eprintln!("pending work={}", recvr.len());
-                }
-            });
-        }
         for _ in 0..n_threads {
             let on_exit = on_exit.clone();
             let recvr = recvr.clone();

@@ -147,11 +147,11 @@ impl Database {
                 for ci in info.column_indexes.iter_mut() {
                     let (_, v) = ci.pair();
                     let reader = v.read();
-                    if reader.needs_refresh(table) {
+                    if reader.needs_refresh(table.as_ref()) {
                         mem::drop(reader);
                         let v = v.clone();
                         scope.spawn(move |_| {
-                            v.lock().refresh(table);
+                            v.lock().refresh(table.as_ref());
                         });
                     }
                 }
@@ -159,11 +159,11 @@ impl Database {
                 for ix in info.indexes.iter_mut() {
                     let (_, v) = ix.pair();
                     let reader = v.read();
-                    if reader.needs_refresh(table) {
+                    if reader.needs_refresh(table.as_ref()) {
                         mem::drop(reader);
                         let v = v.clone();
                         scope.spawn(move |_| {
-                            v.lock().refresh(table);
+                            v.lock().refresh(table.as_ref());
                         });
                     }
                 }
@@ -183,15 +183,13 @@ impl Database {
                 rayon::current_num_threads() > 1
             }
         }
+        if rule_set.plans.is_empty() {
+            return false;
+        }
         let preds = with_pool_set(|ps| ps.get::<PredictedVals>());
         let index_cache = IndexCache::default();
 
         if do_parallel() {
-            let start = std::time::Instant::now();
-            let todo_remove = eprintln!(
-                "running ruleset! [{:?}]",
-                Vec::from_iter(rule_set.plans.iter().map(|(_, desc)| desc))
-            );
             self.update_cached_indexes();
             THREAD_POOL.scope(|scope| {
                 for (plan, _) in &rule_set.plans {
@@ -214,11 +212,6 @@ impl Database {
                     });
                 }
             });
-            let elapsed = start.elapsed();
-            let todo_remove = eprintln!(
-                "ruleset finished, took {elapsed:?} / {}",
-                elapsed.as_secs_f64()
-            );
         } else {
             let join_state = JoinState::new(self, &preds, &index_cache);
             // Just run all of the plans in order with a single in-place action
@@ -627,7 +620,7 @@ impl<'a> JoinState<'a> {
                         &cover.constraints,
                         &mut buffer,
                     );
-                    for (row, key) in buffer.iter_non_stale() {
+                    for (row, key) in buffer.non_stale() {
                         let mut update: Pooled<FrameUpdate> = with_pool_set(PoolSet::get);
                         update.refine_atom(
                             cover_atom,
@@ -694,7 +687,7 @@ impl<'a> JoinState<'a> {
                         &mut buffer,
                     );
                     let pool: Pool<FrameUpdate> = with_pool_set(PoolSet::get_pool);
-                    'mid: for (row, key) in buffer.iter_non_stale() {
+                    'mid: for (row, key) in buffer.non_stale() {
                         let mut update: Pooled<FrameUpdate> = pool.get();
                         update.refine_atom(
                             cover_atom,
@@ -787,7 +780,7 @@ impl Clear for FrameUpdate {
     }
 }
 
-const VAR_BATCH_SIZE: usize = 256;
+const VAR_BATCH_SIZE: usize = 128;
 
 /// A trait used to abstract over different ways of buffering actions together
 /// before running them.
@@ -900,7 +893,7 @@ impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
             rule_set,
             batches: Default::default(),
             needs_flush: false,
-            cur_morsel_size: MorselSize::new(128),
+            cur_morsel_size: MorselSize::new(1024),
         }
     }
 }

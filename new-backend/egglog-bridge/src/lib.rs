@@ -169,6 +169,7 @@ impl EGraph {
                     spec.n_keys + 1,     // added entry for the tableid
                     spec.n_keys + 1 + 2, // one value for the term id, one for the reason,
                     None,
+                    vec![], // no rebuilding needed for term table
                     |_, _, _, _| false,
                 );
                 let table_id = self.db.add_table(table, iter::empty(), iter::empty());
@@ -186,6 +187,7 @@ impl EGraph {
                     arity,
                     arity + 1, // one value for the reason id
                     None,
+                    vec![], // no rebuilding needed for reason tables
                     |_, _, _, _| false,
                 );
                 let table_id = self.db.add_table(table, iter::empty(), iter::empty());
@@ -406,12 +408,12 @@ impl EGraph {
         let mut cur = Offset::new(0);
         let mut buf = TaggedRowBuffer::new(imp.spec().arity());
         while let Some(next) = imp.scan_bounded(all.as_ref(), cur, 500, &mut buf) {
-            buf.iter_non_stale()
+            buf.non_stale()
                 .for_each(|(_, row)| f(&row[0..row.len() - truncate]));
             cur = next;
             buf.clear();
         }
-        buf.iter_non_stale()
+        buf.non_stale()
             .for_each(|(_, row)| f(&row[0..row.len() - truncate]));
     }
 
@@ -459,11 +461,11 @@ impl EGraph {
         let mut cur = Offset::new(0);
         let mut out = TaggedRowBuffer::new(table.spec().arity());
         while let Some(next) = table.scan_bounded(all.as_ref(), cur, BATCH_SIZE, &mut out) {
-            out.iter_non_stale().for_each(|(_, row)| f(row));
+            out.non_stale().for_each(|(_, row)| f(row));
             out.clear();
             cur = next;
         }
-        out.iter_non_stale().for_each(|(_, row)| f(row));
+        out.non_stale().for_each(|(_, row)| f(row));
     }
 
     /// Register a function in this EGraph.
@@ -478,6 +480,12 @@ impl EGraph {
             !schema.is_empty(),
             "must have at least one column in schema"
         );
+        let to_rebuild: Vec<ColumnId> = schema
+            .iter()
+            .enumerate()
+            .filter(|(_, ty)| matches!(ty, ColumnTy::Id))
+            .map(|(i, _)| ColumnId::from_usize(i))
+            .collect();
         let n_args = schema.len() - 1;
         let n_cols = if self.tracing {
             schema.len() + 2
@@ -494,6 +502,7 @@ impl EGraph {
         }
         let table = match merge {
             MergeFn::UnionId => {
+                let todo_remove_fast_merge = 1;
                 #[cfg(not(feature = "fast_merge"))]
                 {
                     {
@@ -501,6 +510,7 @@ impl EGraph {
                             n_args,
                             n_cols,
                             Some(ColumnId::from_usize(schema.len())),
+                            to_rebuild,
                             move |state, cur, new, out| {
                                 let l = cur[n_args];
                                 let r = new[n_args];
@@ -543,6 +553,7 @@ impl EGraph {
                         n_args,
                         n_cols,
                         Some(ColumnId::from_usize(schema.len())),
+                        to_rebuild,
                         move |state, cur, new| {
                             let l = cur[n_args];
                             let r = new[n_args];
@@ -565,6 +576,7 @@ impl EGraph {
                     n_args,
                     n_cols,
                     Some(ColumnId::from_usize(schema.len())),
+                    to_rebuild,
                     move |state, cur, new, out| {
                         // We have F(x0, ..., xn, v1, t1) and F(x0, ..., xn, v2,
                         // t2) in the same table.
@@ -646,6 +658,21 @@ impl EGraph {
             {
                 rayon::current_num_threads() > 1
             }
+        }
+        if self.db.get_table(self.uf_table).rewriter(&[]).is_some() {
+            // The UF implementation supports "native"  rebuilding.
+            let mut tables = Vec::with_capacity(self.funcs.next_id().index());
+            for (_, func) in self.funcs.iter() {
+                tables.push(func.table);
+            }
+            while self
+                .db
+                .apply_rewrite(self.uf_table, &tables, self.next_ts.to_value())
+            {
+                self.next_ts = self.next_ts.inc();
+            }
+            self.next_ts = self.next_ts.inc();
+            return Ok(());
         }
         if do_parallel() {
             return self.rebuild_parallel();
@@ -957,7 +984,6 @@ enum ProofReconstructionError {
 /// rebuild for a given table.
 fn incremental_rebuild(uf_size: usize, table_size: usize, parallel: bool) -> bool {
     if parallel {
-        let todo_revert = 1;
         uf_size <= (table_size / 16)
     } else {
         uf_size <= (table_size / 8)

@@ -33,7 +33,7 @@ fn basic_updates() {
 
         let mut index = Index::new(vec![ColumnId::new(0), ColumnId::new(2)], TupleIndex::new(2));
         assert!(index.get_subset(&[v(0), v(2)]).is_none());
-        index.refresh(&table);
+        index.refresh(table.as_ref());
         for i in 0..=4 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();
@@ -54,7 +54,7 @@ fn basic_updates() {
 
         empty_execution_state!(es);
         table.merge(&mut es);
-        index.refresh(&table);
+        index.refresh(table.as_ref());
         for i in 0..10 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();
@@ -76,7 +76,7 @@ fn basic_updates() {
         }
 
         // Refresh should do the right thing.
-        index.refresh(&table);
+        index.refresh(table.as_ref());
         for i in 0..10 {
             let key = [v(i), v(i + 2)];
             let subset = index.get_subset(&key).unwrap();

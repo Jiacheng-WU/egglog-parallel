@@ -121,7 +121,7 @@ fn line_graph_1_gj() {
 
 fn line_graph_1_test(strat: PlanStrategy) {
     let mut db = Database::default();
-    let edge_impl = SortedWritesTable::new(2, 2, None, move |_, a, b, _| {
+    let edge_impl = SortedWritesTable::new(2, 2, None, vec![], move |_, a, b, _| {
         if a != b {
             panic!("merge not supported")
         } else {
@@ -187,7 +187,7 @@ fn line_graph_2_gj() {
 
 fn line_graph_2_test(strat: PlanStrategy) {
     let mut db = Database::default();
-    let edge_impl = SortedWritesTable::new(2, 2, None, move |_, a, b, _| {
+    let edge_impl = SortedWritesTable::new(2, 2, None, vec![], move |_, a, b, _| {
         if a != b {
             panic!("merge not supported")
         } else {
@@ -823,30 +823,42 @@ struct MathEgraph {
 fn basic_math_egraph() -> MathEgraph {
     let mut db = Database::default();
     let uf = db.add_table(DisplacedTable::default(), iter::empty(), iter::empty());
-    let num_impl = SortedWritesTable::new(1, 3, Some(ColumnId::new(2)), move |state, a, b, res| {
-        if a[1] != b[1] {
-            // Mark the two ids as equal. Picking b[1] as the 'presumed winner'
-            state.stage_insert(uf, &[a[1], b[1], b[2]]);
-            res.extend_from_slice(b);
-            true
-        } else {
-            false
-        }
-    });
+    let num_impl = SortedWritesTable::new(
+        1,
+        3,
+        Some(ColumnId::new(2)),
+        vec![],
+        move |state, a, b, res| {
+            if a[1] != b[1] {
+                // Mark the two ids as equal. Picking b[1] as the 'presumed winner'
+                state.stage_insert(uf, &[a[1], b[1], b[2]]);
+                res.extend_from_slice(b);
+                true
+            } else {
+                false
+            }
+        },
+    );
 
     let id_counter = db.add_counter();
     let num = db.add_table(num_impl, iter::once(uf), iter::empty());
-    let add_impl = SortedWritesTable::new(2, 4, Some(ColumnId::new(3)), move |state, a, b, res| {
-        // Capture a backtrace as a string
-        if a[2] != b[2] {
-            // Mark the two ids as equal. Picking b[2] as the 'presumed winner'
-            state.stage_insert(uf, &[a[2], b[2], b[3]]);
-            res.extend_from_slice(b);
-            true
-        } else {
-            false
-        }
-    });
+    let add_impl = SortedWritesTable::new(
+        2,
+        4,
+        Some(ColumnId::new(3)),
+        vec![],
+        move |state, a, b, res| {
+            // Capture a backtrace as a string
+            if a[2] != b[2] {
+                // Mark the two ids as equal. Picking b[2] as the 'presumed winner'
+                state.stage_insert(uf, &[a[2], b[2], b[3]]);
+                res.extend_from_slice(b);
+                true
+            } else {
+                false
+            }
+        },
+    );
 
     let add = db.add_table(add_impl, iter::once(uf), iter::empty());
 

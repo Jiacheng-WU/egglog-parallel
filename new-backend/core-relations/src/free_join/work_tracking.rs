@@ -14,12 +14,10 @@ use std::{
 use once_cell::sync::Lazy;
 
 static TARGET: Lazy<isize> = Lazy::new(|| {
-    let todo_revert = 1;
-    1024
-    // (std::thread::available_parallelism()
-    //     .map(|x| x.get())
-    //     .unwrap_or(1)
-    //     * 2) as isize
+    (std::thread::available_parallelism()
+        .map(|x| x.get())
+        .unwrap_or(1)
+        * 10) as isize
 });
 static OUTSTANDING_WORK: AtomicIsize = AtomicIsize::new(0);
 

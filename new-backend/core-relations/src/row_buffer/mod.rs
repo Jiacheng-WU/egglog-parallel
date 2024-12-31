@@ -5,6 +5,7 @@ use std::{cell::Cell, mem, ops::Deref};
 
 use concurrency::ParallelVecWriter;
 use numeric_id::NumericId;
+use rayon::iter::ParallelIterator;
 use smallvec::SmallVec;
 
 use crate::{
@@ -21,7 +22,7 @@ mod tests;
 /// allows us to store multiple rows in a single allocation.
 ///
 /// RowBuffer stores data in row-major order.
-pub(crate) struct RowBuffer {
+pub struct RowBuffer {
     n_columns: usize,
     total_rows: usize,
     data: Pooled<Vec<Cell<Value>>>,
@@ -115,6 +116,35 @@ impl RowBuffer {
             // unsafe `set_stale_shared` method whose safety requirements imply
             // that no call will overlap with borrowing such a row.
             .map(|row| unsafe { mem::transmute::<&[Cell<Value>], &[Value]>(row) })
+    }
+
+    pub(crate) fn non_stale_mut(&mut self) -> impl Iterator<Item = &mut [Value]> {
+        self.data
+            .chunks_mut(self.n_columns)
+            .filter(|row| !row[0].get().is_stale())
+            // SAFETY: This kind of transmutation is safe so long as no one
+            // modifies any of the values behind the `Cell` while this value is
+            // borrowed.
+            //
+            // The only time we modify these values is in safe methods requiring
+            // a mutable reference (`set_stale`, `get_row_mut`), or in the
+            // unsafe `set_stale_shared` method whose safety requirements imply
+            // that no call will overlap with borrowing such a row.
+            .map(|row| unsafe { mem::transmute::<&mut [Cell<Value>], &mut [Value]>(row) })
+    }
+
+    /// A parallel version of [`RowBuffer::iter`].
+    pub(crate) fn parallel_iter(&self) -> impl ParallelIterator<Item = &[Value]> {
+        use rayon::prelude::*;
+        // SAFETY: This kind of transmutation is safe so long as no one
+        // modifies any of the values behind the `Cell` while this value is
+        // borrowed.
+        //
+        // The only time we modify these values is in safe methods requiring
+        // a mutable reference (`set_stale`, `get_row_mut`), or in the
+        // unsafe `set_stale_shared` method whose safety requirements imply
+        // that no call will overlap with borrowing such a row.
+        unsafe { mem::transmute::<&[Cell<Value>], &[Value]>(&self.data) }.par_chunks(self.n_columns)
     }
 
     /// Return an iterator over all rows in the buffer.
@@ -313,22 +343,49 @@ impl TaggedRowBuffer {
         self.unwrap_row(self.inner.get_row(row))
     }
 
+    pub fn get_row_mut(&mut self, row: RowId) -> (RowId, &mut [Value]) {
+        let base_arity = self.base_arity();
+        let row = self.inner.get_row_mut(row);
+        let row_id = row[base_arity];
+        let row = &mut row[..base_arity];
+        (RowId::new(row_id.rep()), row)
+    }
+
     /// Iterate over the contents of the buffer.
     pub fn iter(&self) -> impl Iterator<Item = (RowId, &[Value])> {
         self.inner.iter().map(|row| self.unwrap_row(row))
     }
 
+    /// Iterate over the contents of the buffer in parallel.
+    pub fn par_iter(&self) -> impl ParallelIterator<Item = (RowId, &[Value])> {
+        self.inner.parallel_iter().map(|row| self.unwrap_row(row))
+    }
+
     /// Iterate over all rows in the buffer, except for the stale ones.
-    pub fn iter_non_stale(&self) -> impl Iterator<Item = (RowId, &[Value])> {
+    pub fn non_stale(&self) -> impl Iterator<Item = (RowId, &[Value])> {
+        self.inner.non_stale().map(|row| self.unwrap_row(row))
+    }
+
+    /// Iterate over all rows in the buffer, except for the stale ones.
+    pub fn non_stale_mut(&mut self) -> impl Iterator<Item = (RowId, &mut [Value])> {
+        let base_arity = self.base_arity();
         self.inner
-            .iter()
-            .filter(|x| !x[1].is_stale())
-            .map(|row| self.unwrap_row(row))
+            .non_stale_mut()
+            .map(move |row| Self::unwrap_row_mut(base_arity, row))
+    }
+
+    pub fn set_stale(&mut self, row: RowId) -> bool {
+        self.inner.set_stale(row)
     }
 
     fn unwrap_row<'a>(&self, row: &'a [Value]) -> (RowId, &'a [Value]) {
         let row_id = row[self.base_arity()];
         let row = &row[..self.base_arity()];
+        (RowId::new(row_id.rep()), row)
+    }
+    fn unwrap_row_mut(base_arity: usize, row: &mut [Value]) -> (RowId, &mut [Value]) {
+        let row_id = row[base_arity];
+        let row = &mut row[..base_arity];
         (RowId::new(row_id.rep()), row)
     }
 }

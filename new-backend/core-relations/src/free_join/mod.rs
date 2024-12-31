@@ -9,7 +9,7 @@ use std::{
 
 use concurrency::ReadOptimizedLock;
 use numeric_id::{define_id, DenseIdMap, NumericId};
-use rayon::iter::ParallelIterator;
+use rayon::prelude::*;
 use smallvec::SmallVec;
 
 use crate::{
@@ -253,6 +253,66 @@ impl Database {
 
     pub fn primitives_mut(&mut self) -> &mut Primitives {
         &mut self.primitives
+    }
+
+    pub fn apply_rewrite(
+        &mut self,
+        func_id: TableId,
+        to_rewrite: &[TableId],
+        next_ts: Value,
+    ) -> bool {
+        fn do_parallel() -> bool {
+            #[cfg(test)]
+            {
+                use rand::Rng;
+                rand::thread_rng().gen_bool(0.5)
+            }
+            #[cfg(not(test))]
+            {
+                rayon::current_num_threads() > 1
+            }
+        }
+
+        let func = self.tables.take(func_id).unwrap();
+        let prediced = PredictedVals::default();
+        if do_parallel() {
+            let mut tables = Vec::with_capacity(to_rewrite.len());
+            for id in to_rewrite {
+                tables.push((*id, self.tables.take(*id).unwrap()));
+            }
+            tables.par_iter_mut().for_each(|(_, info)| {
+                info.table.apply_rewrite(
+                    func_id,
+                    &func.table,
+                    next_ts,
+                    &mut ExecutionState {
+                        db: self.read_only_view(),
+                        predicted: &prediced,
+                        buffers: Default::default(),
+                    },
+                );
+            });
+            for (id, info) in tables {
+                self.tables.insert(id, info);
+            }
+        } else {
+            for id in to_rewrite {
+                let mut info = self.tables.take(*id).unwrap();
+                info.table.apply_rewrite(
+                    func_id,
+                    &func.table,
+                    next_ts,
+                    &mut ExecutionState {
+                        db: self.read_only_view(),
+                        predicted: &prediced,
+                        buffers: Default::default(),
+                    },
+                );
+                self.tables.insert(*id, info);
+            }
+        }
+        self.tables.insert(func_id, func);
+        self.merge_all()
     }
 
     /// Run `f` with access to an `ExecutionState` mapped to this database.
@@ -503,10 +563,10 @@ fn get_index_from_tableinfo(table_info: &TableInfo, cols: &[ColumnId]) -> HashIn
         )))
     });
     let ix = guard.value().read();
-    if ix.needs_refresh(&table_info.table) {
+    if ix.needs_refresh(table_info.table.as_ref()) {
         mem::drop(ix);
         let mut ix = guard.value().lock();
-        ix.refresh(&table_info.table);
+        ix.refresh(table_info.table.as_ref());
     }
     guard.value().clone()
 }
@@ -522,10 +582,10 @@ fn get_column_index_from_tableinfo(table_info: &TableInfo, col: ColumnId) -> Has
         )))
     });
     let ix = index.read();
-    if ix.needs_refresh(&table_info.table) {
+    if ix.needs_refresh(table_info.table.as_ref()) {
         mem::drop(ix);
         let mut ix = index.lock();
-        ix.refresh(&table_info.table);
+        ix.refresh(table_info.table.as_ref());
     }
     index.clone()
 }

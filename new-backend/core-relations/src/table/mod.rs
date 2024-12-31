@@ -25,6 +25,7 @@ use sharded_hash_table::ShardedHashTable;
 use crate::{
     action::ExecutionState,
     common::{HashMap, ShardData, ShardId, Value},
+    hash_index::{ColumnIndex, Index},
     offsets::{OffsetRange, Offsets, RowId, Subset, SubsetRef},
     pool::with_pool_set,
     row_buffer::{ParallelRowBufWriter, RowBuffer},
@@ -32,9 +33,10 @@ use crate::{
         ColumnId, Constraint, Generation, MutationBuffer, Offset, Row, Table, TableSpec,
         TableVersion,
     },
-    Pooled,
+    Pooled, TableId,
 };
 
+mod rebuild;
 mod sharded_hash_table;
 #[cfg(test)]
 mod tests;
@@ -161,6 +163,9 @@ pub struct SortedWritesTable {
 
     pending_state: Arc<PendingState>,
     merge: MergeFn,
+    to_rebuild: Vec<ColumnId>,
+    rebuild_index: Index<ColumnIndex>,
+    last_rebuilt_at: DenseIdMap<TableId, TableVersion>,
 }
 
 impl Clone for SortedWritesTable {
@@ -175,6 +180,9 @@ impl Clone for SortedWritesTable {
             offsets: self.offsets.clone(),
             pending_state: Arc::new(self.pending_state.deep_copy()),
             merge: self.merge.clone(),
+            to_rebuild: self.to_rebuild.clone(),
+            rebuild_index: Index::new(self.to_rebuild.clone(), ColumnIndex::new()),
+            last_rebuilt_at: Default::default(),
         }
     }
 }
@@ -268,6 +276,16 @@ impl Table for SortedWritesTable {
             uncacheable_columns: Default::default(),
             allows_delete: true,
         }
+    }
+
+    fn apply_rewrite(
+        &mut self,
+        table_id: TableId,
+        table: &crate::WrappedTable,
+        next_ts: Value,
+        exec_state: &mut ExecutionState,
+    ) {
+        self.do_rewrite(table_id, table, next_ts, exec_state);
     }
 
     fn version(&self) -> TableVersion {
@@ -436,18 +454,10 @@ impl Table for SortedWritesTable {
     }
 
     fn merge(&mut self, exec_state: &mut ExecutionState) -> bool {
-        let start = std::time::Instant::now();
         let mut changed = false;
-
-        // First: handle the removals.
         changed |= self.do_delete();
         changed |= self.do_insert(exec_state);
         self.maybe_rehash();
-        let elapsed = start.elapsed();
-        let todo_remove = eprintln!(
-            "merge finished, took {elapsed:?} / {}",
-            elapsed.as_secs_f64()
-        );
         changed
     }
 
@@ -484,6 +494,7 @@ impl SortedWritesTable {
         n_keys: usize,
         n_columns: usize,
         sort_by: Option<ColumnId>,
+        to_rebuild: Vec<ColumnId>,
         merge_fn: impl Fn(&mut ExecutionState, &[Value], &[Value], &mut Vec<Value>) -> bool
             + 'static
             + Send
@@ -491,6 +502,7 @@ impl SortedWritesTable {
     ) -> Self {
         let hash = ShardedHashTable::<TableEntry>::default();
         let shard_data = hash.shard_data();
+        let rebuild_index = Index::new(to_rebuild.clone(), ColumnIndex::new());
         SortedWritesTable {
             generation: Generation::new(0),
             data: Rows::new(RowBuffer::new(n_columns)),
@@ -501,6 +513,9 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Update(Arc::new(merge_fn)),
+            to_rebuild,
+            rebuild_index,
+            last_rebuilt_at: Default::default(),
         }
     }
 
@@ -513,10 +528,12 @@ impl SortedWritesTable {
         n_keys: usize,
         n_columns: usize,
         sort_by: Option<ColumnId>,
+        to_rebuild: Vec<ColumnId>,
         merge_fn: impl Fn(&mut ExecutionState, &[Value], &[Value]) -> bool + 'static + Send + Sync,
     ) -> Self {
         let hash = ShardedHashTable::<TableEntry>::default();
         let shard_data = hash.shard_data();
+        let rebuild_index = Index::new(to_rebuild.clone(), ColumnIndex::new());
         SortedWritesTable {
             generation: Generation::new(0),
             data: Rows::new(RowBuffer::new(n_columns)),
@@ -527,6 +544,9 @@ impl SortedWritesTable {
             offsets: Default::default(),
             pending_state: Arc::new(PendingState::new(shard_data)),
             merge: MergeFn::Bookkeeping(Arc::new(merge_fn)),
+            to_rebuild,
+            rebuild_index,
+            last_rebuilt_at: Default::default(),
         }
     }
 
@@ -693,7 +713,7 @@ impl SortedWritesTable {
                             if let Some(largest) = self.offsets.last().map(|(v, _)| *v) {
                                 assert!(
                                     sort_val >= largest,
-                                    "inserting row that violates sort order"
+                                    "inserting row that violates sort order {sort_val:?} vs. {largest:?}"
                                 );
                                 if sort_val > largest {
                                     self.offsets.push((sort_val, new));

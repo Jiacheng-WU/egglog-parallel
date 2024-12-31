@@ -17,7 +17,7 @@ use crate::{
     offsets::{RowId, SortedOffsetSlice, SubsetRef},
     pool::{with_pool_set, Pooled},
     row_buffer::{RowBuffer, TaggedRowBuffer},
-    table_spec::{ColumnId, Generation, Offset, TableVersion, WrappedTable},
+    table_spec::{ColumnId, Generation, Offset, TableVersion, WrappedTableRef},
     OffsetRange, Subset,
 };
 
@@ -56,11 +56,11 @@ impl<TI: IndexBase> Index<TI> {
         self.table.get_subset(key)
     }
 
-    pub(crate) fn needs_refresh(&self, table: &WrappedTable) -> bool {
+    pub(crate) fn needs_refresh(&self, table: WrappedTableRef) -> bool {
         table.version() != self.updated_to
     }
 
-    pub(crate) fn refresh(&mut self, table: &WrappedTable) {
+    pub(crate) fn refresh(&mut self, table: WrappedTableRef) {
         let cur_version = table.version();
         if cur_version == self.updated_to {
             return;
@@ -85,7 +85,7 @@ impl<TI: IndexBase> Index<TI> {
     ///
     /// The index is guaranteed to be up to date until `merge` is called on the
     /// table again.
-    pub(crate) fn refresh_serial(&mut self, table: &WrappedTable, subset: Subset) {
+    pub(crate) fn refresh_serial(&mut self, table: WrappedTableRef, subset: Subset) {
         let mut buf = TaggedRowBuffer::new(self.key.len());
         let mut cur = Offset::new(0);
         loop {
@@ -131,12 +131,17 @@ pub(crate) trait IndexBase {
     /// these methods can panic.
     type Key: ?Sized;
 
+    /// The write-side keys for an index. This is generally the same as `Key`, but Column-level
+    /// indexes allow for multiple values (e.g. a subset of a row) to be provided, allowing the
+    /// index to effectively cover multiple columns. This is useful for rebuilding.
+    type WriteKey: ?Sized;
+
     /// Remove any existing entries in the index.
     fn clear(&mut self);
     /// Get the subset corresponding to this key, if there is one.
     fn get_subset(&self, key: &Self::Key) -> Option<SubsetRef>;
     /// Add the given key and row id to the table.
-    fn add_row(&mut self, key: &Self::Key, row: RowId);
+    fn add_row(&mut self, key: &Self::WriteKey, row: RowId);
     /// Merge the contents of the [`TaggedRowBuffer`] into the table.
     fn merge_rows(&mut self, buf: &TaggedRowBuffer);
     /// Call `f` over the elements of the index.
@@ -159,7 +164,7 @@ pub(crate) trait IndexBase {
 /// complicated wrappers supporting parallel writes.
 pub(crate) trait ParallelIndexWriter<T: ?Sized> {
     fn finish(self) -> T;
-    fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef);
+    fn merge_rows(&mut self, cols: &[ColumnId], table: WrappedTableRef, subset: SubsetRef);
 }
 
 pub struct ColumnIndex {
@@ -171,6 +176,7 @@ pub struct ColumnIndex {
 
 impl IndexBase for ColumnIndex {
     type Key = Value;
+    type WriteKey = [Value];
     fn clear(&mut self) {
         for (_, shard) in self.table.iter_mut() {
             for (_, subset) in shard.drain(..) {
@@ -190,21 +196,21 @@ impl IndexBase for ColumnIndex {
             .get(key)
             .map(|x| x.as_ref(&self.subsets))
     }
-    fn add_row(&mut self, key: &Value, row: RowId) {
+    fn add_row(&mut self, vals: &[Value], row: RowId) {
         // SAFETY: everything in `table` comes from `subsets`.
-        unsafe {
-            self.shard_data
-                .get_shard_mut(key, &mut self.table)
-                .entry(*key)
-                .or_insert_with(BufferedSubset::empty)
-                .add_row_sorted(row, &mut self.subsets);
+        for key in vals {
+            unsafe {
+                self.shard_data
+                    .get_shard_mut(key, &mut self.table)
+                    .entry(*key)
+                    .or_insert_with(BufferedSubset::empty)
+                    .add_row_sorted(row, &mut self.subsets);
+            }
         }
     }
     fn merge_rows(&mut self, buf: &TaggedRowBuffer) {
         for (src_id, key) in buf.iter() {
-            debug_assert_eq!(key.len(), 1);
-            debug_assert!(!key[0].is_stale());
-            self.add_row(&key[0], src_id);
+            self.add_row(key, src_id);
         }
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
@@ -260,9 +266,8 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
             subsets: self.subsets.finish(),
         }
     }
-    fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef) {
+    fn merge_rows(&mut self, cols: &[ColumnId], table: WrappedTableRef, subset: SubsetRef) {
         const BATCH_SIZE: usize = 1024;
-        assert_eq!(cols.len(), 1);
         let shard_data = self.shard_data;
         let mut queues = IdVec::<ShardId, Mutex<Vec<(RowId, TaggedRowBuffer)>>>::with_capacity(
             shard_data.n_shards(),
@@ -273,10 +278,12 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
         let split_buf = |buf: TaggedRowBuffer| {
             let mut split = IdVec::<ShardId, TaggedRowBuffer>::default();
             split.resize_with(shard_data.n_shards(), || TaggedRowBuffer::new(1));
-            for (row_id, key) in buf.iter_non_stale() {
-                shard_data
-                    .get_shard_mut(key[0], &mut split)
-                    .add_row(row_id, key);
+            for (row_id, keys) in buf.non_stale() {
+                for key in keys {
+                    shard_data
+                        .get_shard_mut(*key, &mut split)
+                        .add_row(row_id, &[*key]);
+                }
             }
             for (shard_id, buf) in split.drain() {
                 if buf.is_empty() {
@@ -291,7 +298,7 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
             rayon::scope(|scope| {
                 let mut cur = Offset::new(0);
                 loop {
-                    let mut buf = TaggedRowBuffer::new(1);
+                    let mut buf = TaggedRowBuffer::new(cols.len());
                     if let Some(next) =
                         table.scan_project(subset, cols, cur, BATCH_SIZE, &[], &mut buf)
                     {
@@ -310,7 +317,8 @@ impl ParallelIndexWriter<ColumnIndex> for ParallelColumnIndexWriter {
                 let mut vec = queues[shard_id].lock().unwrap();
                 vec.sort_by_key(|(start, _)| *start);
                 for (_, buf) in vec.drain(..) {
-                    for (row_id, key) in buf.iter_non_stale() {
+                    for (row_id, key) in buf.non_stale() {
+                        debug_assert_eq!(key.len(), 1);
                         match shard.entry(key[0]) {
                             Entry::Occupied(mut occ) => {
                                 // SAFETY: all of the buffered vectors in this map come from `subsets`.
@@ -343,7 +351,7 @@ impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
             table: self.table,
         }
     }
-    fn merge_rows(&mut self, cols: &[ColumnId], table: &WrappedTable, subset: SubsetRef) {
+    fn merge_rows(&mut self, cols: &[ColumnId], table: WrappedTableRef, subset: SubsetRef) {
         // The structure here is similar to the implementation for ParallelColumnIndexWriter, with
         // slightly more bookkeeping needed to handle arbitrary-arity keys.
 
@@ -358,7 +366,7 @@ impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
         let split_buf = |buf: TaggedRowBuffer| {
             let mut split = IdVec::<ShardId, TaggedRowBuffer>::default();
             split.resize_with(shard_data.n_shards(), || TaggedRowBuffer::new(cols.len()));
-            for (row_id, key) in buf.iter_non_stale() {
+            for (row_id, key) in buf.non_stale() {
                 shard_data
                     .get_shard_mut(key, &mut split)
                     .add_row(row_id, key);
@@ -393,7 +401,7 @@ impl ParallelIndexWriter<TupleIndex> for ParallelTupleIndexWriter {
                 let mut vec = queues[shard_id].lock().unwrap();
                 vec.sort_by_key(|(start, _)| *start);
                 for (_, buf) in vec.drain(..) {
-                    for (row_id, key) in buf.iter_non_stale() {
+                    for (row_id, key) in buf.non_stale() {
                         let hash = hash_key(key);
                         let table_entry = shard.table.entry(
                             hash,
@@ -450,6 +458,7 @@ impl TupleIndex {
 
 impl IndexBase for TupleIndex {
     type Key = [Value];
+    type WriteKey = Self::Key;
 
     fn clear(&mut self) {
         for entry in self.table.iter_mut().flat_map(|(_, shard)| {
