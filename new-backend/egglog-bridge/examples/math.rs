@@ -19,6 +19,13 @@ fn main() {
             .build_global()
             .unwrap();
     }
+    #[cfg(not(feature = "serial_examples"))]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build_global()
+            .unwrap();
+    }
     let mut egraph = EGraph::default();
     let rational_ty = egraph.primitives_mut().register_type::<Rational64>();
     let string_ty = egraph.primitives_mut().register_type::<&'static str>();

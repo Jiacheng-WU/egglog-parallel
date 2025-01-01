@@ -191,7 +191,7 @@ impl Database {
 
         if do_parallel() {
             self.update_cached_indexes();
-            THREAD_POOL.scope(|scope| {
+            rayon::in_place_scope(|scope| {
                 for (plan, _) in &rule_set.plans {
                     scope.spawn(|scope| {
                         let join_state = JoinState::new(self, &preds, &index_cache);
@@ -879,7 +879,7 @@ impl<'a, 'outer: 'a> ActionBuffer<'a> for InPlaceActionBuffer<'outer> {
 
 /// An Action buffer that hands off batches to of actions to rayon to execute.
 struct ScopedActionBuffer<'inner, 'scope> {
-    scope: &'inner parallelism::Scope<'scope>,
+    scope: &'inner rayon::Scope<'scope>,
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
     needs_flush: bool,
@@ -887,7 +887,7 @@ struct ScopedActionBuffer<'inner, 'scope> {
 }
 
 impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
-    fn new(scope: &'inner parallelism::Scope<'scope>, rule_set: &'scope RuleSet) -> Self {
+    fn new(scope: &'inner rayon::Scope<'scope>, rule_set: &'scope RuleSet) -> Self {
         Self {
             scope,
             rule_set,

@@ -17,6 +17,13 @@ fn main() {
             .build_global()
             .unwrap();
     }
+    #[cfg(not(feature = "serial_examples"))]
+    {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(8)
+            .build_global()
+            .unwrap();
+    }
 
     let mut egraph = EGraph::default();
     let int_prim = egraph.primitives_mut().get_ty::<i64>();
