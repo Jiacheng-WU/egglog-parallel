@@ -3,7 +3,6 @@
 use std::{iter, mem, sync::Arc};
 
 use numeric_id::{DenseIdMap, NumericId};
-use once_cell::sync::Lazy;
 use smallvec::SmallVec;
 
 use crate::{
@@ -979,9 +978,3 @@ fn flush_action_states(
         }
     }
 }
-
-static THREAD_POOL: Lazy<parallelism::ThreadPool> = Lazy::new(|| {
-    parallelism::ThreadPool::new(rayon::current_num_threads(), || {
-        with_pool_set(PoolSet::clear)
-    })
-});

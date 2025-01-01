@@ -85,7 +85,8 @@ impl Rewriter for Canonicalizer<'_> {
         let mut cur = start;
         let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
         // SAFETY: `cur` is always in-bounds, guaranteed by the above assertion.
-        let todo_cleanup = 1;
+        // Special-case small columns: this gives us a modest speedup on rebuilding-heavy
+        // workloads.
         match self.cols.as_slice() {
             [c] => {
                 while cur < end {
