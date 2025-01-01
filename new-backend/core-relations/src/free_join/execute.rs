@@ -961,7 +961,8 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
         });
     }
     fn morsel_size(&mut self, _level: usize) -> usize {
-        self.cur_morsel_size.get()
+        // Lower morsel size to increase parallelism.
+        256
     }
 }
 
