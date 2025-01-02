@@ -50,7 +50,7 @@ type HashCode = u64;
 
 /// A pointer to a row in the table.
 #[derive(Clone, Debug)]
-struct TableEntry {
+pub(crate) struct TableEntry {
     hashcode: HashCode,
     row: RowId,
 }
@@ -1387,7 +1387,7 @@ fn do_parallel(_workload_size: usize) -> bool {
 struct StagedOutputs {
     shard_data: ShardData,
     n_keys: usize,
-    hash: HashTable<TableEntry>,
+    hash: Pooled<HashTable<TableEntry>>,
     rows: RowBuffer,
     n_stale: usize,
     scratch: Pooled<Vec<Value>>,
@@ -1402,16 +1402,16 @@ impl StagedOutputs {
         self.rows.non_stale()
     }
     fn new(n_keys: usize, n_cols: usize, capacity: usize) -> Self {
-        let mut res = StagedOutputs {
+        let mut res = with_pool_set(|ps| StagedOutputs {
             shard_data: ShardData::new(1),
             n_keys,
             n_stale: 0,
-            hash: HashTable::with_capacity(capacity),
+            hash: ps.get(),
             rows: RowBuffer::new(n_cols),
-            scratch: with_pool_set(|ps| ps.get::<Vec<Value>>()),
+            scratch: ps.get(),
             changed: false,
-        };
-
+        });
+        res.hash.reserve(capacity, TableEntry::hashcode);
         res.rows.reserve(capacity);
         res
     }

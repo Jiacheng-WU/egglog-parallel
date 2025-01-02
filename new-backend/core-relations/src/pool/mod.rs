@@ -20,6 +20,7 @@ use crate::{
     free_join::execute::FrameUpdate,
     hash_index::{BufferedSubset, TableEntry},
     offsets::SortedOffsetVector,
+    table::TableEntry as SwTableEntry,
     table_spec::Constraint,
     RowId,
 };
@@ -420,6 +421,7 @@ pool_set! {
         frame_updates: FrameUpdate [ 1 << 25 ],
         frame_update_vecs: Vec<Pooled<FrameUpdate>> [ 1 << 20 ],
         tuple_indexes: HashTable<TableEntry<BufferedSubset>> [ 1 << 20 ],
+        staged_outputs: HashTable<SwTableEntry> [ 1 << 25 ],
         predicted_vals: PredictedVals [ 1 << 20 ],
         shard_hist: DenseIdMap<ShardId, usize> [ 1 << 20 ],
     }
