@@ -21,9 +21,7 @@ use crate::{
 use super::{
     get_column_index_from_tableinfo,
     plan::{JoinStage, Plan},
-    with_pool_set,
-    work_tracking::{self, MorselSize},
-    ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
+    with_pool_set, ActionId, AtomId, Database, HashColumnIndex, HashIndex, Variable,
 };
 
 enum DynamicIndex {
@@ -340,6 +338,14 @@ impl<'a> JoinState<'a> {
         self.get_index(plan, atom, binding_info, iter::once(col))
     }
 
+    /// The core method for executing a free join plan.
+    ///
+    /// This method takes the plan, mutable data-structures for variable binding and staging
+    /// actions, and two indexes: `cur` which is the current stage of the plan to run, and `level`
+    /// which is the current "fan-out" node we are in. The latter parameter is an experimental
+    /// index used to detect if we are at the "top" of a plan rather than the "bottom", and is
+    /// currently used as a heuristic to determine if we should increase parallelism more than the
+    /// default.
     fn run_plan<'buf, BUF: ActionBuffer<'buf>>(
         &self,
         plan: &'a Plan,
@@ -777,6 +783,10 @@ impl Clear for FrameUpdate {
     fn reuse(&self) -> bool {
         self.bindings.capacity() > 0 || self.refinements.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.bindings.capacity() * mem::size_of::<(Variable, Value)>()
+            + self.refinements.capacity() * mem::size_of::<(AtomId, Subset)>()
+    }
 }
 
 const VAR_BATCH_SIZE: usize = 128;
@@ -882,7 +892,6 @@ struct ScopedActionBuffer<'inner, 'scope> {
     rule_set: &'scope RuleSet,
     batches: DenseIdMap<ActionId, ActionState>,
     needs_flush: bool,
-    cur_morsel_size: MorselSize,
 }
 
 impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
@@ -892,7 +901,6 @@ impl<'inner, 'scope> ScopedActionBuffer<'inner, 'scope> {
             rule_set,
             batches: Default::default(),
             needs_flush: false,
-            cur_morsel_size: MorselSize::new(1024),
         }
     }
 }
@@ -923,10 +931,8 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
             let mut bindings = mem::take(&mut action_state.bindings);
             action_state.len = 0;
             let rule_set = self.rule_set;
-            work_tracking::enter_work();
             self.scope.spawn(move |_| {
                 state.run_instrs(&rule_set.actions[action], &mut bindings);
-                work_tracking::exit_work();
             });
         }
     }
@@ -942,22 +948,18 @@ impl<'scope> ActionBuffer<'scope> for ScopedActionBuffer<'_, 'scope> {
         work: impl for<'a> FnOnce(&mut Local, &mut ScopedActionBuffer<'a, 'scope>) + Send + 'scope,
     ) {
         let rule_set = self.rule_set;
-        let cur_morsel_size = self.cur_morsel_size.clone();
         let mut inner = local.clone();
-        work_tracking::enter_work();
         self.scope.spawn(move |scope| {
             let mut buf: ScopedActionBuffer<'_, 'scope> = ScopedActionBuffer {
                 scope,
                 rule_set,
                 needs_flush: false,
                 batches: Default::default(),
-                cur_morsel_size,
             };
             work(&mut inner, &mut buf);
             if buf.needs_flush {
                 flush_action_states(&mut to_exec_state(), &mut buf.batches, buf.rule_set);
             }
-            work_tracking::exit_work();
         });
     }
     fn morsel_size(&mut self, _level: usize) -> usize {

@@ -37,6 +37,8 @@ pub trait Clear: Default {
     fn reuse(&self) -> bool {
         true
     }
+    /// A rough approximation for the in-memory overhead of this object.
+    fn bytes(&self) -> usize;
 }
 
 impl<T> Clear for Vec<T> {
@@ -46,6 +48,9 @@ impl<T> Clear for Vec<T> {
     fn reuse(&self) -> bool {
         self.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.capacity() * mem::size_of::<T>()
+    }
 }
 
 impl<T: Clear> Clear for Rc<T> {
@@ -54,6 +59,9 @@ impl<T: Clear> Clear for Rc<T> {
     }
     fn reuse(&self) -> bool {
         Rc::strong_count(self) == 1 && Rc::weak_count(self) == 0
+    }
+    fn bytes(&self) -> usize {
+        mem::size_of::<T>()
     }
 }
 
@@ -75,6 +83,9 @@ impl<T> Clear for HashSet<T> {
     fn reuse(&self) -> bool {
         self.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.capacity() * mem::size_of::<T>()
+    }
 }
 
 impl<T> Clear for HashTable<T> {
@@ -83,6 +94,9 @@ impl<T> Clear for HashTable<T> {
     }
     fn reuse(&self) -> bool {
         self.capacity() > 0
+    }
+    fn bytes(&self) -> usize {
+        self.capacity() * mem::size_of::<T>()
     }
 }
 
@@ -93,6 +107,9 @@ impl<K, V> Clear for HashMap<K, V> {
     fn reuse(&self) -> bool {
         self.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.capacity() * mem::size_of::<(K, V)>()
+    }
 }
 
 impl<K, V> Clear for IndexMap<K, V> {
@@ -101,6 +118,9 @@ impl<K, V> Clear for IndexMap<K, V> {
     }
     fn reuse(&self) -> bool {
         self.capacity() > 0
+    }
+    fn bytes(&self) -> usize {
+        self.capacity() * (mem::size_of::<u64>() + mem::size_of::<(K, V)>())
     }
 }
 
@@ -111,6 +131,9 @@ impl<T> Clear for IndexSet<T> {
     fn reuse(&self) -> bool {
         self.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.capacity() * (mem::size_of::<u64>() + mem::size_of::<T>())
+    }
 }
 
 impl Clear for FixedBitSet {
@@ -120,11 +143,57 @@ impl Clear for FixedBitSet {
     fn reuse(&self) -> bool {
         !self.is_empty()
     }
+    fn bytes(&self) -> usize {
+        self.len() / 8
+    }
+}
+
+struct PoolState<T> {
+    data: Vec<T>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl<T: Clear> PoolState<T> {
+    fn new(limit: usize) -> Self {
+        PoolState {
+            data: Vec::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, mut item: T) {
+        if !item.reuse() {
+            return;
+        }
+        if self.bytes + item.bytes() > self.limit {
+            return;
+        }
+        item.clear();
+        self.bytes += item.bytes();
+        self.data.push(item);
+    }
+
+    fn pop(&mut self) -> T {
+        if let Some(got) = self.data.pop() {
+            self.bytes -= got.bytes();
+            got
+        } else {
+            Default::default()
+        }
+    }
+
+    fn clear_and_shrink(&mut self) {
+        self.data.clear();
+        self.bytes = 0;
+        self.data.shrink_to_fit();
+    }
 }
 
 /// A shared pool of objects.
 pub struct Pool<T> {
-    data: Rc<RefCell<Vec<T>>>,
+    data: Rc<RefCell<PoolState<T>>>,
 }
 
 impl<T> Clone for Pool<T> {
@@ -138,15 +207,20 @@ impl<T> Clone for Pool<T> {
 impl<T: Clear> Default for Pool<T> {
     fn default() -> Self {
         Pool {
-            data: Default::default(),
+            data: Rc::new(RefCell::new(PoolState::new(usize::MAX))),
         }
     }
 }
 
 impl<T: Clear + InPoolSet<PoolSet>> Pool<T> {
+    pub(crate) fn new(limit: usize) -> Pool<T> {
+        Pool {
+            data: Rc::new(RefCell::new(PoolState::new(limit))),
+        }
+    }
     /// Get an empty value of type `T`, potentially reused from the pool.
     pub(crate) fn get(&self) -> Pooled<T> {
-        let empty = self.data.borrow_mut().pop().unwrap_or_default();
+        let empty = self.data.borrow_mut().pop();
 
         Pooled {
             data: ManuallyDrop::new(empty),
@@ -156,8 +230,7 @@ impl<T: Clear + InPoolSet<PoolSet>> Pool<T> {
     /// Clear the contents of the pool and release any memory associated with it.
     pub(crate) fn clear(&self) {
         let mut data_mut = self.data.borrow_mut();
-        data_mut.clear();
-        data_mut.shrink_to_fit();
+        data_mut.clear_and_shrink();
     }
 }
 
@@ -209,9 +282,10 @@ impl<T: Clear + InPoolSet<PoolSet> + 'static> Pooled<T> {
             return;
         }
         let pool = with_pool_set(|ps| ps.get_pool::<T>());
-        let Some(mut other) = pool.data.borrow_mut().pop() else {
+        let mut other = pool.data.borrow_mut().pop();
+        if !other.reuse() {
             return;
-        };
+        }
         let slot: &mut T = &mut this.data;
         mem::swap(slot, &mut other);
     }
@@ -283,12 +357,21 @@ where
 }
 
 macro_rules! pool_set {
-    ($vis:vis $name:ident { $($ident:ident : $ty:ty,)* }) => {
-        #[derive(Default)]
+    ($vis:vis $name:ident { $($ident:ident : $ty:ty [ $bytes:expr ],)* }) => {
         $vis struct $name {
             $(
                 $ident: Pool<$ty>,
             )*
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                $name {
+                $(
+                    $ident: Pool::new($bytes),
+                )*
+                }
+            }
         }
 
         impl $name {
@@ -314,23 +397,31 @@ macro_rules! pool_set {
     }
 }
 
+// The main thread-local memory pool used for reusing allocations. The syntax is:
+//
+// <name> : <type> [ <bytes> ],
+//
+// Where `name` is not used for anything, `type` feeds into the `InPoolSet` machinery and allows
+// anything of that type to be allocated using `with_pool_set`, and `bytes` is a per-type limit on
+// the total bytes that can be buffered in a single (per-thread) memory pool.
+
 pool_set! {
     pub PoolSet {
-        vec_vals: Vec<Value>,
-        vec_cell_vals: Vec<Cell<Value>>,
+        vec_vals: Vec<Value> [ 1 << 25 ],
+        vec_cell_vals: Vec<Cell<Value>> [ 1 << 25 ],
         // TODO: work on scaffolding/DI/etc. so that we can share allocations
         // between vec_vals and shared_vals.
-        rows: Vec<RowId>,
-        offset_vec: SortedOffsetVector,
-        column_index: IndexMap<Value, BufferedSubset>,
-        constraints: Vec<Constraint>,
-        bitsets: FixedBitSet,
-        instrs: Vec<Instr>,
-        frame_updates: FrameUpdate,
-        frame_update_vecs: Vec<Pooled<FrameUpdate>>,
-        tuple_indexes: HashTable<TableEntry<BufferedSubset>>,
-        predicted_vals: PredictedVals,
-        shard_hist: DenseIdMap<ShardId, usize>,
+        rows: Vec<RowId> [ 1 << 25 ],
+        offset_vec: SortedOffsetVector [ 1 << 20 ],
+        column_index: IndexMap<Value, BufferedSubset> [ 1 << 20 ],
+        constraints: Vec<Constraint> [ 1 << 20 ],
+        bitsets: FixedBitSet [ 1 << 20 ],
+        instrs: Vec<Instr> [ 1 << 20 ],
+        frame_updates: FrameUpdate [ 1 << 25 ],
+        frame_update_vecs: Vec<Pooled<FrameUpdate>> [ 1 << 20 ],
+        tuple_indexes: HashTable<TableEntry<BufferedSubset>> [ 1 << 20 ],
+        predicted_vals: PredictedVals [ 1 << 20 ],
+        shard_hist: DenseIdMap<ShardId, usize> [ 1 << 20 ],
     }
 }
 

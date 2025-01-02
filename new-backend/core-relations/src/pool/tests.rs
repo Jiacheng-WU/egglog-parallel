@@ -19,7 +19,7 @@ fn pooled_does_not_drop() {
         let d3 = pool.get();
         assert!(d3.cleared);
     }
-    assert_eq!(DROP_COUNT.with(|k| { k.get() }), start + 2);
+    assert_eq!(DROP_COUNT.with(|k| { k.get() }), start + 3);
 }
 
 #[test]
@@ -84,6 +84,9 @@ impl Clear for Dropper {
     }
     fn reuse(&self) -> bool {
         self.reuse
+    }
+    fn bytes(&self) -> usize {
+        0
     }
 }
 

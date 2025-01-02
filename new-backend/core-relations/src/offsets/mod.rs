@@ -107,6 +107,9 @@ impl Clear for SortedOffsetVector {
     fn reuse(&self) -> bool {
         self.0.capacity() > 0
     }
+    fn bytes(&self) -> usize {
+        self.0.capacity() * mem::size_of::<RowId>()
+    }
 }
 
 impl Offsets for SortedOffsetVector {

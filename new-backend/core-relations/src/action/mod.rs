@@ -113,6 +113,11 @@ impl Clear for PredictedVals {
         }
         self.data.clear()
     }
+    fn bytes(&self) -> usize {
+        self.data.capacity()
+            * (std::mem::size_of::<(TableId, SmallVec<[Value; 3]>)>()
+                + std::mem::size_of::<Pooled<Vec<Value>>>())
+    }
 }
 
 impl PredictedVals {

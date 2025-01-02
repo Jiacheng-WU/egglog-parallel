@@ -254,6 +254,12 @@ impl Database {
         &mut self.primitives
     }
 
+    /// Apply the value-level rewrite rule encoded by `func_id` to all the tables in `to_rewrite`.
+    ///
+    /// The native [`Table::apply_rewrite`] method takes a `next_ts` argument for filling in new
+    /// values in a table like [`crate::SortedWritesTable`] where values in a certain column need
+    /// to be inserted in sorted order; the `next_ts` argument to this method is passed to
+    /// `apply_rewrite` for this purpose.
     pub fn apply_rewrite(
         &mut self,
         func_id: TableId,

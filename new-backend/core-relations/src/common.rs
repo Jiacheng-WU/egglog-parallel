@@ -92,6 +92,9 @@ impl<K: NumericId, V> Clear for DenseIdMap<K, V> {
     fn clear(&mut self) {
         self.clear();
     }
+    fn bytes(&self) -> usize {
+        self.capacity() * mem::size_of::<Option<V>>()
+    }
 }
 
 define_id!(pub Value, u32, "A generic identifier representing an egglog value");

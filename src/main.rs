@@ -3,6 +3,9 @@ use egglog::{EGraph, RunMode, SerializeConfig};
 use std::io::{self, BufRead, BufReader};
 use std::path::PathBuf;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Debug, Parser)]
 #[command(version = env!("FULL_VERSION"), about = env!("CARGO_PKG_DESCRIPTION"))]
 struct Args {
