@@ -198,12 +198,7 @@ impl<'b> Context<'b> {
                         .map(|(j, _a)| tries[*j].len())
                         .min()
                         .unwrap();
-                    // if min_len < 10 {
-                    //     1
-                    // } else {
-                    //     *partition_size
-                    // }
-                    *partition_size
+                    usize::max(usize::min(*partition_size, min_len), 1)
                 };
 
                 if let Some(x) = trie_accesses
@@ -213,9 +208,8 @@ impl<'b> Context<'b> {
                 {
                     stage.add_measurement(x);
                 }
-
-                let mut tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 4]> =
-                    SmallVec::with_capacity(partition_size);
+                let mut tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 1]> =
+                    SmallVec::with_capacity(partition_size - 1);
                 for _i in 0..partition_size - 1 {
                     tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
                 }
@@ -231,8 +225,8 @@ impl<'b> Context<'b> {
                     }
                 };
 
-                let mut ctx_workspace: SmallVec<[SyncUnsafeCell<Context>; 4]> =
-                    SmallVec::with_capacity(partition_size);
+                let mut ctx_workspace: SmallVec<[SyncUnsafeCell<Context>; 1]> =
+                    SmallVec::with_capacity(partition_size - 1);
                 for _i in 0..partition_size - 1 {
                     ctx_workspace.push(SyncUnsafeCell::new(self.clone()));
                 }
@@ -246,23 +240,26 @@ impl<'b> Context<'b> {
                 };
 
                 match trie_accesses.as_slice() {
-                    [(j, access)] => get_tries(0)[*j].for_each(
-                        access,
-                        |p, value, trie| {
-                            let tries = get_tries(p);
-                            let this = get_context(p);
+                    [(j, access)] => {
+                        assert!(partition_size == 1);
+                        get_tries(0)[*j].for_each(
+                            access,
+                            |p, value, trie| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
 
-                            let old_trie = std::mem::replace(&mut tries[*j], unsafe {
-                                // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
-                                &*(trie as *const LazyTrie)
-                            });
-                            this.tuple.get_mut()[*value_idx] = value;
-                            this.eval(tries, program, stage.next(), f)?;
-                            tries[*j] = old_trie;
-                            Ok(())
-                        },
-                        partition_size,
-                    ),
+                                let old_trie = std::mem::replace(&mut tries[*j], unsafe {
+                                    // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                    &*(trie as *const LazyTrie)
+                                });
+                                this.tuple.get_mut()[*value_idx] = value;
+                                this.eval(tries, program, stage.next(), f)?;
+                                tries[*j] = old_trie;
+                                Ok(())
+                            },
+                            partition_size,
+                        )
+                    },
                     [a, b] => {
                         let tries = get_tries(0);
                         let (a, b) = if tries[a.0].len() <= tries[b.0].len() {
@@ -302,7 +299,7 @@ impl<'b> Context<'b> {
                             .min_by_key(|(j, _a)| tries[*j].len())
                             .unwrap();
 
-                        let mut new_tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 4]> =
+                        let mut new_tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 1]> =
                             SmallVec::with_capacity(partition_size);
                         for _i in 0..partition_size {
                             new_tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
@@ -988,7 +985,6 @@ impl LazyTrie {
         // Also, when T1 finished, the T2 release write lock and get the read lock,
         // and then T3 get the write lock it then is stucked also
         // Solution: Before get the write lock, check if the trie is already sparse or borrowed.
-
         let read_lock = self.0.read().unwrap();
         let lazy_trie = match &read_lock as &LazyTrieInner {
             LazyTrieInner::Delayed(..) => {
@@ -1072,8 +1068,6 @@ impl LazyTrie {
             return Ok(());
         }
 
-        let partition_size = usize::min(partition_size, len);
-
         if partition_size == 1 {
             for (k, v) in m.iter() {
                 if f(0, *k, v).is_err() {
@@ -1082,13 +1076,10 @@ impl LazyTrie {
             }
             return Ok(());
         }
-        // dbg!(partition_size);
-        // dbg!(len);
 
         let chunk = (len - 1) / partition_size + 1;
         (0..partition_size)
             .into_par_iter()
-            .by_uniform_blocks(1)
             .for_each(|p| {
                 let lo = p * chunk;
                 let hi = usize::min((p + 1) * chunk, len);
@@ -1102,22 +1093,6 @@ impl LazyTrie {
                     }
                 }
             });
-
-        // (0..partition_size).into_par_iter().for_each(|p| {
-        //     for (k, v) in m.iter() {
-        //         // get the hash value of k
-        //         let mut hasher = DefaultHasher::new();
-        //         hasher.write_u64(k.bits);
-        //         let hash = (hasher.finish() as usize) % partition_size;
-        //         if hash == p {
-        //             if f(p, *k, v).is_err() {
-        //                 *should_stop.get_mut() = true;
-        //                 return;
-        //             }
-        //         }
-
-        //     }
-        // });
 
         if unsafe { *should_stop.get() } {
             Err(())
