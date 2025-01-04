@@ -449,21 +449,20 @@ pub(crate) struct ReadHandle<'a, T> {
 }
 
 impl<T: Deref<Target = [Cell<Value>]>> ReadHandle<'_, T> {
-    pub(crate) fn get_row(&self, row: RowId) -> Option<&[Value]> {
-        if row.index() < self.data.len() {
-            // SAFETY: ParallelVecWriter guarantees that data within bounds is not
-            // being modified concurrently.
-            Some(unsafe { get_row(&self.data, self.buf.n_columns, row) })
-        } else {
-            None
-        }
-    }
-
-    /// Get a raw pointer to the start of the buffer.
+    /// Get the row corresponding to the given RowId without bounds checking.
     ///
-    /// Used for debug assertions only
-    pub(crate) fn _data_offset_for_testing(&self) -> *const Value {
-        self.data.as_ptr() as *const Value
+    /// # Safety
+    /// The caller must ensure that either `row` is within bounds of the buffer at the creation of
+    /// this handle, or that the row was successfully written to the buffer before it was called.
+    ///
+    /// Furthermore, no calls to `set_stale_shared` may overlap with this call.
+    pub(crate) unsafe fn get_row_unchecked(&self, row: RowId) -> &[Value] {
+        // SAFETY: ParallelVecWriter guarantees that data within bounds is not
+        // being modified concurrently.
+        std::slice::from_raw_parts(
+            self.data.as_ptr().add(row.index() * self.buf.n_columns) as *const Value,
+            self.buf.n_columns,
+        )
     }
 
     /// See the documentation for [`RowBuffer::set_stale_shared`].

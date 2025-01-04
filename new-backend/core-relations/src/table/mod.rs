@@ -606,10 +606,9 @@ impl SortedWritesTable {
                         current: None,
                         baseline: self.offsets.last().map(|(v, _)| *v),
                     },
-                    total,
                 )
             } else {
-                self.parallel_insert(exec_state, (), total)
+                self.parallel_insert(exec_state, ())
             }
         } else {
             self.serial_insert(exec_state)
@@ -735,8 +734,8 @@ impl SortedWritesTable {
         &mut self,
         exec_state: &ExecutionState,
         checker: C,
-        n_rows: usize,
     ) -> bool {
+        const BATCH_SIZE: usize = 1 << 18;
         // Parallel insert uses one giant parallel foreach. We have updates
         // pre-sharded, and one logical thread can process updates for each
         // shard independently. Updates happen in three phases, which comments
@@ -758,7 +757,89 @@ impl SortedWritesTable {
                 let mut scratch = with_pool_set(|ps| ps.get::<Vec<Value>>());
                 let queue = &self.pending_state.pending_rows[shard_id];
                 let mut marked_stale = 0usize;
-                let mut staged = StagedOutputs::new(n_keys, n_cols, n_rows);
+                let mut staged = StagedOutputs::new(n_keys, n_cols, BATCH_SIZE);
+                let mut changed = false;
+                // The core flush loop: We call once `staged` reaches `BATCH_SIZE` or
+                // when we're done.
+                macro_rules! flush_staged_outputs {
+                    () => {{
+                        // Phase 2: Write the staged rows to the row writer. This only
+                        // works due to the `ParallelRowBufWriter` machinery.
+                        let start_row = staged.write_output(&row_writer);
+                        // Phase 3: With the values buffered in the row buffer, we can
+                        // write them back to the shard, pointed to the correct rows.
+
+                        // In the serial implementation, we do phases 2 and 3 inline with
+                        // processing the incoming mutation, but separating them out
+                        // this way allows us to do a single write to the shared row
+                        // buffer, rather than one per row, which would cause
+                        // contention.
+                        let mut cur_row = start_row;
+                        let read_handle = row_writer.read_handle();
+                        for row in staged.rows() {
+                            use hashbrown::hash_table::Entry;
+                            checker.check_local(row);
+                            changed = true;
+                            let key = &row[0..n_keys];
+                            let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
+                            #[cfg(any(debug_assertions, test))]
+                            {
+                                unsafe {
+                                    // read the value we wrote at this row and
+                                    // check that it matches.
+                                    assert_eq!(read_handle.get_row_unchecked(cur_row), row);
+                                }
+                            }
+                            debug_assert_eq!(_actual_shard, shard_id);
+                            match shard.entry(
+                                hc,
+                                // SAFETY: `ent` must point to a valid row
+                                |ent| unsafe {
+                                    ent.hashcode == hc as HashCode
+                                        && &read_handle.get_row_unchecked(ent.row)[0..n_keys] == key
+                                },
+                                TableEntry::hashcode,
+                            ) {
+                                Entry::Occupied(mut occ) => {
+                                    // SAFETY: `occ` must point to a valid row: we only insert valid rows
+                                    // into the map.
+                                    let cur = unsafe { read_handle.get_row_unchecked(occ.get().row) };
+
+                                    // SAFETY: The safety requirements of
+                                    // `set_stale_shared` are that there are no
+                                    // concurrent accesses to `row`. We have
+                                    // exclusive access to any row whose hash matches this
+                                    // shard.
+                                    if (self.merge.0)(&mut exec_state, cur, row, &mut scratch) {
+                                        unsafe {
+                                            let _was_stale = read_handle.set_stale_shared(occ.get().row);
+                                            debug_assert!(!_was_stale);
+                                        }
+                                        occ.get_mut().row = cur_row;
+                                    } else {
+                                        // Mark the new row as stale: we didn't end up needing it.
+                                        unsafe {
+                                            let _was_stale = read_handle.set_stale_shared(cur_row);
+                                            debug_assert!(!_was_stale);
+                                        }
+                                    }
+                                    marked_stale += 1;
+                                    scratch.clear();
+                                }
+                                Entry::Vacant(v) => {
+                                    v.insert(TableEntry {
+                                        hashcode: hc as HashCode,
+                                        row: cur_row,
+                                    });
+                                }
+                            }
+
+                            cur_row = cur_row.inc();
+                        }
+                        changed |= staged.changed;
+                        staged.clear();
+                    }};
+                }
                 // Phase 1: process all incoming updates:
                 // * Add new values to `staged`
                 // * Removing entries in `shard` and mark them as stale in
@@ -771,97 +852,13 @@ impl SortedWritesTable {
                         staged.insert(row, |cur, new, out| {
                             (self.merge.0)(&mut exec_state, cur, new, out)
                         });
+                        if staged.len() >= BATCH_SIZE {
+                            flush_staged_outputs!();
+                        }
                     }
                 }
-                // Phase 2: Write the staged rows to the row writer. This only
-                // works due to the `ParallelRowBufWriter` machinery.
-                let start_row = staged.write_output(&row_writer);
-                // Phase 3: With the values buffered in the row buffer, we can
-                // write them back to the shard, pointed to the correct rows.
-
-                // In the serial implementation, we do phases 2 and 3 inline with
-                // processing the incoming mutation, but separating them out
-                // this way allows us to do a single write to the shared row
-                // buffer, rather than one per row, which would cause
-                // contention.
-                let mut changed = false;
-                let mut cur_row = start_row;
-                let read_handle = row_writer.read_handle();
-                for row in staged.rows() {
-                    use hashbrown::hash_table::Entry;
-                    checker.check_local(row);
-                    changed = true;
-                    let key = &row[0..n_keys];
-                    let (_actual_shard, hc) = hash_code(shard_data, row, n_keys);
-                    #[cfg(any(debug_assertions, test))]
-                    {
-                        assert!(shard
-                            .find(hc, |ent| {
-                                ent.hashcode == hc as HashCode
-                                    && read_handle
-                                        .get_row(ent.row)
-                                        .map(|x| &x[0..n_keys] == row)
-                                        .unwrap_or(false)
-                            })
-                            .is_none());
-                        unsafe {
-                            // (hackily) read the value we wrote at this row and
-                            // check that it matches.
-                            let data_raw = read_handle._data_offset_for_testing();
-                            let actual_row = std::slice::from_raw_parts(
-                                data_raw.add(cur_row.index() * self.n_columns),
-                                self.n_columns,
-                            );
-                            assert_eq!(actual_row, row);
-                        }
-                    }
-                    debug_assert_eq!(_actual_shard, shard_id);
-                    match shard.entry(
-                        hc,
-                        |ent| {
-                            ent.hashcode == hc as HashCode
-                                && read_handle
-                                    .get_row(ent.row)
-                                    .map(|x| &x[0..n_keys] == key)
-                                    .unwrap_or(false)
-                        },
-                        TableEntry::hashcode,
-                    ) {
-                        Entry::Occupied(mut occ) => {
-                            let cur = read_handle.get_row(occ.get().row).unwrap();
-
-                            // SAFETY: The safety requirements of
-                            // `set_stale_shared` are that there are no
-                            // concurrent accesses to `row`. We have
-                            // exclusive access to any row whose hash matches this
-                            // shard.
-                            if (self.merge.0)(&mut exec_state, cur, row, &mut scratch) {
-                                unsafe {
-                                    let _was_stale = read_handle.set_stale_shared(occ.get().row);
-                                    debug_assert!(!_was_stale);
-                                }
-                                occ.get_mut().row = cur_row;
-                            } else {
-                                // Mark the new row as stale: we didn't end up needing it.
-                                unsafe {
-                                    let _was_stale = read_handle.set_stale_shared(cur_row);
-                                    debug_assert!(!_was_stale);
-                                }
-                            }
-                            marked_stale += 1;
-                            scratch.clear();
-                        }
-                        Entry::Vacant(v) => {
-                            v.insert(TableEntry {
-                                hashcode: hc as HashCode,
-                                row: cur_row,
-                            });
-                        }
-                    }
-
-                    cur_row = cur_row.inc();
-                }
-                (checker, marked_stale, changed || staged.changed)
+                flush_staged_outputs!();
+                (checker, marked_stale, changed)
             })
             .collect_vec_list();
         self.data.data = row_writer.finish();
@@ -1414,6 +1411,15 @@ impl StagedOutputs {
         res.hash.reserve(capacity, TableEntry::hashcode);
         res.rows.reserve(capacity);
         res
+    }
+    fn clear(&mut self) {
+        self.hash.clear();
+        self.rows.clear();
+        self.n_stale = 0;
+        self.changed = false;
+    }
+    fn len(&self) -> usize {
+        self.rows.len() - self.n_stale
     }
 
     fn insert(
