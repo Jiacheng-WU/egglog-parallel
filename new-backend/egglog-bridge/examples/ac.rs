@@ -91,8 +91,13 @@ fn main() {
             (left_root, right_root)
         };
         // Saturate
-        while egraph.run_rules(&[add_comm, add_assoc]).unwrap() {
-            println!("Finished an interation after {:?}", start.elapsed());
+        loop {
+            let iter_start = web_time::Instant::now();
+            let keep_going = egraph.run_rules(&[add_comm, add_assoc]).unwrap();
+            println!("Finished an iteration after {:?}", iter_start.elapsed());
+            if !keep_going {
+                break;
+            }
         }
         let canon_left = egraph.get_canon(left_root);
         let canon_right = egraph.get_canon(right_root);
