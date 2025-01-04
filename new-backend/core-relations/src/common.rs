@@ -153,7 +153,10 @@ impl ShardData {
             & ((1 << self.log2_shard_count) - 1);
         ShardId::from_usize(high_bits as usize)
     }
-    pub(crate) fn get_shard<'a, V>(&self, val: &impl Hash, table: &'a IdVec<ShardId, V>) -> &'a V {
+    pub(crate) fn get_shard<'a, K: ?Sized, V>(&self, val: &K, table: &'a IdVec<ShardId, V>) -> &'a V
+    where
+        for<'b> &'b K: Hash,
+    {
         let hc = {
             let mut hasher = FxHasher::default();
             val.hash(&mut hasher);

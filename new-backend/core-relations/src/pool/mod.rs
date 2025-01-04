@@ -47,7 +47,7 @@ impl<T> Clear for Vec<T> {
         self.clear()
     }
     fn reuse(&self) -> bool {
-        self.capacity() > 0
+        self.capacity() > 256
     }
     fn bytes(&self) -> usize {
         self.capacity() * mem::size_of::<T>()
