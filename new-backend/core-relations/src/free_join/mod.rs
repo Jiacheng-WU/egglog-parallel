@@ -279,7 +279,7 @@ impl Database {
         }
 
         let func = self.tables.take(func_id).unwrap();
-        let prediced = PredictedVals::default();
+        let predicted = PredictedVals::default();
         if do_parallel() {
             let mut tables = Vec::with_capacity(to_rewrite.len());
             for id in to_rewrite {
@@ -292,7 +292,7 @@ impl Database {
                     next_ts,
                     &mut ExecutionState {
                         db: self.read_only_view(),
-                        predicted: &prediced,
+                        predicted: &predicted,
                         buffers: Default::default(),
                     },
                 );
@@ -309,7 +309,7 @@ impl Database {
                     next_ts,
                     &mut ExecutionState {
                         db: self.read_only_view(),
-                        predicted: &prediced,
+                        predicted: &predicted,
                         buffers: Default::default(),
                     },
                 );
