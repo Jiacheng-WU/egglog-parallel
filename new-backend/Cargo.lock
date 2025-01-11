@@ -179,13 +179,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "containers-2"
-version = "0.1.0"
-dependencies = [
- "core-relations",
-]
-
-[[package]]
 name = "core-relations"
 version = "0.1.0"
 dependencies = [
