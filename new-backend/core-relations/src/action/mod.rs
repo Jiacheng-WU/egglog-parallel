@@ -2,7 +2,7 @@
 //!
 //! This allows us to execute the "right-hand-side" of a rule. The
 //! implementation here is optimized to execute on a batch of rows at a time.
-use std::{ops::Deref, sync::atomic::AtomicUsize};
+use std::{mem, ops::Deref, sync::atomic::AtomicUsize};
 
 use numeric_id::{DenseIdMap, NumericId};
 use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
@@ -305,7 +305,10 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
         // iteration on the "transpose" of these sources (row-wise).
         macro_rules! iter_entries {
             ($pool:expr, $entries:expr) => {
-                mask.iter_dynamic(
+                iter_entries!(mask, $pool, $entries)
+            };
+            ($mask:expr, $pool:expr, $entries:expr) => {
+                $mask.iter_dynamic(
                     $pool,
                     $entries.iter().map(|v| match v {
                         QueryEntry::Var(v) => {
@@ -335,15 +338,20 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
                     self.db.table_info.get_table(*table_id).new_buffer()
                 });
                 let table = self.db.table_info.get_table(*table_id);
-                let mut out = pool.get();
-
-                // TODO: we may want to vectorize this one better: do a round of
-                // lookups, then for ones that failed, do a round of inserts.
-                iter_entries!(pool, args).fill_vec(&mut out, Value::stale, |offset, key| {
+                // Do two passes over the current vector. First, do a round of lookups. Then, for
+                // any offsets where the lookup failed, insert the default value.
+                let mut mask_copy = mask.clone();
+                table.lookup_row_vectorized(&mut mask_copy, bindings, args, *dst_col, *dst_var);
+                mask_copy.symmetric_difference(mask);
+                if mask_copy.is_empty() {
+                    return;
+                }
+                let mut out = mem::take(&mut bindings[*dst_var]);
+                iter_entries!(mask_copy, pool, args).assign_vec(&mut out, |offset, key| {
                     // First, check if the entry is already in the table:
-                    if let Some(row) = table.get_row_column(&key, *dst_col) {
-                        return Some(row);
-                    }
+                    // if let Some(row) = table.get_row_column(&key, *dst_col) {
+                    //     return row;
+                    // }
                     // If not, insert the default value.
                     //
                     // We avoid doing this more than once by using the
@@ -380,7 +388,7 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
                             buffers.get_mut(*table_id).unwrap().stage_insert(&row);
                             row
                         });
-                    Some(row[dst_col.index()])
+                    row[dst_col.index()]
                 });
                 bindings.insert(*dst_var, out);
             }

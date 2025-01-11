@@ -110,15 +110,14 @@ impl<TI: IndexBase> Index<TI> {
 
 pub(crate) struct SubsetTable {
     keys: RowBuffer,
-    table: Pooled<HashTable<TableEntry<BufferedSubset>>>,
+    hash: Pooled<HashTable<TableEntry<BufferedSubset>>>,
 }
-type TodoRenameTableToHash = ();
 
 impl SubsetTable {
     fn new(key_arity: usize) -> SubsetTable {
         SubsetTable {
             keys: RowBuffer::new(key_arity),
-            table: with_pool_set(|ps| ps.get()),
+            hash: with_pool_set(|ps| ps.get()),
         }
     }
 }
@@ -328,7 +327,7 @@ impl IndexBase for TupleIndex {
     fn clear(&mut self) {
         for (_, shard) in self.shards.iter_mut() {
             shard.table.keys.clear();
-            for entry in shard.table.table.drain() {
+            for entry in shard.table.hash.drain() {
                 match entry.vals {
                     BufferedSubset::Dense(_) => {}
                     BufferedSubset::Sparse(v) => {
@@ -342,7 +341,7 @@ impl IndexBase for TupleIndex {
     fn get_subset<'a>(&'a self, key: &[Value]) -> Option<SubsetRef<'a>> {
         let hash = hash_key(key);
         let shard = &self.shards[self.shard_data.shard_id(hash)];
-        let entry = shard.table.table.find(hash, |entry| {
+        let entry = shard.table.hash.find(hash, |entry| {
             entry.hash == hash && shard.table.keys.get_row(entry.key) == key
         })?;
         Some(entry.vals.as_ref(&shard.subsets))
@@ -352,7 +351,7 @@ impl IndexBase for TupleIndex {
         use hashbrown::hash_table::Entry;
         let hash = hash_key(key);
         let shard = &mut self.shards[self.shard_data.shard_id(hash)];
-        let table_entry = shard.table.table.entry(
+        let table_entry = shard.table.hash.entry(
             hash,
             |entry| entry.hash == hash && shard.table.keys.get_row(entry.key) == key,
             |ent| ent.hash,
@@ -383,7 +382,7 @@ impl IndexBase for TupleIndex {
     }
     fn for_each(&self, mut f: impl FnMut(&Self::Key, SubsetRef)) {
         for (_, shard) in self.shards.iter() {
-            for entry in shard.table.table.iter() {
+            for entry in shard.table.hash.iter() {
                 let key = shard.table.keys.get_row(entry.key);
                 f(key, entry.vals.as_ref(&shard.subsets));
             }
@@ -393,7 +392,7 @@ impl IndexBase for TupleIndex {
     fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|(_, shard)| shard.table.table.len())
+            .map(|(_, shard)| shard.table.hash.len())
             .sum()
     }
 
@@ -449,7 +448,7 @@ impl IndexBase for TupleIndex {
                 for (_, buf) in vec.drain(..) {
                     for (row_id, key) in buf.non_stale() {
                         let hash = hash_key(key);
-                        let table_entry = shard.table.table.entry(
+                        let table_entry = shard.table.hash.entry(
                             hash,
                             |entry| {
                                 entry.hash == hash && shard.table.keys.get_row(entry.key) == key

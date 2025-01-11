@@ -91,6 +91,7 @@ pub trait UnionFindHandle: Send {
     fn generate_id(&self) -> Value;
     fn union(&self, id1: Value, id2: Value) -> Value;
     fn find(&self, id: Value) -> Value;
+    fn rebuild_batch(&self, ids: &mut [Value]) -> bool;
 }
 
 /// A UnionFindHandle that resolves new ids by looking them up in a table, via
@@ -126,6 +127,9 @@ impl UnionFindHandle for DynamicUnionFindHandle<'_> {
     }
 
     fn find(&self, id: Value) -> Value {
+        todo!()
+    }
+    fn rebuild_batch(&self, ids: &mut [Value]) -> bool {
         todo!()
     }
 }

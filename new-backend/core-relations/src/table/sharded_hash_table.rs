@@ -13,7 +13,12 @@ pub(crate) struct ShardedHashTable<T> {
 
 impl<T> Default for ShardedHashTable<T> {
     fn default() -> Self {
-        Self::with_shards(rayon::current_num_threads())
+        let cur_threads = rayon::current_num_threads();
+        if cur_threads == 1 {
+            Self::with_shards(1)
+        } else {
+            Self::with_shards(cur_threads * 2)
+        }
     }
 }
 

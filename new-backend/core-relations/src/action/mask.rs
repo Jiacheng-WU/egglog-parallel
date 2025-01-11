@@ -16,6 +16,14 @@ pub(crate) struct Mask {
     data: Pooled<FixedBitSet>,
 }
 
+impl Clone for Mask {
+    fn clone(&self) -> Self {
+        Mask {
+            data: Pooled::cloned(&self.data),
+        }
+    }
+}
+
 // NB: this is currently a very basic implementation of execution masks, and for
 // highly "sparse" masks with only a few bits set, it's not very efficient. (For
 // "dense" masks, it's probably fine, but there's still plenty to do there too.)
@@ -31,15 +39,20 @@ pub(crate) struct Mask {
 // the bindings.).
 
 impl Mask {
-    pub(crate) fn new(range: Range<usize>, ps: &PoolSet) -> Mask {
+    pub(super) fn new(range: Range<usize>, ps: &PoolSet) -> Mask {
         let mut data = ps.get::<FixedBitSet>();
         data.grow(range.end);
         data.set_range(range, true);
         Mask { data }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.data.is_clear()
+    }
+
+    pub(super) fn symmetric_difference(&mut self, other: &Mask) {
+        debug_assert!(self.data.is_subset(&other.data));
+        self.data.symmetric_difference_with(&other.data);
     }
 
     /// Iterate over the offsets in the slice that correspond to set offsets in
@@ -69,7 +82,7 @@ impl Mask {
     }
 
     /// Set all entries in the mask to false.
-    pub(crate) fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.data.clear();
     }
 }
@@ -141,6 +154,22 @@ pub(crate) trait MaskIter {
                     self.remove(cur);
                 }
             }
+        }
+    }
+    fn assign_vec<Out>(mut self, out: &mut [Out], mut f: impl FnMut(usize, Self::Item) -> Out)
+    where
+        Self: Sized,
+    {
+        loop {
+            let cur = self.inc_counter();
+            let next = match self.get_at(cur) {
+                IterResult::Item(item) => item,
+                IterResult::Skip => {
+                    continue;
+                }
+                IterResult::Done => break,
+            };
+            out[cur] = f(cur, next);
         }
     }
 

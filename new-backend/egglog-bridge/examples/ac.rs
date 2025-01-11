@@ -91,10 +91,10 @@ fn main() {
             (left_root, right_root)
         };
         // Saturate
-        loop {
+        for i in 0.. {
             let iter_start = web_time::Instant::now();
             let keep_going = egraph.run_rules(&[add_comm, add_assoc]).unwrap();
-            println!("Finished an iteration after {:?}", iter_start.elapsed());
+            println!("Finished iteration {i} after {:?}", iter_start.elapsed());
             if !keep_going {
                 break;
             }

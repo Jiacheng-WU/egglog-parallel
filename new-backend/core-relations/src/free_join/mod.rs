@@ -369,6 +369,7 @@ impl Database {
     /// Useful for out-of-band insertions into the database.
     pub fn merge_all(&mut self) -> bool {
         let mut ever_changed = false;
+        let do_parallel = rayon::current_num_threads() > 1;
         loop {
             let mut changed = false;
             let predicted = with_pool_set(|ps| ps.get::<PredictedVals>());
@@ -399,17 +400,31 @@ impl Database {
                     tables_merging[table].0 = Some(self.tables.unwrap_val(table));
                 }
                 let db = self.read_only_view();
-                changed |= tables_merging
-                    .par_iter_mut()
-                    .map(|(_, (info, buffers))| {
-                        info.as_mut().unwrap().table.merge(&mut ExecutionState {
-                            predicted: &predicted,
-                            db,
-                            buffers: mem::take(buffers),
+                changed |= if do_parallel {
+                    tables_merging
+                        .par_iter_mut()
+                        .map(|(_, (info, buffers))| {
+                            info.as_mut().unwrap().table.merge(&mut ExecutionState {
+                                predicted: &predicted,
+                                db,
+                                buffers: mem::take(buffers),
+                            })
                         })
-                    })
-                    .max()
-                    .unwrap_or(false);
+                        .max()
+                        .unwrap_or(false)
+                } else {
+                    tables_merging
+                        .iter_mut()
+                        .map(|(_, (info, buffers))| {
+                            info.as_mut().unwrap().table.merge(&mut ExecutionState {
+                                predicted: &predicted,
+                                db,
+                                buffers: mem::take(buffers),
+                            })
+                        })
+                        .max()
+                        .unwrap_or(false)
+                };
                 for (id, (table, _)) in tables_merging.drain() {
                     self.tables.insert(id, table.unwrap());
                 }
