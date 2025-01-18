@@ -104,8 +104,9 @@ pub trait Rewriter: Send + Sync {
     /// The column that contains values that should be rewritten. If this is set, callers can use
     /// this functionality to perform rewrites incrementally.
     fn hint_col(&self) -> Option<ColumnId>;
+    fn rewrite_val(&self, val: Value) -> Value;
     /// Rewrite a contiguous slice of rows in the table.
-    fn rewrite_slice(
+    fn rewrite_buf(
         &self,
         buf: &RowBuffer,
         start: RowId,
@@ -121,6 +122,9 @@ pub trait Rewriter: Send + Sync {
         out: &mut TaggedRowBuffer,
         exec_state: &mut ExecutionState,
     );
+
+    /// Rewrite a slice of values in place, returning true if any values were changed.
+    fn rewrite_slice(&self, vals: &mut [Value]) -> bool;
 }
 
 /// A row in a table.

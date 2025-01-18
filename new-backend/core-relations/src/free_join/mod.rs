@@ -25,7 +25,7 @@ use crate::{
     primitives::Primitives,
     query::{Query, RuleSetBuilder},
     table_spec::{ColumnId, Constraint, MutationBuffer, Table, TableSpec, WrappedTable},
-    PoolSet, QueryEntry, TupleIndex, Value,
+    Containers, PoolSet, QueryEntry, TupleIndex, Value,
 };
 
 use self::plan::Plan;
@@ -133,7 +133,23 @@ define_id!(pub ExternalFunctionId, u32, "A user-defined operation that can be in
 pub trait ExternalFunction: Send + Sync {
     /// Invoke the function with mutable access to the database. If a value is
     /// not returned, halt the execution of the current rule.
-    fn invoke(&self, state: &ExecutionState, args: &[Value]) -> Option<Value>;
+    fn invoke(&self, state: &mut ExecutionState, args: &[Value]) -> Option<Value>;
+}
+
+/// Automatically generate an `ExternalFunction` implementation from a function.
+pub fn make_external_func<F: Fn(&mut ExecutionState, &[Value]) -> Option<Value> + Send + Sync>(
+    f: F,
+) -> impl ExternalFunction {
+    struct Wrapped<F>(F);
+    impl<F> ExternalFunction for Wrapped<F>
+    where
+        F: Fn(&mut ExecutionState, &[Value]) -> Option<Value> + Send + Sync,
+    {
+        fn invoke(&self, state: &mut ExecutionState, args: &[Value]) -> Option<Value> {
+            (self.0)(state, args)
+        }
+    }
+    Wrapped(f)
 }
 
 pub(crate) trait ExternalFunctionExt: ExternalFunction {
@@ -145,7 +161,7 @@ pub(crate) trait ExternalFunctionExt: ExternalFunction {
     #[doc(hidden)]
     fn invoke_batch(
         &self,
-        state: &ExecutionState,
+        state: &mut ExecutionState,
         mask: &mut Mask,
         bindings: &mut Bindings,
         args: &[QueryEntry],
@@ -181,6 +197,7 @@ pub struct Database {
     // because we keep an array per id in the UF.
     pub(crate) counters: DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_functions: DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
+    containers: Containers,
     // Tracks the relative dependencies between tables during merge operations.
     deps: DependencyGraph,
     primitives: Primitives,
@@ -252,6 +269,14 @@ impl Database {
 
     pub fn primitives_mut(&mut self) -> &mut Primitives {
         &mut self.primitives
+    }
+
+    pub fn containers(&self) -> &Containers {
+        &self.containers
+    }
+
+    pub fn containers_mut(&mut self) -> &mut Containers {
+        &mut self.containers
     }
 
     /// Apply the value-level rewrite rule encoded by `func_id` to all the tables in `to_rewrite`.
@@ -331,12 +356,13 @@ impl Database {
         f(&mut state)
     }
 
-    pub(crate) fn read_only_view(&self) -> DbView<DenseIdMap<TableId, TableInfo>> {
+    pub(crate) fn read_only_view(&self) -> DbView {
         DbView {
             table_info: &self.tables,
             counters: &self.counters,
             external_funcs: &self.external_functions,
             prims: &self.primitives,
+            containers: &self.containers,
         }
     }
 

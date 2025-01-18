@@ -178,7 +178,7 @@ impl SortedWritesTable {
                         )
                     },
                     |(mut mutation_buf, mut buf, mut exec_state), start| {
-                        rewriter.rewrite_slice(
+                        rewriter.rewrite_buf(
                             &self.data.data,
                             RowId::from_usize(start),
                             RowId::from_usize(cmp::min(
@@ -204,7 +204,7 @@ impl SortedWritesTable {
             let mut buf = TaggedRowBuffer::new(self.n_columns);
             let mut write_buf = self.new_buffer();
             for start in (0..self.data.next_row().index()).step_by(STEP_SIZE) {
-                rewriter.rewrite_slice(
+                rewriter.rewrite_buf(
                     &self.data.data,
                     RowId::from_usize(start),
                     RowId::from_usize(cmp::min(start + STEP_SIZE, self.data.next_row().index())),

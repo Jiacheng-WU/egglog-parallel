@@ -1,9 +1,5 @@
 //! Mechanisms for declaring primitive types and operations on them.
 
-// NB: We use standard Rust dynamic dispatch throughout. If we notice overhead
-// resulting from this, we can "vectorize" this API to amortize the cost of
-// dynamic type checks across larger batches of invocations.
-
 use std::{
     any::{Any, TypeId},
     fmt::{self, Debug},

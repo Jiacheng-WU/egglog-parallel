@@ -14,7 +14,7 @@ use crate::{
     pool::{with_pool_set, Clear, PoolSet, Pooled},
     primitives::PrimitiveFunctionId,
     table_spec::{ColumnId, MutationBuffer},
-    ExternalFunctionId, Primitives, WrappedTable,
+    Containers, ExternalFunctionId, Primitives, WrappedTable,
 };
 
 use self::mask::{Mask, MaskIter, ValueSource};
@@ -133,48 +133,29 @@ impl PredictedVals {
     }
 }
 
-pub trait TableInfoMap {
-    fn get_table_info(&self, table: TableId) -> &TableInfo;
-    fn get_table(&self, table: TableId) -> &WrappedTable {
-        &self.get_table_info(table).table
-    }
-}
-
-impl TableInfoMap for DenseIdMap<TableId, TableInfo> {
-    fn get_table_info(&self, table: TableId) -> &TableInfo {
-        self.get(table).expect("table not found")
-    }
-}
-
-pub(crate) struct DbView<'a, Tables> {
-    pub(crate) table_info: &'a Tables,
+#[derive(Copy, Clone)]
+pub(crate) struct DbView<'a> {
+    pub(crate) table_info: &'a DenseIdMap<TableId, TableInfo>,
     pub(crate) counters: &'a DenseIdMap<CounterId, AtomicUsize>,
     pub(crate) external_funcs: &'a DenseIdMap<ExternalFunctionId, Box<dyn ExternalFunctionExt>>,
     pub(crate) prims: &'a Primitives,
+    pub(crate) containers: &'a Containers,
 }
 
-impl<T> Clone for DbView<'_, T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-impl<T> Copy for DbView<'_, T> {}
-
-impl<T> DbView<'_, T> {
+impl DbView<'_> {
     fn inc_counter(&self, ctr: CounterId) -> usize {
         self.counters[ctr].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 }
 
-pub struct ExecutionState<'a, T = DenseIdMap<TableId, TableInfo>> {
+pub struct ExecutionState<'a> {
     pub(crate) predicted: &'a PredictedVals,
-    pub(crate) db: DbView<'a, T>,
+    pub(crate) db: DbView<'a>,
     pub(crate) buffers: DenseIdMap<TableId, Box<dyn MutationBuffer>>,
 }
 
-impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
-    pub fn new_handle(&self) -> ExecutionState<'a, T> {
+impl<'a> ExecutionState<'a> {
+    pub fn new_handle(&self) -> ExecutionState<'a> {
         let mut res = ExecutionState {
             predicted: self.predicted,
             db: self.db,
@@ -187,12 +168,12 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
     }
     pub fn stage_insert(&mut self, table: TableId, vals: &[Value]) {
         self.buffers
-            .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
+            .get_or_insert(table, || self.db.table_info[table].table.new_buffer())
             .stage_insert(vals);
     }
     pub fn stage_remove(&mut self, table: TableId, vals: &[Value]) {
         self.buffers
-            .get_or_insert(table, || self.db.table_info.get_table(table).new_buffer())
+            .get_or_insert(table, || self.db.table_info[table].table.new_buffer())
             .stage_remove(vals);
     }
 
@@ -202,7 +183,15 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
 
     /// Get an immutable reference to the table with id `table`.
     pub fn get_table(&self, table: TableId) -> &WrappedTable {
-        self.db.table_info.get_table(table)
+        &self.db.table_info[table].table
+    }
+
+    pub fn prims(&self) -> &Primitives {
+        self.db.prims
+    }
+
+    pub fn containers(&self) -> &Containers {
+        self.db.containers
     }
 
     /// Get the _current_ value for a given key in `table`, or otherwise insert
@@ -219,7 +208,7 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
         vals: impl ExactSizeIterator<Item = MergeVal>,
     ) -> Pooled<Vec<Value>> {
         with_pool_set(|ps| {
-            if let Some(row) = self.db.table_info.get_table(table).get_row(key) {
+            if let Some(row) = self.db.table_info[table].table.get_row(key) {
                 return row.vals;
             }
             Pooled::cloned(
@@ -237,9 +226,7 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
                             })
                         }
                         self.buffers
-                            .get_or_insert(table, || {
-                                self.db.table_info.get_table(table).new_buffer()
-                            })
+                            .get_or_insert(table, || self.db.table_info[table].table.new_buffer())
                             .stage_insert(&new);
                         new
                     })
@@ -249,7 +236,7 @@ impl<'a, T: TableInfoMap> ExecutionState<'a, T> {
     }
 }
 
-impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
+impl ExecutionState<'_> {
     pub(crate) fn run_instrs(&mut self, instrs: &[Instr], bindings: &mut Bindings) {
         let Some(batch_size) = bindings.iter().map(|(_, x)| x.len()).next() else {
             // Empty bindings; nothing to do.
@@ -335,9 +322,9 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
             } => {
                 let pool = pool_set.get_pool::<Vec<Value>>().clone();
                 self.buffers.get_or_insert(*table_id, || {
-                    self.db.table_info.get_table(*table_id).new_buffer()
+                    self.db.table_info[*table_id].table.new_buffer()
                 });
-                let table = self.db.table_info.get_table(*table_id);
+                let table = &self.db.table_info[*table_id].table;
                 // Do two passes over the current vector. First, do a round of lookups. Then, for
                 // any offsets where the lookup failed, insert the default value.
                 let mut mask_copy = mask.clone();
@@ -399,7 +386,7 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
                 dst_var,
                 default,
             } => {
-                let table = self.db.table_info.get_table(*table);
+                let table = &self.db.table_info[*table].table;
                 table.lookup_with_default_vectorized(
                     mask, bindings, args, *dst_col, *default, *dst_var,
                 );
@@ -410,7 +397,7 @@ impl ExecutionState<'_, DenseIdMap<TableId, TableInfo>> {
                 dst_col,
                 dst_var,
             } => {
-                let table = self.db.table_info.get_table(*table);
+                let table = &self.db.table_info[*table].table;
                 table.lookup_row_vectorized(mask, bindings, args, *dst_col, *dst_var);
             }
             Instr::Insert { table, vals } => {

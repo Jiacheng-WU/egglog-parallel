@@ -15,9 +15,10 @@ use std::{
 };
 
 use core_relations::{
-    ColumnId, Constraint, CounterId, Database, DisplacedTable, DisplacedTableWithProvenance,
-    ExternalFunction, ExternalFunctionId, MergeVal, Offset, PlanStrategy, PrimitiveId, Primitives,
-    SortedWritesTable, TableId, TaggedRowBuffer, Value, WrappedTable,
+    ColumnId, Constraint, Container, Containers, CounterId, Database, DisplacedTable,
+    DisplacedTableWithProvenance, ExternalFunction, ExternalFunctionId, MergeVal, Offset,
+    PlanStrategy, PrimitiveId, Primitives, SortedWritesTable, TableId, TaggedRowBuffer, Value,
+    WrappedTable,
 };
 use indexmap::{map::Entry, IndexMap};
 use log::info;
@@ -133,9 +134,38 @@ impl EGraph {
         self.db.primitives_mut()
     }
 
+    /// Get a mutable reference to the underlying table of containers for this
+    /// EGraph.
+    pub fn containers_mut(&mut self) -> &mut Containers {
+        self.db.containers_mut()
+    }
+
+    pub fn register_container_ty<C: Container>(&mut self) {
+        let uf_table = self.uf_table;
+        self.db
+            .containers_mut()
+            .register_type::<C>(self.id_counter, move |state, old, new| {
+                let todo_fix = 1;
+                let todo_ts = Value::new(!0);
+                if old != new {
+                    state.stage_insert(uf_table, &[old, new, todo_ts]);
+                    std::cmp::min(old, new)
+                } else {
+                    old
+                }
+            });
+    }
+
     /// Get a reference to the underlying table of primitives for this EGraph.
     pub fn primitives(&self) -> &Primitives {
         self.db.primitives()
+    }
+
+    pub fn register_external_func(
+        &mut self,
+        func: impl ExternalFunction + 'static,
+    ) -> ExternalFunctionId {
+        self.db.add_external_function(func)
     }
 
     /// Generate a fresh id.
@@ -922,7 +952,7 @@ pub(crate) struct GetFirstMatch {
 }
 
 impl ExternalFunction for GetFirstMatch {
-    fn invoke(&self, _: &core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
+    fn invoke(&self, _: &mut core_relations::ExecutionState, args: &[Value]) -> Option<Value> {
         let mut guard = self.side_channel.lock().unwrap();
         if guard.is_some() {
             return None;

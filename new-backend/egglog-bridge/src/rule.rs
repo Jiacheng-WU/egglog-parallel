@@ -9,8 +9,9 @@ use std::{cmp::Ordering, rc::Rc};
 
 use anyhow::Context;
 use core_relations::{
-    ColumnId, Constraint, CounterId, PlanStrategy, PrimitiveFunctionId, PrimitivePrinter,
-    QueryBuilder, RuleBuilder as CoreRuleBuilder, RuleSetBuilder, TableId, Value, WriteVal,
+    ColumnId, Constraint, CounterId, ExternalFunctionId, PlanStrategy, PrimitiveFunctionId,
+    PrimitivePrinter, QueryBuilder, RuleBuilder as CoreRuleBuilder, RuleSetBuilder, TableId, Value,
+    WriteVal,
 };
 use log::debug;
 use numeric_id::{define_id, DenseIdMap, NumericId};
@@ -400,6 +401,27 @@ impl RuleBuilder<'_> {
             atom.push(proof_var.into());
         }
         self.query.atoms.push((table, atom));
+    }
+
+    pub fn call_external_func(
+        &mut self,
+        func: ExternalFunctionId,
+        args: &[QueryEntry],
+        ret_ty: ColumnTy,
+    ) -> Variable {
+        let res = self.new_var(ret_ty);
+        assert!(
+            !self.egraph.tracing,
+            "calling an external / container function with proofs enabled"
+        );
+        let args = args.to_vec();
+        self.query.add_rule.push(Box::new(move |inner, rb| {
+            let args = inner.convert_all(&args);
+            let var = rb.call_external(func, &args)?;
+            inner.mapping.insert(res, var.into());
+            Ok(())
+        }));
+        res
     }
 
     /// Add the given atom to query. As elsewhere in the crate, the last

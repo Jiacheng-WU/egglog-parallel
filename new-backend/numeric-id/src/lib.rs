@@ -270,6 +270,9 @@ impl<K: NumericId, V> IdVec<K, V> {
             .enumerate()
             .map(|(i, v)| (K::from_usize(i), v))
     }
+    pub fn get(&self, key: K) -> Option<&V> {
+        self.data.get(key.index())
+    }
 }
 
 impl<K: NumericId, V: Send + Sync> IdVec<K, V> {

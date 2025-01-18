@@ -70,7 +70,10 @@ impl Rewriter for Canonicalizer<'_> {
     fn hint_col(&self) -> Option<ColumnId> {
         Some(ColumnId::new(0))
     }
-    fn rewrite_slice(
+    fn rewrite_val(&self, val: Value) -> Value {
+        self.table.uf.find_naive(val)
+    }
+    fn rewrite_buf(
         &self,
         buf: &RowBuffer,
         start: RowId,
@@ -183,6 +186,16 @@ impl Rewriter for Canonicalizer<'_> {
                 out.set_stale(i);
             }
         }
+    }
+
+    fn rewrite_slice(&self, vals: &mut [Value]) -> bool {
+        let mut changed = false;
+        for val in vals {
+            let canon = self.table.uf.find_naive(*val);
+            changed |= canon != *val;
+            *val = canon;
+        }
+        changed
     }
 }
 
