@@ -498,6 +498,22 @@ fn math_test(mut egraph: EGraph) {
 }
 
 // Tests for containers:
+// * build num, add, etc.
+// * start with:
+//   - vec![1]
+//   - vec![]
+// * have a rule that does, for any vec, push (add 0 last-elt) onto it.
+// * have a rule that does, for any vec, push (add last-elt 0) onto it.
+// * Run this 3 times.
+// * Check that we get some decent number of vectors out.
+// * Saturate the rule that just evaluates add.
+// * should have just have:
+//  - vec![]
+//  - vec![1]
+//  - vec![1, 1]
+//  - vec![1, 1, 1]
+//  - vec![1, 1, 1, 1]
+//  After that
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 struct VecContainer(Vec<Value>);
@@ -511,5 +527,8 @@ impl Container for VecContainer {
 }
 
 fn register_vec_push(eg: &mut EGraph) -> ExternalFunctionId {
+    todo!()
+}
+fn register_vec_of(eg: &mut EGraph) -> ExternalFunctionId {
     todo!()
 }

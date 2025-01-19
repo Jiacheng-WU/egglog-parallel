@@ -45,6 +45,16 @@ impl Containers {
         Some(res.downcast_ref::<ContainerEnv<C>>().unwrap())
     }
 
+    /// Iterate over the containers of the given type.
+    pub fn for_each<C: Container>(&self, mut f: impl FnMut(&C, Value)) {
+        let Some(env) = self.get::<C>() else {
+            return;
+        };
+        for ent in env.to_id.iter() {
+            f(ent.key(), *ent.value());
+        }
+    }
+
     /// Get the container associated with the value `val` in the database. The caller must know the
     /// type of the container.
     pub fn get_val<C: Container>(&self, val: Value) -> Option<impl Deref<Target = &C>> {
