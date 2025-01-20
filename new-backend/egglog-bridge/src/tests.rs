@@ -1,10 +1,12 @@
 use std::thread;
 
-use core_relations::{Container, Containers, ExternalFunctionId, Rewriter, Value};
+use core_relations::{
+    make_external_func, Container, Containers, ExternalFunctionId, Rewriter, Value,
+};
 use log::debug;
 use num_rational::Rational64;
 
-use crate::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, MergeFn};
+use crate::{add_expressions, define_rule, ColumnTy, DefaultVal, EGraph, Function, MergeFn};
 
 #[test]
 fn ac() {
@@ -526,9 +528,187 @@ impl Container for VecContainer {
     }
 }
 
-fn register_vec_push(eg: &mut EGraph) -> ExternalFunctionId {
-    todo!()
+fn register_vec_push(egraph: &mut EGraph) -> ExternalFunctionId {
+    egraph.register_container_ty::<VecContainer>();
+    let external_func = make_external_func(move |state, vals| -> Option<Value> {
+        let [vec_id, val] = vals else {
+            panic!("[vec-push] expected 2 values, got {vals:?}")
+        };
+        let mut vec: VecContainer = state.containers().get_val::<VecContainer>(*vec_id)?.clone();
+        vec.0.push(*val);
+        // Vectors are immutable. May as well not use O(n) auxiliary space.
+        vec.0.shrink_to_fit();
+        Some(state.new_handle().containers().register_val(vec, state))
+    });
+    egraph.register_external_func(external_func)
 }
-fn register_vec_of(eg: &mut EGraph) -> ExternalFunctionId {
-    todo!()
+
+fn register_vec_last(egraph: &mut EGraph) -> ExternalFunctionId {
+    egraph.register_container_ty::<VecContainer>();
+    let external_func = make_external_func(move |state, vals| -> Option<Value> {
+        let [vec_id] = vals else {
+            panic!("[vec-last] expected 1 value, got {vals:?}")
+        };
+        let todo_figure_out_crash = 1;
+        let vec = state.containers().get_val::<VecContainer>(*vec_id)?;
+        vec.0.last().cloned()
+        // state
+        //     .containers()
+        //     .get_val::<VecContainer>(*vec_id)?
+        //     .0
+        //     .last()
+        //     .cloned()
+    });
+    egraph.register_external_func(external_func)
+}
+
+fn dump_vecs(egraph: &EGraph) -> Vec<Vec<Value>> {
+    let mut res = Vec::new();
+    egraph
+        .containers()
+        .for_each::<VecContainer>(|vec, _| res.push(vec.0.clone()));
+    res
+}
+
+fn assert_unordered_eq<T: Ord + std::fmt::Debug>(mut a: Vec<T>, mut b: Vec<T>) {
+    a.sort();
+    b.sort();
+    assert_eq!(a, b);
+}
+
+fn container_test() {
+    let mut egraph = EGraph::default();
+    let int_prim = egraph.primitives_mut().register_type::<i64>();
+    let num_table = egraph.add_table(
+        vec![ColumnTy::Primitive(int_prim), ColumnTy::Id],
+        DefaultVal::FreshId,
+        MergeFn::UnionId,
+        "num",
+    );
+    let add_table = egraph.add_table(
+        vec![ColumnTy::Id; 3],
+        DefaultVal::FreshId,
+        MergeFn::UnionId,
+        "add",
+    );
+    let vec_table = egraph.add_table(
+        vec![ColumnTy::Id; 2],
+        DefaultVal::FreshId,
+        MergeFn::UnionId,
+        "vec",
+    );
+    let int_add = core_relations::lift_operation! {
+        [egraph.primitives_mut()] fn add(x: i64, y: i64) -> i64 {
+            x + y
+        }
+    };
+    let vec_last = register_vec_last(&mut egraph);
+    let vec_push = register_vec_push(&mut egraph);
+
+    let mut ids = Vec::new();
+    //  Add 0 and 1 to the database.
+    let num_rows = (0..=1)
+        .map(|i| {
+            let id = egraph.fresh_id();
+            let i = egraph.primitives_mut().get(i as i64);
+            ids.push(id);
+            (num_table, vec![i, id])
+        })
+        .collect::<Vec<_>>();
+    egraph.add_values(num_rows);
+
+    let empty_vec = egraph.get_container_val(VecContainer(vec![]));
+    let vec1 = egraph.get_container_val(VecContainer(vec![ids[1]]));
+
+    let empty_vec_id = egraph.fresh_id();
+    let vec1_id = egraph.fresh_id();
+
+    egraph.add_values(vec![
+        (vec_table, vec![empty_vec, empty_vec_id]),
+        (vec_table, vec![vec1, vec1_id]),
+    ]);
+
+    let vec_expand = {
+        let mut rb = egraph.new_query();
+        let vec = rb.new_var(ColumnTy::Id);
+        let vec_id = rb.new_var(ColumnTy::Id);
+        rb.add_atom(Function::Table(vec_table), &[vec.into(), vec_id.into()])
+            .unwrap();
+        let last = rb.call_external_func(vec_last, &[vec.into()], ColumnTy::Id);
+        let add_last_0 = rb.lookup(Function::Table(add_table), &[last.into(), ids[0].into()]);
+        let add_0_last = rb.lookup(Function::Table(add_table), &[ids[0].into(), last.into()]);
+        let new_vec_1 =
+            rb.call_external_func(vec_push, &[vec.into(), add_last_0.into()], ColumnTy::Id);
+        let new_vec_2 =
+            rb.call_external_func(vec_push, &[vec.into(), add_0_last.into()], ColumnTy::Id);
+        rb.lookup(Function::Table(vec_table), &[new_vec_1.into()]);
+        rb.lookup(Function::Table(vec_table), &[new_vec_2.into()]);
+        rb.build()
+    };
+
+    let eval_add = {
+        let mut rb = egraph.new_query();
+        let lhs_raw = rb.new_var(ColumnTy::Primitive(int_prim));
+        let lhs_id = rb.new_var(ColumnTy::Id);
+        let rhs_raw = rb.new_var(ColumnTy::Primitive(int_prim));
+        let rhs_id = rb.new_var(ColumnTy::Id);
+        let add_id = rb.new_var(ColumnTy::Id);
+        rb.add_atom(Function::Table(num_table), &[lhs_raw.into(), lhs_id.into()])
+            .unwrap();
+        rb.add_atom(Function::Table(num_table), &[rhs_raw.into(), rhs_id.into()])
+            .unwrap();
+        rb.add_atom(
+            Function::Table(add_table),
+            &[lhs_id.into(), rhs_id.into(), add_id.into()],
+        )
+        .unwrap();
+        let evaled = rb.lookup(Function::Prim(int_add), &[lhs_raw.into(), rhs_raw.into()]);
+        let boxed = rb.lookup(Function::Table(num_table), &[evaled.into()]);
+        rb.union(add_id.into(), boxed.into());
+        rb.build()
+    };
+
+    assert_unordered_eq(
+        dump_vecs(&egraph),
+        vec![vec![], vec![egraph.get_canon(ids[1])]],
+    );
+
+    assert!(egraph.run_rules(&[vec_expand]).unwrap());
+    assert_eq!(dump_vecs(&egraph).len(), 4);
+    // We have 2 new vectors with a last element. Each of those should spawn two more, adding 4.
+    assert!(egraph.run_rules(&[vec_expand]).unwrap());
+    assert_eq!(dump_vecs(&egraph).len(), 8);
+    // We have 4 new vectors with a last element. Each of those should spawn two more, adding 8.
+    assert!(egraph.run_rules(&[vec_expand]).unwrap());
+    assert_eq!(dump_vecs(&egraph).len(), 16);
+
+    // Now we want to saturate `eval_add`. This should collapse a bunch of new vectors.
+
+    let mut saturated = false;
+    for _ in 0..20 {
+        saturated = !egraph.run_rules(&[eval_add]).unwrap();
+        if saturated {
+            break;
+        }
+    }
+    assert!(saturated, "failed to saturate after 20 iterations");
+
+    let one_id = egraph.get_canon(ids[1]);
+    assert_unordered_eq(
+        dump_vecs(&egraph),
+        vec![
+            vec![],
+            vec![one_id],
+            vec![one_id; 2],
+            vec![one_id; 3],
+            vec![one_id; 4],
+        ],
+    );
+}
+
+#[test]
+fn basic_container() {
+    for _ in 0..4 {
+        container_test()
+    }
 }

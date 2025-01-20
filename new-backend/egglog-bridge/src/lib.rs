@@ -151,15 +151,31 @@ impl EGraph {
         self.db.containers_mut()
     }
 
+    /// Get a reference to the underlying table of containers for this EGraph.
+    pub fn containers(&self) -> &Containers {
+        self.db.containers()
+    }
+
+    /// Intern the given container value into the EGraph.
+    pub fn get_container_val<C: Container>(&mut self, val: C) -> Value {
+        self.register_container_ty::<C>();
+        self.db
+            .with_execution_state(|state| state.new_handle().containers().register_val(val, state))
+    }
+
+    /// Register the given [`Container`] type with this EGraph.
+    ///
+    /// The given container will use the EGraph's union-find to manage rebuilding and the merging
+    /// of containers with a common id.
     pub fn register_container_ty<C: Container>(&mut self) {
         let uf_table = self.uf_table;
+        let ts_counter = self.timetstamp_counter;
         self.db
             .containers_mut()
             .register_type::<C>(self.id_counter, move |state, old, new| {
-                let todo_fix = 1;
-                let todo_ts = Value::new(!0);
                 if old != new {
-                    state.stage_insert(uf_table, &[old, new, todo_ts]);
+                    let next_ts = Value::from_usize(state.read_counter(ts_counter));
+                    state.stage_insert(uf_table, &[old, new, next_ts]);
                     std::cmp::min(old, new)
                 } else {
                     old
@@ -670,6 +686,7 @@ impl EGraph {
             while self
                 .db
                 .apply_rewrite(self.uf_table, &tables, self.next_ts().to_value())
+                || self.db.rewrite_containers(self.uf_table)
             {
                 self.inc_ts();
             }

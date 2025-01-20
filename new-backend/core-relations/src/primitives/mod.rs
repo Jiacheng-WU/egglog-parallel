@@ -206,9 +206,9 @@ impl<T: PrimitiveOperation> PrimitiveOperationExt for T {}
 macro_rules! lift_operation_impl {
     ([$arity:expr, $table:expr] fn $name:ident ( $($id:ident : $ty:ty : $n:tt),* ) -> $ret:ty { $body:expr }) => {
          {
-            use $crate::primitives::{Primitives, PrimitiveOperation, PrimitiveId, PrimitiveFunctionSignature};
-            use $crate::common::Value;
-            fn $name(prims: &mut Primitives) -> $crate::primitives::PrimitiveFunctionId {
+            use $crate::{Primitives, PrimitiveOperation, PrimitiveId, PrimitiveFunctionSignature};
+            use $crate::Value;
+            fn $name(prims: &mut Primitives) -> $crate::PrimitiveFunctionId {
                 struct Impl<F> {
                     arg_prims: Vec<PrimitiveId>,
                     ret: PrimitiveId,

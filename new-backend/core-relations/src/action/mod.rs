@@ -144,7 +144,10 @@ pub(crate) struct DbView<'a> {
 
 impl DbView<'_> {
     fn inc_counter(&self, ctr: CounterId) -> usize {
-        self.counters[ctr].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        self.counters[ctr].fetch_add(1, std::sync::atomic::Ordering::Release)
+    }
+    fn read_counter(&self, ctr: CounterId) -> usize {
+        self.counters[ctr].load(std::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -179,6 +182,10 @@ impl<'a> ExecutionState<'a> {
 
     pub fn inc_counter(&self, ctr: CounterId) -> usize {
         self.db.inc_counter(ctr)
+    }
+
+    pub fn read_counter(&self, ctr: CounterId) -> usize {
+        self.db.read_counter(ctr)
     }
 
     /// Get an immutable reference to the table with id `table`.

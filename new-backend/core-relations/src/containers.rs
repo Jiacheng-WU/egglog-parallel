@@ -57,7 +57,10 @@ impl Containers {
 
     /// Get the container associated with the value `val` in the database. The caller must know the
     /// type of the container.
-    pub fn get_val<C: Container>(&self, val: Value) -> Option<impl Deref<Target = &C>> {
+    ///
+    /// The return type of this function may contain lock guards. Attempts to modify the contents
+    /// of the containers database may deadlock if the given guard has not been dropped.
+    pub fn get_val<C: Container>(&self, val: Value) -> Option<impl Deref<Target = C> + '_> {
         self.get::<C>()?.get_container(val)
     }
 
@@ -75,7 +78,7 @@ impl Containers {
     /// Apply the given rewrite rule to the contents of each container.
     pub fn rewrite_all(
         &mut self,
-        rewriter: &impl Rewriter,
+        rewriter: &dyn Rewriter,
         exec_state: &mut ExecutionState,
     ) -> bool {
         if do_parallel() {
@@ -112,6 +115,11 @@ impl Containers {
     }
 }
 
+/// A trait implemented by container types.
+///
+/// Containers behave a lot like primitives, but they include extra trait methods to support
+/// rebuilding of container contents and merging containers that become equal after a rewrite pass
+/// as taken place.
 pub trait Container: Hash + Eq + Clone + Send + Sync + 'static {
     /// Rewrite an additional container in place according the the given [`Rewriter`].
     ///
@@ -143,7 +151,7 @@ struct ContainerEnv<C> {
     merge_fn: Box<MergeFn>,
     counter: CounterId,
     to_id: DashMap<C, Value>,
-    to_container: DashMap<Value, usize /* hash code */>,
+    to_container: DashMap<Value, (usize /* hash code */, usize /* map */)>,
     /// Map from a Value to the set of ids of containers that contain that value.
     val_index: DashMap<Value, IndexSet<Value>>,
 }
@@ -174,7 +182,9 @@ impl<C: Container> ContainerEnv<C> {
             None => {
                 let value = Value::from_usize(exec_state.inc_counter(self.counter));
                 self.to_id.insert(container.clone(), value);
-                self.to_container.insert(value, hash_container(container));
+                let target_map = self.to_id.determine_map(container);
+                self.to_container
+                    .insert(value, (hash_container(container), target_map));
                 for val in container.iter() {
                     self.val_index.entry(val).or_default().insert(value);
                 }
@@ -185,13 +195,14 @@ impl<C: Container> ContainerEnv<C> {
 
     fn insert_owned(&self, container: C, value: Value, exec_state: &mut ExecutionState) {
         let hc = hash_container(&container);
+        let target_map = self.to_id.determine_map(&container);
         match self.to_id.entry(container) {
             dashmap::Entry::Occupied(mut occ) => {
                 let result = (self.merge_fn)(exec_state, *occ.get(), value);
                 let old_val = *occ.get();
                 if result != old_val {
                     self.to_container.remove(&old_val);
-                    self.to_container.insert(result, hc);
+                    self.to_container.insert(result, (hc, target_map));
                     *occ.get_mut() = result;
                     for val in occ.key().iter() {
                         let mut index = self.val_index.entry(val).or_default();
@@ -201,7 +212,7 @@ impl<C: Container> ContainerEnv<C> {
                 }
             }
             dashmap::Entry::Vacant(vacant_entry) => {
-                self.to_container.insert(value, hc);
+                self.to_container.insert(value, (hc, target_map));
                 for val in vacant_entry.key().iter() {
                     self.val_index.entry(val).or_default().insert(value);
                 }
@@ -220,7 +231,7 @@ impl<C: Container> ContainerEnv<C> {
             let mut changed = false;
             let mut to_reinsert = Vec::new();
             let shards = self.to_id.shards_mut();
-            for (_, shard) in shards.iter_mut().enumerate() {
+            for shard in shards.iter_mut() {
                 let shard = shard.get_mut();
                 // SAFETY: the iterator does not outlive `shard`.
                 for bucket in unsafe { shard.iter() } {
@@ -256,11 +267,11 @@ impl<C: Container> ContainerEnv<C> {
         }
     }
 
-    fn get_container(&self, value: Value) -> Option<impl Deref<Target = &C>> {
-        let hc = *self.to_container.get(&value)?;
-        let shard = &self.to_id.shards()[self.to_id.determine_shard(hc)];
+    fn get_container(&self, value: Value) -> Option<impl Deref<Target = C> + '_> {
+        let (hc, target_map) = *self.to_container.get(&value)?;
+        let shard = &self.to_id.shards()[target_map];
         let read_guard = shard.read();
-        let val_ptr = shard
+        let val_ptr: *const (C, _) = shard
             .read()
             .find(hc as u64, |(_, v)| *v.get() == value)?
             .as_ptr();
@@ -272,7 +283,7 @@ impl<C: Container> ContainerEnv<C> {
         impl<T, Guard> Deref for ValueDeref<'_, T, Guard> {
             type Target = T;
 
-            fn deref(&self) -> &Self::Target {
+            fn deref(&self) -> &T {
                 self.data
             }
         }
@@ -280,7 +291,10 @@ impl<C: Container> ContainerEnv<C> {
         Some(ValueDeref {
             _guard: read_guard,
             // SAFETY: the value will remain valid for as long as `read_guard` is in scope.
-            data: unsafe { &*(val_ptr as *const _) },
+            data: unsafe {
+                let unwrapped: &(C, _) = &*val_ptr;
+                &unwrapped.0
+            },
         })
     }
 }

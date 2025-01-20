@@ -281,6 +281,16 @@ impl Database {
         &mut self.containers
     }
 
+    pub fn rewrite_containers(&mut self, func_id: TableId) -> bool {
+        let Some(rewriter) = self.tables[func_id].table.rewriter(&[]) else {
+            return false;
+        };
+        let mut containers = mem::take(&mut self.containers);
+        let res = self.with_execution_state(|state| containers.rewrite_all(&*rewriter, state));
+        self.containers = containers;
+        res
+    }
+
     /// Apply the value-level rewrite rule encoded by `func_id` to all the tables in `to_rewrite`.
     ///
     /// The native [`Table::apply_rewrite`] method takes a `next_ts` argument for filling in new
