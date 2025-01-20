@@ -62,7 +62,7 @@ pub struct EGraph {
     uf_table: TableId,
     id_counter: CounterId,
     reason_counter: CounterId,
-    next_ts: Timestamp,
+    timetstamp_counter: CounterId,
     rules: DenseIdMap<RuleId, RuleInfo>,
     next_rule: RuleId,
     funcs: DenseIdMap<FunctionId, FunctionInfo>,
@@ -105,6 +105,9 @@ impl EGraph {
     fn create_internal(mut db: Database, uf_table: TableId, tracing: bool) -> EGraph {
         let id_counter = db.add_counter();
         let trace_counter = db.add_counter();
+        let ts_counter = db.add_counter();
+        // Start the timestamp counter at 1.
+        db.inc_counter(ts_counter);
         let side_channel = Arc::new(Mutex::new(None));
         let get_first = GetFirstMatch {
             side_channel: side_channel.clone(),
@@ -115,7 +118,7 @@ impl EGraph {
             uf_table,
             id_counter,
             reason_counter: trace_counter,
-            next_ts: Timestamp::new(1),
+            timetstamp_counter: ts_counter,
             rules: Default::default(),
             funcs: Default::default(),
             next_rule: RuleId::new(0),
@@ -126,6 +129,14 @@ impl EGraph {
             get_first_id,
             tracing,
         }
+    }
+
+    fn next_ts(&self) -> Timestamp {
+        Timestamp::from_usize(self.db.read_counter(self.timetstamp_counter))
+    }
+
+    fn inc_ts(&mut self) {
+        self.db.inc_counter(self.timetstamp_counter);
     }
 
     /// Get a mutable reference to the underlying table of primitives for this
@@ -251,13 +262,13 @@ impl EGraph {
             let reason = self.get_fiat_reason(desc);
             let term = self.get_term(func, inputs, reason);
             extended_row.push(term);
-            extended_row.push(self.next_ts.to_value());
+            extended_row.push(self.next_ts().to_value());
             extended_row.push(term);
             term
         } else {
             let id = self.fresh_id();
             extended_row.push(id);
-            extended_row.push(self.next_ts.to_value());
+            extended_row.push(self.next_ts().to_value());
             id
         };
         let table_id = self.funcs[func].table;
@@ -266,7 +277,7 @@ impl EGraph {
             .new_buffer()
             .stage_insert(&extended_row);
         self.db.merge_all();
-        self.next_ts = self.next_ts.inc();
+        self.inc_ts();
         self.rebuild().unwrap();
         self.get_canon(res)
     }
@@ -348,7 +359,7 @@ impl EGraph {
         let mut bufs = DenseIdMap::default();
         for (func, row) in values.into_iter() {
             extended_row.extend_from_slice(&row);
-            extended_row.push(self.next_ts.to_value());
+            extended_row.push(self.next_ts().to_value());
             let table_info = &self.funcs[func];
             let table_id = table_info.table;
             if let Some(reason_id) = reason_id {
@@ -361,7 +372,7 @@ impl EGraph {
                 buf.stage_insert(&[
                     *row.last().unwrap(),
                     term_id,
-                    self.next_ts.to_value(),
+                    self.next_ts().to_value(),
                     reason_id,
                 ]);
                 extended_row.push(term_id);
@@ -373,7 +384,7 @@ impl EGraph {
         // Flush the buffers.
         mem::drop(bufs);
         self.db.merge_all();
-        self.next_ts = self.next_ts.inc();
+        self.inc_ts();
         self.rebuild().unwrap();
     }
 
@@ -630,7 +641,8 @@ impl EGraph {
     ///
     /// If the given rules are malformed, this method can return an error.
     pub fn run_rules(&mut self, rules: &[RuleId]) -> Result<bool> {
-        if !run_rules_impl(&mut self.db, &mut self.rules, rules, self.next_ts)? {
+        let ts = self.next_ts();
+        if !run_rules_impl(&mut self.db, &mut self.rules, rules, ts)? {
             return Ok(false);
         }
         self.rebuild()?;
@@ -657,11 +669,11 @@ impl EGraph {
             }
             while self
                 .db
-                .apply_rewrite(self.uf_table, &tables, self.next_ts.to_value())
+                .apply_rewrite(self.uf_table, &tables, self.next_ts().to_value())
             {
-                self.next_ts = self.next_ts.inc();
+                self.inc_ts();
             }
-            self.next_ts = self.next_ts.inc();
+            self.inc_ts();
             return Ok(());
         }
         if do_parallel() {
@@ -675,7 +687,8 @@ impl EGraph {
             changed = false;
             // We need to iterate rebuilding to a fixed point. Future scans
             // should look only at the latest updates.
-            self.next_ts = self.next_ts.inc();
+            self.inc_ts();
+            let ts = self.next_ts();
             for (_, info) in self.funcs.iter_mut() {
                 let last_rebuilt_at = self.rules[info.nonincremental_rebuild_rule].last_run_at;
                 let table_size = self.db.estimate_size(info.table, None);
@@ -693,15 +706,10 @@ impl EGraph {
                         // This is to avoid recanonicalizing the same row multiple
                         // times.
                         for rule in &info.incremental_rebuild_rules {
-                            changed |= run_rules_impl(
-                                &mut self.db,
-                                &mut self.rules,
-                                &[*rule],
-                                self.next_ts,
-                            )?;
+                            changed |= run_rules_impl(&mut self.db, &mut self.rules, &[*rule], ts)?;
                         }
                         // Reset the rule we did not run. These two should be equivalent.
-                        self.rules[info.nonincremental_rebuild_rule].last_run_at = self.next_ts;
+                        self.rules[info.nonincremental_rebuild_rule].last_run_at = ts;
                         Ok(())
                     })?;
                 } else {
@@ -710,10 +718,10 @@ impl EGraph {
                             &mut self.db,
                             &mut self.rules,
                             &[info.nonincremental_rebuild_rule],
-                            self.next_ts,
+                            ts,
                         )?;
                         for rule in &info.incremental_rebuild_rules {
-                            self.rules[*rule].last_run_at = self.next_ts;
+                            self.rules[*rule].last_run_at = ts;
                         }
                         Ok(())
                     })?;
@@ -749,7 +757,7 @@ impl EGraph {
         while changed {
             changed = false;
             state.clear();
-            self.next_ts = self.next_ts.inc();
+            self.inc_ts();
             // First, figure out which functions will be rebuilt nonincrementally,
             // vs. incrementally. Group them together.
             for (func, info) in self.funcs.iter_mut() {
@@ -770,21 +778,23 @@ impl EGraph {
                     state.nonincremental.push(func);
                 }
             }
+            let ts = self.next_ts();
             for func in state.nonincremental.iter().copied() {
                 scratch.push(self.funcs[func].nonincremental_rebuild_rule);
                 for rule in &self.funcs[func].incremental_rebuild_rules {
-                    self.rules[*rule].last_run_at = self.next_ts;
+                    self.rules[*rule].last_run_at = ts;
                 }
             }
-            changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, self.next_ts)?;
+            changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, ts)?;
             scratch.clear();
+            let ts = self.next_ts();
             for (i, funcs) in state.incremental.iter() {
                 for func in funcs.iter().copied() {
                     let info = &mut self.funcs[func];
                     scratch.push(info.incremental_rebuild_rules[i]);
-                    self.rules[info.nonincremental_rebuild_rule].last_run_at = self.next_ts;
+                    self.rules[info.nonincremental_rebuild_rule].last_run_at = ts;
                 }
-                changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, self.next_ts)?;
+                changed |= run_rules_impl(&mut self.db, &mut self.rules, &scratch, ts)?;
                 scratch.clear();
             }
         }

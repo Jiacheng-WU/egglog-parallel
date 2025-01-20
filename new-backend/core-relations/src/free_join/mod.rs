@@ -213,7 +213,9 @@ pub(crate) fn inc_counter(
     counters: &DenseIdMap<CounterId, AtomicUsize>,
     counter_id: CounterId,
 ) -> usize {
-    counters[counter_id].fetch_add(1, Ordering::Relaxed)
+    // We synchronize with `read_counter` but not with other increments.
+    // NB: we may want to experimetn with Relaxed here.
+    counters[counter_id].fetch_add(1, Ordering::Release)
 }
 
 impl Database {
@@ -483,6 +485,10 @@ impl Database {
     /// Increment the given counter and return its previous value.
     pub fn inc_counter(&self, counter: CounterId) -> usize {
         inc_counter(&self.counters, counter)
+    }
+
+    pub fn read_counter(&self, counter: CounterId) -> usize {
+        self.counters[counter].load(Ordering::Acquire)
     }
 
     /// Get id of the next table to be added to the database.
