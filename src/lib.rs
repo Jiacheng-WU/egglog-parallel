@@ -43,6 +43,7 @@ use indexmap::map::Entry;
 use instant::{Duration, Instant};
 pub use serialize::{SerializeConfig, SerializedNode};
 use sort::*;
+use std::fmt::Debug;
 use std::fmt::{Display, Formatter};
 use std::fs::File;
 use std::hash::Hash;
@@ -50,9 +51,9 @@ use std::io::Read;
 use std::iter::once;
 use std::ops::{Deref, Range};
 use std::path::PathBuf;
-use std::rc::Rc;
 use std::str::FromStr;
-use std::{fmt::Debug, sync::Arc};
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
 pub use termdag::{Term, TermDag, TermId};
 use thiserror::Error;
 pub use typechecking::TypeInfo;
@@ -64,7 +65,7 @@ pub type ArcSort = Arc<dyn Sort>;
 
 pub type Subst = IndexMap<Symbol, Value>;
 
-pub trait PrimitiveLike {
+pub trait PrimitiveLike: Send + Sync {
     fn name(&self) -> Symbol;
     /// Constructs a type constraint for the primitive that uses the span information
     /// for error localization.
@@ -904,38 +905,58 @@ impl EGraph {
             .unwrap_or_else(|| panic!("ruleset does not exist: {}", &ruleset));
         match rules {
             Ruleset::Rules(_ruleset_name, rule_names) => {
+                let run_report_arc = Arc::new(RwLock::new(run_report));
+                let search_results_arc = Arc::new(RwLock::new(search_results));
                 let copy_rules = rule_names.clone();
                 let search_start = Instant::now();
-
-                for (rule_name, rule) in copy_rules.iter() {
-                    let mut all_matches = vec![];
+                let _ = copy_rules.iter().for_each(|(rule_name, rule)| {
+                    let match_pool_size = 1;
+                    let mut all_matches = Vec::with_capacity(match_pool_size);
+                    for i in 0..match_pool_size {
+                        all_matches.push(Mutex::new(vec![]))
+                    }
+                    let counter = SyncUnsafeCell::new(0usize);
                     let rule_search_start = Instant::now();
-                    let mut did_match = false;
+                    let did_match = AtomicBool::new(false);
                     let timestamp = self.rule_last_run_timestamp.get(rule_name).unwrap_or(&0);
                     self.run_query(&rule.query, *timestamp, false, |values| {
-                        did_match = true;
+                        // println!("{}", current_num_threads());
+                        did_match.store(true, std::sync::atomic::Ordering::SeqCst);
                         assert_eq!(values.len(), rule.query.vars.len());
-                        all_matches.extend_from_slice(values);
+
+                        all_matches[counter.get_ref() % match_pool_size]
+                            .lock()
+                            .unwrap()
+                            .extend_from_slice(values);
+
+                        *counter.get_mut() += 1;
                         Ok(())
                     });
                     let rule_search_time = rule_search_start.elapsed();
+                    let all_matches: Vec<_> = all_matches
+                        .into_iter()
+                        .flat_map(|all_matches| {
+                            std::mem::take::<Vec<_>>(all_matches.lock().unwrap().as_mut()).into_iter()
+                        })
+                        .collect();
                     log::trace!(
                         "Searched for {rule_name} in {:.3}s ({} results)",
                         rule_search_time.as_secs_f64(),
                         all_matches.len()
                     );
-                    run_report.add_rule_search_time(*rule_name, rule_search_time);
-                    search_results.insert(
+                    (*run_report_arc.write().unwrap())
+                        .add_rule_search_time(*rule_name, rule_search_time);
+                    (*search_results_arc.write().unwrap()).insert(
                         *rule_name,
                         SearchResult {
                             all_matches,
-                            did_match,
+                            did_match: did_match.load(std::sync::atomic::Ordering::SeqCst),
                         },
                     );
-                }
+                });
 
                 let search_time = search_start.elapsed();
-                run_report.add_ruleset_search_time(ruleset, search_time);
+                (*run_report_arc.write().unwrap()).add_ruleset_search_time(ruleset, search_time);
             }
             Ruleset::Combined(_name, sub_rulesets) => {
                 let start_time = Instant::now();
@@ -1161,13 +1182,15 @@ impl EGraph {
         let ordering = &query.get_vars();
         let query = self.compile_gj_query(query, ordering);
 
-        let mut matched = false;
+        // TODO: switch back to SyncUnsafeCell
+        // let matched = SyncUnsafeCell::new(false);
+        let matched = AtomicBool::new(false);
         self.run_query(&query, 0, true, |values| {
             assert_eq!(values.len(), query.vars.len());
-            matched = true;
+            matched.store(true, std::sync::atomic::Ordering::SeqCst);
             Err(())
         });
-        if !matched {
+        if !matched.load(std::sync::atomic::Ordering::SeqCst) {
             Err(Error::CheckError(
                 facts.iter().map(|f| f.clone().make_unresolved()).collect(),
                 span.clone(),

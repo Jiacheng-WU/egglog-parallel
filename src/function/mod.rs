@@ -17,7 +17,7 @@ pub struct Function {
     pub merge: MergeAction,
     pub(crate) nodes: table::Table,
     sorts: HashSet<Symbol>,
-    pub(crate) indexes: Vec<Rc<ColumnIndex>>,
+    pub(crate) indexes: Vec<Arc<ColumnIndex>>,
     pub(crate) rebuild_indexes: Vec<Option<CompositeColumnIndex>>,
     index_updated_through: usize,
     updates: usize,
@@ -26,7 +26,7 @@ pub struct Function {
 
 #[derive(Clone)]
 pub struct MergeAction {
-    pub on_merge: Option<Rc<Program>>,
+    pub on_merge: Option<Arc<Program>>,
     pub merge_vals: MergeFn,
 }
 
@@ -36,7 +36,7 @@ pub enum MergeFn {
     Union,
     // the rc is make sure it's cheaply clonable, since calling the merge fn
     // requires a clone
-    Expr(Rc<Program>),
+    Expr(Arc<Program>),
 }
 
 /// All information we know determined by the input.
@@ -131,7 +131,7 @@ impl Function {
             let program = egraph
                 .compile_expr(&binding, &actions, &target)
                 .map_err(Error::TypeErrors)?;
-            MergeFn::Expr(Rc::new(program))
+            MergeFn::Expr(Arc::new(program))
         } else if output.is_eq_sort() {
             MergeFn::Union
         } else {
@@ -149,14 +149,14 @@ impl Function {
             let program = egraph
                 .compile_actions(&binding, &merge_action)
                 .map_err(Error::TypeErrors)?;
-            Some(Rc::new(program))
+            Some(Arc::new(program))
         };
 
         let indexes = Vec::from_iter(
             input
                 .iter()
                 .chain(once(&output))
-                .map(|x| Rc::new(ColumnIndex::new(x.name()))),
+                .map(|x| Arc::new(ColumnIndex::new(x.name()))),
         );
 
         let rebuild_indexes = Vec::from_iter(input.iter().chain(once(&output)).map(|x| {
@@ -202,7 +202,7 @@ impl Function {
         self.nodes.clear();
         self.indexes
             .iter_mut()
-            .for_each(|x| Rc::make_mut(x).clear());
+            .for_each(|x| Arc::make_mut(x).clear());
         self.rebuild_indexes.iter_mut().for_each(|x| {
             if let Some(x) = x {
                 x.clear()
@@ -247,7 +247,7 @@ impl Function {
         &self,
         col: usize,
         timestamps: &Range<u32>,
-    ) -> Option<Rc<ColumnIndex>> {
+    ) -> Option<Arc<ColumnIndex>> {
         let range = self.nodes.transform_range(timestamps);
         if range.end > self.index_updated_through {
             return None;
@@ -278,7 +278,7 @@ impl Function {
             .zip(self.rebuild_indexes.iter_mut())
             .enumerate()
         {
-            let as_mut = Rc::make_mut(index);
+            let as_mut = Arc::make_mut(index);
             if col == self.schema.input.len() {
                 for (slot, _, out) in self.nodes.iter_range(offsets.clone(), true) {
                     as_mut.add(out.value, slot)
@@ -323,7 +323,7 @@ impl Function {
         for index in &mut self.indexes {
             // Everything works if we don't have a unique copy of the indexes,
             // but we ought to be able to avoid this copy.
-            Rc::make_mut(index).clear();
+            Arc::make_mut(index).clear();
         }
         for rebuild_index in self.rebuild_indexes.iter_mut().flatten() {
             rebuild_index.clear();

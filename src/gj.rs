@@ -1,13 +1,15 @@
 use indexmap::map::Entry;
 use log::log_enabled;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use smallvec::SmallVec;
 use util::HashMap;
 
 use crate::{core::*, function::index::Offset, *};
 use std::{
-    cell::UnsafeCell,
+    cell::{OnceCell, UnsafeCell},
     fmt::{self, Debug},
     ops::Range,
+    sync::{Once, OnceLock},
 };
 
 type Query = crate::core::Query<ResolvedCall, Symbol>;
@@ -19,6 +21,7 @@ enum Instr<'a> {
         variable_name: Symbol,
         info: VarInfo2,
         trie_accesses: Vec<(usize, TrieAccess<'a>)>,
+        partition_size: usize,
     },
     ConstrainConstant {
         index: usize,
@@ -40,26 +43,28 @@ struct VarInfo2 {
     size_guess: usize,
 }
 
+#[derive(Clone)]
 struct InputSizes<'a> {
-    cur_stage: usize,
+    // cur_stage: usize,
     // a map from from stage to vector of costs for each stage,
     // where 'cost' is the largest relation being intersected
-    stage_sizes: &'a mut HashMap<usize, Vec<usize>>,
+    stage_sizes: &'a HashMap<usize, Vec<usize>>,
 }
 
 impl<'a> InputSizes<'a> {
-    fn add_measurement(&mut self, max_size: usize) {
-        self.stage_sizes
-            .entry(self.cur_stage)
-            .or_default()
-            .push(max_size);
+    fn add_measurement(&self, _max_size: usize) {
+        // self.stage_sizes
+        //     .entry(self.cur_stage)
+        //     .or_default()
+        //     .push(max_size);
     }
 
-    fn next(&mut self) -> InputSizes {
-        InputSizes {
-            cur_stage: self.cur_stage + 1,
-            stage_sizes: self.stage_sizes,
-        }
+    fn next(&self) -> InputSizes {
+        self.clone()
+        // InputSizes {
+        //     cur_stage: self.cur_stage + 1,
+        //     stage_sizes: self.stage_sizes,
+        // }
     }
 }
 
@@ -75,6 +80,7 @@ impl<'a> std::fmt::Display for Instr<'a> {
                 trie_accesses,
                 variable_name,
                 info,
+                partition_size,
             } => {
                 write!(
                     f,
@@ -110,10 +116,11 @@ impl<'a> std::fmt::Display for Program<'a> {
     }
 }
 
+#[derive(Clone)]
 struct Context<'b> {
     query: &'b CompiledQuery,
-    join_var_ordering: Vec<Symbol>,
-    tuple: Vec<Value>,
+    join_var_ordering: Arc<Vec<Symbol>>,
+    tuple: SyncUnsafeCell<Vec<Value>>,
     matches: usize,
     egraph: &'b EGraph,
 }
@@ -130,8 +137,8 @@ impl<'b> Context<'b> {
 
         let ctx = Context {
             query: cq,
-            tuple: vec![Value::fake(); cq.vars.len()],
-            join_var_ordering,
+            tuple: SyncUnsafeCell::new(vec![Value::fake(); cq.vars.len()]),
+            join_var_ordering: Arc::new(join_var_ordering),
             matches: 0,
             egraph,
         };
@@ -140,19 +147,19 @@ impl<'b> Context<'b> {
     }
 
     fn eval<F>(
-        &mut self,
+        &self,
         tries: &mut [&LazyTrie],
         program: &[Instr],
-        mut stage: InputSizes,
-        f: &mut F,
+        stage: InputSizes,
+        f: &F,
     ) -> Result
     where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         let (instr, program) = match program.split_first() {
             None => {
-                self.matches += 1;
-                return f(&self.tuple);
+                // self.matches += 1;
+                return f(self.tuple.get_ref());
             }
             Some(pair) => pair,
         };
@@ -174,8 +181,18 @@ impl<'b> Context<'b> {
             Instr::Intersect {
                 value_idx,
                 trie_accesses,
+                partition_size,
                 ..
             } => {
+                let partition_size = {
+                    let min_len = trie_accesses
+                        .iter()
+                        .map(|(j, _a)| tries[*j].len())
+                        .min()
+                        .unwrap();
+                    usize::max(usize::min(*partition_size, min_len), 1)
+                };
+
                 if let Some(x) = trie_accesses
                     .iter()
                     .map(|(atom, _)| tries[*atom].len())
@@ -184,56 +201,140 @@ impl<'b> Context<'b> {
                     stage.add_measurement(x);
                 }
 
+                if let Some(x) = trie_accesses
+                    .iter()
+                    .map(|(atom, _)| tries[*atom].len())
+                    .max()
+                {
+                    stage.add_measurement(x);
+                }
+                let mut tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 1]> =
+                    SmallVec::with_capacity(partition_size - 1);
+                for _i in 0..partition_size - 1 {
+                    tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
+                }
+                let tries_cell = SyncUnsafeCell::new(tries);
+
+                let get_tries = move |p| -> &mut [&LazyTrie] {
+                    if p == 0 {
+                        unsafe { *tries_cell.get() }
+                    } else {
+                        let t: &SyncUnsafeCell<_> = &tries_workspace[p - 1];
+                        let t: *mut Vec<_> = t.get();
+                        unsafe { &mut (*t)[..] }
+                    }
+                };
+
+                let mut ctx_workspace: SmallVec<[SyncUnsafeCell<Context>; 1]> =
+                    SmallVec::with_capacity(partition_size - 1);
+                for _i in 0..partition_size - 1 {
+                    ctx_workspace.push(SyncUnsafeCell::new(self.clone()));
+                }
+                let this = SyncUnsafeCell::new(self);
+                let get_context = |p: usize| -> &Context {
+                    if p == 0 {
+                        this.get_ref()
+                    } else {
+                        ctx_workspace[p - 1].get_ref()
+                    }
+                };
+
                 match trie_accesses.as_slice() {
-                    [(j, access)] => tries[*j].for_each(access, |value, trie| {
-                        let old_trie = std::mem::replace(&mut tries[*j], trie);
-                        self.tuple[*value_idx] = value;
-                        self.eval(tries, program, stage.next(), f)?;
-                        tries[*j] = old_trie;
-                        Ok(())
-                    }),
+                    [(j, access)] => {
+                        get_tries(0)[*j].for_each(
+                            access,
+                            |p, value, trie| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
+
+                                let old_trie = std::mem::replace(&mut tries[*j], unsafe {
+                                    // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                    &*(trie as *const LazyTrie)
+                                });
+                                this.tuple.get_mut()[*value_idx] = value;
+                                this.eval(tries, program, stage.next(), f)?;
+                                tries[*j] = old_trie;
+                                Ok(())
+                            },
+                            partition_size,
+                        )
+                    }
                     [a, b] => {
+                        let tries = get_tries(0);
                         let (a, b) = if tries[a.0].len() <= tries[b.0].len() {
                             (a, b)
                         } else {
                             (b, a)
                         };
-                        tries[a.0].for_each(&a.1, |value, ta| {
-                            if let Some(tb) = tries[b.0].get(&b.1, value) {
-                                let old_ta = std::mem::replace(&mut tries[a.0], ta);
-                                let old_tb = std::mem::replace(&mut tries[b.0], tb);
-                                self.tuple[*value_idx] = value;
-                                self.eval(tries, program, stage.next(), f)?;
-                                tries[a.0] = old_ta;
-                                tries[b.0] = old_tb;
-                            }
-                            Ok(())
-                        })
+                        tries[a.0].for_each(
+                            &a.1,
+                            |p, value, ta| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
+
+                                let trie = tries[b.0].at(&b.1, value);
+                                if let Some(tb) = trie {
+                                    let old_ta = std::mem::replace(&mut tries[a.0], unsafe {
+                                        // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                        &*(ta as *const LazyTrie)
+                                    });
+                                    let old_tb = std::mem::replace(&mut tries[b.0], unsafe {
+                                        &*(tb as *const LazyTrie)
+                                    });
+                                    this.tuple.get_mut()[*value_idx] = value;
+                                    this.eval(tries, program, stage.next(), f)?;
+                                    tries[a.0] = old_ta;
+                                    tries[b.0] = old_tb;
+                                }
+                                Ok(())
+                            },
+                            partition_size,
+                        )
                     }
                     _ => {
+                        let tries = get_tries(0);
                         let (j_min, access_min) = trie_accesses
                             .iter()
                             .min_by_key(|(j, _a)| tries[*j].len())
                             .unwrap();
 
-                        let mut new_tries = tries.to_vec();
+                        let mut new_tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 3]> =
+                            SmallVec::with_capacity(partition_size);
+                        for _i in 0..partition_size {
+                            new_tries_workspace.push(SyncUnsafeCell::new(tries.to_vec()));
+                        }
+                        let get_new_tries = |p: usize| {
+                            let t: &SyncUnsafeCell<_> = &new_tries_workspace[p];
+                            unsafe { &mut (*t.get()) }
+                        };
 
-                        tries[*j_min].for_each(access_min, |value, min_trie| {
-                            new_tries[*j_min] = min_trie;
-                            for (j, access) in trie_accesses {
-                                if j != j_min {
-                                    if let Some(t) = tries[*j].get(access, value) {
-                                        new_tries[*j] = t;
+                        tries[*j_min].for_each(
+                            access_min,
+                            |p, value, min_trie| {
+                                let tries = get_tries(p);
+                                let this = get_context(p);
+                                let new_tries = SyncUnsafeCell::new(get_new_tries(p));
+
+                                // No escaping happens in this unsafe operation because trie is swapped in and out immediately.
+                                let nt = new_tries.get_mut();
+                                nt[*j_min] = unsafe { &*(min_trie as *const LazyTrie) };
+                                for (j, access) in trie_accesses.iter().filter(|(j, _)| j != j_min)
+                                {
+                                    let trie = tries[*j].at(access, value);
+                                    if let Some(trie) = trie {
+                                        let new_tries = new_tries.get_mut();
+                                        new_tries[*j] = unsafe { &*(trie as *const LazyTrie) };
                                     } else {
                                         return Ok(());
                                     }
                                 }
-                            }
 
-                            // at this point, new_tries is ready to go
-                            self.tuple[*value_idx] = value;
-                            self.eval(&mut new_tries, program, stage.next(), f)
-                        })
+                                // at this point, new_tries is ready to go
+                                this.tuple.get_mut()[*value_idx] = value;
+                                this.eval(unsafe { *new_tries.get() }, program, stage.next(), f)
+                            },
+                            partition_size,
+                        )
                     }
                 }
             }
@@ -244,7 +345,7 @@ impl<'b> Context<'b> {
                     values.push(match arg {
                         AtomTerm::Var(_ann, v) => {
                             let i = self.query.vars.get_index_of(v).unwrap();
-                            self.tuple[i]
+                            self.tuple.get_ref()[i]
                         }
                         AtomTerm::Literal(_ann, lit) => self.egraph.eval_lit(lit),
                         AtomTerm::Global(_ann, _g) => panic!("Globals should have been desugared"),
@@ -260,13 +361,13 @@ impl<'b> Context<'b> {
                             let i = self.query.vars.get_index_of(v).unwrap();
 
                             if *check {
-                                assert_ne!(self.tuple[i], Value::fake());
-                                if self.tuple[i] != res {
+                                assert_ne!(self.tuple.get_ref()[i], Value::fake());
+                                if self.tuple.get_ref()[i] != res {
                                     return Ok(());
                                 }
                             }
 
-                            self.tuple[i] = res;
+                            self.tuple.get_mut()[i] = res;
                         }
                         AtomTerm::Literal(_ann, lit) => {
                             assert!(check);
@@ -542,6 +643,17 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
+        let total_threads = 128;
+        let intersected_var_len =
+            usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
+
+        let partition_size = usize::max(
+            1,
+            (total_threads as f64)
+                .powf((vars.len() as f64).recip())
+                .round() as usize,
+        );
+
         let var_instrs = vars.iter().map(|(&v, info)| {
             let value_idx = query.vars.get_index_of(&v).unwrap_or_else(|| {
                 panic!("variable {} not found in query", v);
@@ -564,6 +676,7 @@ impl EGraph {
                         (atom_idx, access)
                     })
                     .collect(),
+                partition_size: 1,
             }
         });
         program.extend(var_instrs);
@@ -664,7 +777,7 @@ impl EGraph {
         include_subsumed: bool,
         mut f: F,
     ) where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         // do the gj
         if let Some((mut ctx, program, cols)) =
@@ -680,7 +793,7 @@ impl EGraph {
             log::debug!(
                 "Query:\n{q}\n{atom_info}\nTuple: {tuple}\nJoin order: {order}\nProgram\n{program}",
                 q = cq.query,
-                order = ListDisplay(&ctx.join_var_ordering, " "),
+                order = ListDisplay(ctx.join_var_ordering.iter(), " "),
                 tuple = ListDisplay(cq.vars.keys(), " "),
             );
             let mut tries = Vec::with_capacity(cq.query.funcs().collect::<Vec<_>>().len());
@@ -690,22 +803,22 @@ impl EGraph {
                 .zip(timestamp_ranges.iter())
                 .zip(cols.iter())
             {
-                // tries.push(LazyTrie::default());
-                if let Some(target) = col {
-                    if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
-                        tries.push(LazyTrie::from_column_index(col))
-                    } else {
-                        tries.push(LazyTrie::default());
-                    }
-                } else {
-                    tries.push(LazyTrie::default());
-                }
+                tries.push(LazyTrie::default());
+                // if let Some(target) = col {
+                //     if let Some(col) = self.functions[&atom.head].column_index(*target, ts) {
+                //         tries.push(LazyTrie::from_column_index(col))
+                //     } else {
+                //         tries.push(LazyTrie::default());
+                //     }
+                // } else {
+                //     tries.push(LazyTrie::default());
+                // }
             }
             let mut trie_refs = tries.iter().collect::<Vec<_>>();
             let mut meausrements = HashMap::<usize, Vec<usize>>::default();
             let stages = InputSizes {
                 stage_sizes: &mut meausrements,
-                cur_stage: 0,
+                // cur_stage: 0,
             };
             ctx.eval(&mut trie_refs, &program.0, stages, &mut f)
                 .unwrap_or(());
@@ -735,7 +848,7 @@ impl EGraph {
         include_subsumed: bool,
         mut f: F,
     ) where
-        F: FnMut(&[Value]) -> Result,
+        F: Fn(&[Value]) -> Result + Send + Sync,
     {
         let has_atoms = !cq.query.funcs().collect::<Vec<_>>().is_empty();
 
@@ -756,25 +869,19 @@ impl EGraph {
                 for (atom_i, _atom) in cq.query.funcs().enumerate() {
                     timestamp_ranges[atom_i] = timestamp..u32::MAX;
 
-                    self.gj_for_atom(
-                        Some(atom_i),
-                        &timestamp_ranges,
-                        cq,
-                        include_subsumed,
-                        &mut f,
-                    );
+                    self.gj_for_atom(Some(atom_i), &timestamp_ranges, cq, include_subsumed, &f);
                     // now we can fix this atom to be "old stuff" only
                     // range is half-open; timestamp is excluded
                     timestamp_ranges[atom_i] = 0..timestamp;
                 }
             } else {
-                self.gj_for_atom(None, &timestamp_ranges, cq, include_subsumed, &mut f);
+                self.gj_for_atom(None, &timestamp_ranges, cq, include_subsumed, &f);
             }
         } else if let Some((mut ctx, program, _)) = Context::new(self, cq, &[], include_subsumed) {
             let mut meausrements = HashMap::<usize, Vec<usize>>::default();
             let stages = InputSizes {
                 stage_sizes: &mut meausrements,
-                cur_stage: 0,
+                // cur_stage: 0,
             };
             let tries = LazyTrie::make_initial_vec(cq.query.funcs().collect::<Vec<_>>().len()); // TODO: bad use of collect here
             let mut trie_refs = tries.iter().collect::<Vec<_>>();
@@ -784,7 +891,7 @@ impl EGraph {
     }
 }
 
-struct LazyTrie(UnsafeCell<LazyTrieInner>);
+struct LazyTrie(SyncUnsafeCell<LazyTrieInner>, Once);
 
 impl Debug for LazyTrie {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -797,7 +904,7 @@ type RowIdx = u32;
 #[derive(Debug)]
 enum LazyTrieInner {
     Borrowed {
-        index: Rc<ColumnIndex>,
+        index: Arc<ColumnIndex>,
         map: HashMap<Value, LazyTrie>,
     },
     Delayed(SmallVec<[RowIdx; 4]>),
@@ -806,7 +913,10 @@ enum LazyTrieInner {
 
 impl Default for LazyTrie {
     fn default() -> Self {
-        LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(Default::default())))
+        LazyTrie(
+            SyncUnsafeCell::new(LazyTrieInner::Delayed(Default::default())),
+            Once::new(),
+        )
     }
 }
 
@@ -822,11 +932,14 @@ impl LazyTrie {
             LazyTrieInner::Borrowed { index, .. } => index.len(),
         }
     }
-    fn from_column_index(index: Rc<ColumnIndex>) -> LazyTrie {
-        LazyTrie(UnsafeCell::new(LazyTrieInner::Borrowed {
-            index,
-            map: Default::default(),
-        }))
+    fn from_column_index(index: Arc<ColumnIndex>) -> LazyTrie {
+        LazyTrie(
+            SyncUnsafeCell::new(LazyTrieInner::Borrowed {
+                index,
+                map: Default::default(),
+            }),
+            Once::new(),
+        )
     }
     fn from_indexes(ixs: impl Iterator<Item = usize>) -> Option<LazyTrie> {
         let data = SmallVec::from_iter(ixs.map(|x| x as RowIdx));
@@ -834,29 +947,38 @@ impl LazyTrie {
             return None;
         }
 
-        Some(LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(data))))
+        Some(LazyTrie(
+            SyncUnsafeCell::new(LazyTrieInner::Delayed(data)),
+            Once::new(),
+        ))
     }
 
     unsafe fn force_mut(&self, access: &TrieAccess) -> *mut LazyTrieInner {
-        let this = &mut *self.0.get();
-        if let LazyTrieInner::Delayed(idxs) = this {
-            *this = access.make_trie_inner(idxs);
+        // let this = &mut *self.0.get();
+        if let LazyTrieInner::Delayed(idxs) = self.0.get_ref() {
+            self.1.call_once(|| {
+                let this = &mut *self.0.get();
+                *this = access.make_trie_inner(idxs);
+            });
         }
         self.0.get()
     }
 
     fn force_borrowed(&self, access: &TrieAccess) -> &LazyTrieInner {
-        let this = unsafe { &mut *self.0.get() };
-        match this {
-            LazyTrieInner::Borrowed { index, .. } => {
-                let mut map = HashMap::with_capacity_and_hasher(index.len(), Default::default());
-                map.extend(index.iter().filter_map(|(v, ixs)| {
-                    LazyTrie::from_indexes(access.filter_live(ixs)).map(|trie| (v, trie))
-                }));
-                *this = LazyTrieInner::Sparse(map);
+        match self.0.get_ref() {
+            LazyTrieInner::Borrowed { .. } => {
+                // let mut map = HashMap::with_capacity_and_hasher(index.len(), Default::default());
+                // map.extend(index.iter().filter_map(|(v, ixs)| {
+                //     LazyTrie::from_indexes(access.filter_live(ixs)).map(|trie| (v, trie))
+                // }));
+                // *this = LazyTrieInner::Sparse(map);
+                todo!()
             }
             LazyTrieInner::Delayed(idxs) => {
-                *this = access.make_trie_inner(idxs);
+                self.1.call_once(|| {
+                    let this = unsafe { &mut *self.0.get() };
+                    *this = access.make_trie_inner(idxs);
+                });
             }
             LazyTrieInner::Sparse(_) => {}
         }
@@ -866,35 +988,90 @@ impl LazyTrie {
     fn for_each<'a>(
         &'a self,
         access: &TrieAccess,
-        mut f: impl FnMut(Value, &'a LazyTrie) -> Result,
+        f: impl Fn(usize, Value, &LazyTrie) -> Result + Send + Sync,
+        partition_size: usize,
     ) -> Result {
         // There is probably something cleaner to do here compared with the
         // `force_borrowed` construct.
-        match self.force_borrowed(access) {
-            LazyTrieInner::Sparse(m) => {
-                for (k, v) in m {
-                    f(*k, v)?;
+        // match self.force_borrowed(access) {
+        //     LazyTrieInner::Sparse(m) => {
+        //         for (k, v) in m {
+        //             f(*k, v)?;
+        //         }
+        //         Ok(())
+        //     }
+        //     LazyTrieInner::Borrowed { .. } | LazyTrieInner::Delayed(_) => unreachable!(),
+        // }
+
+        let lazy_trie = self.force_borrowed(access);
+
+        let should_stop = SyncUnsafeCell::new(false);
+
+        let LazyTrieInner::Sparse(m) = lazy_trie else {
+            std::process::exit(-1);
+        };
+        let len = m.len();
+        if len == 0 {
+            return Ok(());
+        }
+
+        if partition_size == 1 {
+            for (k, v) in m.iter() {
+                if f(0, *k, v).is_err() {
+                    return Err(());
                 }
-                Ok(())
             }
-            LazyTrieInner::Borrowed { .. } | LazyTrieInner::Delayed(_) => unreachable!(),
+            return Ok(());
+        }
+
+        let chunk = (len - 1) / partition_size + 1;
+        (0..partition_size).into_par_iter().for_each(|p| {
+            let lo = p * chunk;
+            let hi = usize::min((p + 1) * chunk, len);
+            for i in lo..hi {
+                let (k, v) = m.get_index(i).unwrap();
+                if f(p, *k, v).is_err() {
+                    unsafe {
+                        *should_stop.get() = true;
+                    }
+                    return;
+                }
+            }
+        });
+
+        if unsafe { *should_stop.get() } {
+            Err(())
+        } else {
+            Ok(())
         }
     }
 
     fn get(&self, access: &TrieAccess, value: Value) -> Option<&LazyTrie> {
         match unsafe { &mut *self.force_mut(access) } {
             LazyTrieInner::Sparse(m) => m.get(&value),
-            LazyTrieInner::Borrowed { index, map } => {
-                let ixs = index.get(&value)?;
-                match map.entry(value) {
-                    HEntry::Occupied(o) => Some(o.into_mut()),
-                    HEntry::Vacant(v) => {
-                        Some(v.insert(LazyTrie::from_indexes(access.filter_live(ixs))?))
-                    }
-                }
+            LazyTrieInner::Borrowed { .. } => {
+                todo!()
+                // LazyTrieInner::Borrowed { index, map } => {
+                // let ixs = index.get(&value)?;
+                // match map.entry(value) {
+                //     HEntry::Occupied(o) => Some(o.into_mut()),
+                //     HEntry::Vacant(v) => {
+                //         Some(v.insert(LazyTrie::from_indexes(access.filter_live(ixs))?))
+                //     }
+                // }
             }
             LazyTrieInner::Delayed(_) => unreachable!(),
         }
+    }
+
+    fn at<'a>(&self, access: &TrieAccess, value: Value) -> Option<*const LazyTrie> {
+        let trie = self.force_borrowed(access);
+        let LazyTrieInner::Sparse(m) = trie else {
+            unreachable!();
+        };
+
+        let trie = m.get(&value).map(|t| t as *const LazyTrie);
+        trie
     }
 }
 
@@ -948,9 +1125,12 @@ impl<'a> TrieAccess<'a> {
                         }
                     }
                     HEntry::Vacant(e) => {
-                        e.insert(LazyTrie(UnsafeCell::new(LazyTrieInner::Delayed(
-                            smallvec::smallvec![i as RowIdx,],
-                        ))));
+                        e.insert(LazyTrie(
+                            SyncUnsafeCell::new(LazyTrieInner::Delayed(smallvec::smallvec![
+                                i as RowIdx,
+                            ])),
+                            Once::new(),
+                        ));
                     }
                 }
             }

@@ -389,6 +389,7 @@ dependencies = [
  "log",
  "num",
  "ordered-float",
+ "rayon",
  "rustc-hash",
  "serde_json",
  "smallvec",

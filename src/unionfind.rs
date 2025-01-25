@@ -5,18 +5,29 @@
 use crate::util::HashMap;
 use crate::{Symbol, Value};
 
-use std::cell::Cell;
 use std::fmt::Debug;
 use std::mem;
+use std::sync::Mutex;
 
 pub type Id = u64;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Default)]
 pub struct UnionFind {
-    parents: Vec<Cell<Id>>,
+    parents: Mutex<Vec<Id>>,
     n_unions: usize,
     recent_ids: HashMap<Symbol, Vec<Id>>,
     staged_ids: HashMap<Symbol, Vec<Id>>,
+}
+
+impl Clone for UnionFind {
+    fn clone(&self) -> Self {
+        Self {
+            parents: Mutex::new(self.parents.lock().unwrap().clone()),
+            n_unions: self.n_unions.clone(),
+            recent_ids: self.recent_ids.clone(),
+            staged_ids: self.staged_ids.clone(),
+        }
+    }
 }
 
 impl UnionFind {
@@ -28,8 +39,9 @@ impl UnionFind {
 
     /// Create a fresh [`Id`].
     pub fn make_set(&mut self) -> Id {
-        let res = self.parents.len() as u64;
-        self.parents.push(Cell::new(res));
+        let mut parents = self.parents.lock().unwrap();
+        let res = parents.len() as u64;
+        parents.push(res);
         res
     }
 
@@ -69,19 +81,24 @@ impl UnionFind {
         ids.iter().copied()
     }
 
-    /// Look up the canonical representative for the given [`Id`].
-    pub fn find(&self, id: Id) -> Id {
-        let mut cur = self.parent(id);
+    fn find_impl(&self, id: Id, parent: &mut Vec<Id>) -> Id {
+        let mut cur = id;
         loop {
-            let next = self.parent(cur.get());
-            if cur.get() == next.get() {
-                return cur.get();
+            let next = parent[cur as usize];
+            if cur == next {
+                return cur;
             }
             // Path halving
-            let grand = self.parent(next.get());
-            cur.set(grand.get());
+            let grand = parent[next as usize];
+            parent[cur as usize] = grand;
             cur = grand;
         }
+    }
+
+    /// Look up the canonical representative for the given [`Id`].
+    pub fn find(&self, id: Id) -> Id {
+        let mut parent = self.parents.lock().unwrap();
+        self.find_impl(id, parent.as_mut())
     }
 
     /// Merge the equivalence classes associated with the two values.
@@ -121,30 +138,22 @@ impl UnionFind {
     }
 
     fn do_union(&mut self, id1: Id, id2: Id) -> (Id, Option<Id>) {
-        let id1 = self.find(id1);
-        let id2 = self.find(id2);
+        let mut parent = self.parents.lock().unwrap();
+        let id1 = self.find_impl(id1, &mut parent);
+        let id2 = self.find_impl(id2, &mut  parent);
         if id1 != id2 {
-            self.parent(id2).set(id1);
+            parent[id2 as usize] = id1;
             self.n_unions += 1;
             (id1, Some(id2))
         } else {
             (id1, None)
         }
     }
-
-    fn parent(&self, id: Id) -> &Cell<Id> {
-        &self.parents[id as usize]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn ids(us: impl IntoIterator<Item = Id>) -> Vec<Cell<Id>> {
-        us.into_iter().map(Cell::new).collect()
-    }
-
     #[test]
     fn union_find() {
         let n = 10;
@@ -155,7 +164,7 @@ mod tests {
         }
 
         // test the initial condition of everyone in their own set
-        assert_eq!(uf.parents, ids(0..n));
+        assert_eq!(uf.parents.lock().unwrap().clone(), (0..n).collect::<Vec<u64>>());
 
         // build up one set
         uf.union_raw(0, 1);
@@ -174,6 +183,6 @@ mod tests {
 
         // indexes:         0, 1, 2, 3, 4, 5, 6, 7, 8, 9
         let expected = vec![0, 0, 0, 0, 4, 5, 6, 6, 6, 6];
-        assert_eq!(uf.parents, ids(expected));
+        assert_eq!(uf.parents.lock().unwrap().clone(), expected);
     }
 }

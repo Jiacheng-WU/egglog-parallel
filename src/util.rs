@@ -1,6 +1,6 @@
 #![allow(unused)]
 
-use std::fmt::Display;
+use std::{cell::UnsafeCell, fmt::Display};
 
 use crate::core::SpecializedPrimitive;
 #[allow(unused_imports)]
@@ -137,5 +137,41 @@ pub(crate) trait SymbolLike {
 impl SymbolLike for Symbol {
     fn to_symbol(&self) -> Symbol {
         *self
+    }
+}
+
+
+#[derive(Debug)]
+pub struct SyncUnsafeCell<T: ?Sized> {
+    value: UnsafeCell<T>,
+}
+
+impl<T: Clone> Clone for SyncUnsafeCell<T> {
+    fn clone(&self) -> Self {
+        Self::new(unsafe { &*self.get() }.clone())
+    }
+}
+
+impl<T> SyncUnsafeCell<T> {
+    pub fn get_mut(&self) -> &mut T {
+        unsafe { &mut *self.get() }
+    }
+
+    pub fn get_ref(&self) -> &T {
+        unsafe { &*self.get() }
+    }
+}
+
+unsafe impl<T: ?Sized + Sync> Sync for SyncUnsafeCell<T> {}
+
+impl<T> SyncUnsafeCell<T> {
+    pub const fn new(value: T) -> Self {
+        Self {
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    pub const fn get(&self) -> *mut T {
+        self.value.get()
     }
 }
