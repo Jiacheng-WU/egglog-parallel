@@ -10,6 +10,7 @@ use std::{
     fmt::{self, Debug},
     ops::Range,
     sync::{Once, OnceLock},
+    thread,
 };
 
 type Query = crate::core::Query<ResolvedCall, Symbol>;
@@ -187,27 +188,23 @@ impl<'b> Context<'b> {
                 let partition_size = {
                     let min_len = trie_accesses
                         .iter()
-                        .map(|(j, _a)| tries[*j].len())
+                        .map(|(j, a)| {
+                            tries[*j].force_borrowed(a);
+                            tries[*j].len()
+                        })
                         .min()
                         .unwrap();
                     usize::max(usize::min(*partition_size, min_len), 1)
                 };
 
-                if let Some(x) = trie_accesses
-                    .iter()
-                    .map(|(atom, _)| tries[*atom].len())
-                    .max()
-                {
-                    stage.add_measurement(x);
-                }
+                // if let Some(x) = trie_accesses
+                //     .iter()
+                //     .map(|(atom, _)| tries[*atom].len())
+                //     .max()
+                // {
+                //     stage.add_measurement(x);
+                // }
 
-                if let Some(x) = trie_accesses
-                    .iter()
-                    .map(|(atom, _)| tries[*atom].len())
-                    .max()
-                {
-                    stage.add_measurement(x);
-                }
                 let mut tries_workspace: SmallVec<[SyncUnsafeCell<Vec<&LazyTrie>>; 1]> =
                     SmallVec::with_capacity(partition_size - 1);
                 for _i in 0..partition_size - 1 {
@@ -643,7 +640,7 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
-        let total_threads = 128;
+        let total_threads = 64;
         let intersected_var_len =
             usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
 
@@ -654,7 +651,7 @@ impl EGraph {
                 .round() as usize,
         );
 
-        let var_instrs = vars.iter().map(|(&v, info)| {
+        let var_instrs = vars.iter().enumerate().map(|(i, (&v, info))| {
             let value_idx = query.vars.get_index_of(&v).unwrap_or_else(|| {
                 panic!("variable {} not found in query", v);
             });
@@ -676,7 +673,13 @@ impl EGraph {
                         (atom_idx, access)
                     })
                     .collect(),
-                partition_size: 1,
+                partition_size: partition_size,
+                // partition_size: 1,
+                // partition_size: if i == 0 {
+                //     2
+                // } else {
+                //     1
+                // }
             }
         });
         program.extend(var_instrs);
@@ -927,6 +930,7 @@ impl LazyTrie {
 
     fn len(&self) -> usize {
         match unsafe { &*self.0.get() } {
+            // match unsafe { &*self.0.get() } {
             LazyTrieInner::Delayed(v) => v.len(),
             LazyTrieInner::Sparse(m) => m.len(),
             LazyTrieInner::Borrowed { index, .. } => index.len(),
@@ -955,34 +959,23 @@ impl LazyTrie {
 
     unsafe fn force_mut(&self, access: &TrieAccess) -> *mut LazyTrieInner {
         // let this = &mut *self.0.get();
-        if let LazyTrieInner::Delayed(idxs) = self.0.get_ref() {
-            self.1.call_once(|| {
-                let this = &mut *self.0.get();
-                *this = access.make_trie_inner(idxs);
-            });
-        }
+        // if let LazyTrieInner::Delayed(idxs) = self.0.get_ref() {
+        self.1.call_once(|| {
+            let LazyTrieInner::Delayed(idxs) = self.0.get_ref() else {
+                unreachable!();
+            };
+            let this = &mut *self.0.get();
+            *this = access.make_trie_inner(idxs);
+        });
+        // }
         self.0.get()
     }
 
     fn force_borrowed(&self, access: &TrieAccess) -> &LazyTrieInner {
-        match self.0.get_ref() {
-            LazyTrieInner::Borrowed { .. } => {
-                // let mut map = HashMap::with_capacity_and_hasher(index.len(), Default::default());
-                // map.extend(index.iter().filter_map(|(v, ixs)| {
-                //     LazyTrie::from_indexes(access.filter_live(ixs)).map(|trie| (v, trie))
-                // }));
-                // *this = LazyTrieInner::Sparse(map);
-                todo!()
-            }
-            LazyTrieInner::Delayed(idxs) => {
-                self.1.call_once(|| {
-                    let this = unsafe { &mut *self.0.get() };
-                    *this = access.make_trie_inner(idxs);
-                });
-            }
-            LazyTrieInner::Sparse(_) => {}
+        unsafe {
+            let trie = self.force_mut(access);
+            &*trie
         }
-        unsafe { &*self.0.get() }
     }
 
     fn for_each<'a>(
@@ -1025,19 +1018,41 @@ impl LazyTrie {
         }
 
         let chunk = (len - 1) / partition_size + 1;
-        (0..partition_size).into_par_iter().for_each(|p| {
-            let lo = p * chunk;
-            let hi = usize::min((p + 1) * chunk, len);
-            for i in lo..hi {
-                let (k, v) = m.get_index(i).unwrap();
-                if f(p, *k, v).is_err() {
-                    unsafe {
-                        *should_stop.get() = true;
-                    }
-                    return;
+        {
+            let f = &f;
+            let should_stop = &should_stop;
+            thread::scope(|s| {
+                for p in 0..partition_size {
+                    s.spawn(move || {
+                        let lo = p * chunk;
+                        let hi = usize::min((p + 1) * chunk, len);
+                        for i in lo..hi {
+                            let (k, v) = m.get_index(i).unwrap();
+                            // TODO: what about other threads?
+                            if f(p, *k, v).is_err() {
+                                unsafe {
+                                    *should_stop.get() = true;
+                                }
+                                return;
+                            }
+                        }
+                    });
                 }
-            }
-        });
+            });
+        }
+        // (0..partition_size).into_par_iter().for_each(|p| {
+        //     let lo = p * chunk;
+        //     let hi = usize::min((p + 1) * chunk, len);
+        //     for i in lo..hi {
+        //         let (k, v) = m.get_index(i).unwrap();
+        //         if f(p, *k, v).is_err() {
+        //             unsafe {
+        //                 *should_stop.get() = true;
+        //             }
+        //             return;
+        //         }
+        //     }
+        // });
 
         if unsafe { *should_stop.get() } {
             Err(())
