@@ -640,14 +640,14 @@ impl EGraph {
         });
         let mut program: Vec<Instr> = const_instrs.collect();
 
-        let total_threads = 64;
+        let total_threads = 128;
         let intersected_var_len =
             usize::max(1, vars.values().filter(|v| v.occurences.len() > 1).count());
 
         let partition_size = usize::max(
             1,
             (total_threads as f64)
-                .powf((vars.len() as f64).recip())
+                .powf((intersected_var_len as f64).recip())
                 .round() as usize,
         );
 
@@ -673,13 +673,18 @@ impl EGraph {
                         (atom_idx, access)
                     })
                     .collect(),
-                partition_size: partition_size,
+                // partition_size: partition_size,
                 // partition_size: 1,
-                // partition_size: if i == 0 {
-                //     2
+                // partition_size: if i <= 2 {
+                //     8
                 // } else {
                 //     1
                 // }
+                partition_size: if info.occurences.len() > 1 {
+                    partition_size
+                } else {
+                    1
+                },
             }
         });
         program.extend(var_instrs);
